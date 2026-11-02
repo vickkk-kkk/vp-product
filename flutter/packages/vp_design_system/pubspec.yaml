@@ -1,0 +1,22 @@
+name: vp_design_system
+description: VP product design system boundary.
+version: 0.1.0
+publish_to: none
+environment:
+  sdk: ">=3.10.0 <4.0.0"
+  flutter: ">=3.38.0"
+dependencies:
+  cupertino_icons: 1.0.9
+  flutter:
+    sdk: flutter
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+flutter:
+  assets:
+    - assets/fonts/OFL.txt
+    - assets/fonts/provenance.json
+  fonts:
+    - family: VpSans
+      fonts:
+        - asset: assets/fonts/NotoSansSC-Variable.ttf

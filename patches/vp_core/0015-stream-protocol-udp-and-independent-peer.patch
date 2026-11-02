@@ -1,0 +1,2335 @@
+From aa800267b51e0870bde831162f2b7ef3427b059c Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Fri, 30 Oct 2026 13:30:38 +0900
+Subject: [PATCH] feat(protocol): implement bounded VLESS VMess Trojan stream
+ UDP
+
+---
+ crates/vp-protocol/src/lib.rs                 |   1 +
+ crates/vp-protocol/src/stream_udp.rs          | 501 ++++++++++++++++++
+ crates/vp-protocol/src/trojan.rs              |  96 +++-
+ crates/vp-protocol/src/vless.rs               |  86 ++-
+ crates/vp-protocol/src/vmess.rs               | 143 ++++-
+ .../vp-protocol/tests/STREAM_VERIFICATION.md  |  68 +++
+ .../tests/reference_stream/README.md          |  39 ++
+ .../vp-protocol/tests/reference_stream/go.mod |  20 +
+ .../vp-protocol/tests/reference_stream/go.sum |  26 +
+ .../tests/reference_stream/main.go            | 445 ++++++++++++++++
+ .../tests/stream_library_interop.rs           | 303 +++++++++++
+ crates/vp-protocol/tests/stream_udp.rs        | 328 ++++++++++++
+ 12 files changed, 2037 insertions(+), 19 deletions(-)
+ create mode 100644 crates/vp-protocol/src/stream_udp.rs
+ create mode 100644 crates/vp-protocol/tests/STREAM_VERIFICATION.md
+ create mode 100644 crates/vp-protocol/tests/reference_stream/README.md
+ create mode 100644 crates/vp-protocol/tests/reference_stream/go.mod
+ create mode 100644 crates/vp-protocol/tests/reference_stream/go.sum
+ create mode 100644 crates/vp-protocol/tests/reference_stream/main.go
+ create mode 100644 crates/vp-protocol/tests/stream_library_interop.rs
+ create mode 100644 crates/vp-protocol/tests/stream_udp.rs
+
+diff --git a/crates/vp-protocol/src/lib.rs b/crates/vp-protocol/src/lib.rs
+index f1127a5..a62ece6 100644
+--- a/crates/vp-protocol/src/lib.rs
++++ b/crates/vp-protocol/src/lib.rs
+@@ -24,6 +24,7 @@ pub mod ss;
+ pub mod ssh;
+ pub mod ssr;
+ pub mod stream_inbound;
++mod stream_udp;
+ pub mod sub;
+ #[cfg(feature = "trojan")]
+ pub mod trojan;
+diff --git a/crates/vp-protocol/src/stream_udp.rs b/crates/vp-protocol/src/stream_udp.rs
+new file mode 100644
+index 0000000..7edf266
+--- /dev/null
++++ b/crates/vp-protocol/src/stream_udp.rs
+@@ -0,0 +1,501 @@
++//! Bounded datagram sessions carried by authenticated proxy streams.
++//!
++//! VLESS/VMess command-UDP fixes the destination in the request header. A
++//! PacketConn can target several peers, so each destination gets its own proxy
++//! stream (never a direct client socket). Readers own framing until completion:
++//! canceling PacketConn::recv cannot lose a partially received length/header.
++use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
++
++use async_trait::async_trait;
++use bytes::Bytes;
++use tokio::{
++    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
++    sync::{Mutex, mpsc, oneshot},
++    task::JoinHandle,
++};
++use vp_common::{DstAddr, Error, Host, Result};
++use vp_core::{PacketConn, UdpPacket};
++
++pub(crate) const MAX_DATAGRAM: usize = 65_507;
++const MAX_SESSIONS: usize = 16;
++const QUEUE: usize = 16;
++const IO_TIMEOUT: Duration = Duration::from_secs(10);
++const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
++
++pub(crate) struct Frame {
++    pub target: DstAddr,
++    pub data: Bytes,
++}
++#[async_trait]
++pub(crate) trait ReadDatagram: Send {
++    async fn read(&mut self) -> Result<Frame>;
++}
++#[async_trait]
++pub(crate) trait WriteDatagram: Send {
++    async fn write(&mut self, frame: &Frame) -> Result<()>;
++}
++pub(crate) type DatagramIo = (Box<dyn ReadDatagram>, Box<dyn WriteDatagram>);
++#[async_trait]
++pub(crate) trait Factory: Send + Sync {
++    async fn open(&self, dst: &DstAddr) -> Result<DatagramIo>;
++}
++
++fn closed() -> Error {
++    Error::Io(std::io::Error::new(
++        std::io::ErrorKind::BrokenPipe,
++        "UDP stream session closed",
++    ))
++}
++fn timed_out() -> Error {
++    Error::Io(std::io::Error::new(
++        std::io::ErrorKind::TimedOut,
++        "UDP stream session deadline",
++    ))
++}
++pub(crate) fn validate_target(dst: &DstAddr) -> Result<()> {
++    if dst.port == 0 {
++        return Err(Error::Proto("UDP destination port is zero"));
++    }
++    if let Host::Domain(name) = &dst.host {
++        if name.is_empty() || name.len() > 255 {
++            return Err(Error::Proto("UDP destination domain length is invalid"));
++        }
++    }
++    vp_core::task_scope::check_destination(dst)
++}
++pub(crate) fn validate_payload(data: &[u8]) -> Result<()> {
++    if data.len() > MAX_DATAGRAM {
++        return Err(Error::Proto("UDP payload exceeds maximum datagram size"));
++    }
++    Ok(())
++}
++struct SendRequest {
++    frame: Frame,
++    done: oneshot::Sender<Result<()>>,
++}
++struct Handle {
++    tx: mpsc::Sender<SendRequest>,
++    task: JoinHandle<()>,
++}
++impl Drop for Handle {
++    fn drop(&mut self) {
++        self.task.abort();
++    }
++}
++struct Pool {
++    factory: Arc<dyn Factory>,
++    sessions: Mutex<HashMap<DstAddr, Handle>>,
++    responses: mpsc::Sender<Result<Frame>>,
++    scope: Option<Arc<vp_core::task_scope::TaskScope>>,
++}
++impl Pool {
++    async fn send(&self, frame: Frame) -> Result<()> {
++        if let Some(scope) = &self.scope {
++            scope.run(self.send_scoped(frame)).await
++        } else {
++            self.send_scoped(frame).await
++        }
++    }
++    async fn send_scoped(&self, frame: Frame) -> Result<()> {
++        validate_target(&frame.target)?;
++        validate_payload(&frame.data)?;
++        if self.scope.as_ref().is_some_and(|scope| {
++            matches!(
++                scope.snapshot().phase,
++                vp_core::task_scope::Phase::Canceling | vp_core::task_scope::Phase::Stopped
++            )
++        }) {
++            return Err(closed());
++        }
++        let mut sessions = self.sessions.lock().await;
++        sessions.retain(|_, value| !value.task.is_finished());
++        if !sessions.contains_key(&frame.target) {
++            if sessions.len() >= MAX_SESSIONS {
++                return Err(Error::Proto("UDP stream destination session limit reached"));
++            }
++            if self
++                .scope
++                .as_ref()
++                .is_some_and(|scope| scope.snapshot().phase != vp_core::task_scope::Phase::Running)
++            {
++                return Err(closed());
++            }
++            // Opening is itself tracked/owned. A canceled send or generation
++            // shutdown drops this JoinSet and closes a partially dialed stream.
++            let factory = self.factory.clone();
++            let target = frame.target.clone();
++            let mut opening = tokio::task::JoinSet::new();
++            vp_core::task_scope::spawn_in(&mut opening, async move {
++                tokio::time::timeout(IO_TIMEOUT, factory.open(&target))
++                    .await
++                    .map_err(|_| timed_out())?
++            });
++            let (mut reader, mut writer) = opening
++                .join_next()
++                .await
++                .ok_or_else(closed)?
++                .map_err(|_| closed())??;
++            if self
++                .scope
++                .as_ref()
++                .is_some_and(|scope| scope.snapshot().phase != vp_core::task_scope::Phase::Running)
++            {
++                return Err(closed());
++            }
++            let (tx, mut rx) = mpsc::channel::<SendRequest>(QUEUE);
++            let responses = self.responses.clone();
++            let task = vp_core::task_scope::spawn(async move {
++                let read = async {
++                    loop {
++                        let frame = reader.read().await?;
++                        validate_payload(&frame.data)?;
++                        responses.send(Ok(frame)).await.map_err(|_| closed())?;
++                    }
++                    #[allow(unreachable_code)]
++                    Ok::<(), Error>(())
++                };
++                let write = async {
++                    loop {
++                        let request = tokio::time::timeout(IDLE_TIMEOUT, rx.recv())
++                            .await
++                            .map_err(|_| timed_out())?
++                            .ok_or_else(closed)?;
++                        let result = tokio::time::timeout(IO_TIMEOUT, writer.write(&request.frame))
++                            .await
++                            .map_err(|_| timed_out())
++                            .and_then(|r| r);
++                        let failed = result.is_err();
++                        let _ = request.done.send(result);
++                        if failed {
++                            return Err::<(), Error>(closed());
++                        }
++                    }
++                };
++                // Dropping either half closes the entire destination session.
++                // No read_exact future is canceled and then resumed on this IO.
++                let result = tokio::select! { result = read => result, result = write => result };
++                if let Err(error) = result {
++                    let _ = responses.try_send(Err(error));
++                }
++            });
++            sessions.insert(frame.target.clone(), Handle { tx, task });
++        }
++        let tx = sessions.get(&frame.target).unwrap().tx.clone();
++        drop(sessions);
++        let (done, result) = oneshot::channel();
++        tokio::time::timeout(IO_TIMEOUT, tx.send(SendRequest { frame, done }))
++            .await
++            .map_err(|_| timed_out())?
++            .map_err(|_| closed())?;
++        tokio::time::timeout(IO_TIMEOUT, result)
++            .await
++            .map_err(|_| timed_out())?
++            .map_err(|_| closed())?
++    }
++}
++
++pub(crate) struct StreamPacketConn {
++    pool: Pool,
++    responses: mpsc::Receiver<Result<Frame>>,
++    source: SocketAddr,
++}
++impl StreamPacketConn {
++    pub(crate) fn new(factory: Arc<dyn Factory>, source: Option<SocketAddr>) -> Self {
++        let (tx, responses) = mpsc::channel(QUEUE);
++        Self {
++            pool: Pool {
++                factory,
++                sessions: Mutex::new(HashMap::new()),
++                responses: tx,
++                scope: vp_core::task_scope::current_scope(),
++            },
++            responses,
++            source: source.unwrap_or_else(|| "0.0.0.0:0".parse().unwrap()),
++        }
++    }
++}
++#[async_trait]
++impl PacketConn for StreamPacketConn {
++    async fn send(&self, pkt: &UdpPacket) -> Result<()> {
++        self.pool
++            .send(Frame {
++                target: DstAddr::ip(pkt.dst.ip(), pkt.dst.port()),
++                data: pkt.data.clone(),
++            })
++            .await
++    }
++    async fn recv(&mut self) -> Result<UdpPacket> {
++        let frame = self.responses.recv().await.ok_or_else(closed)??;
++        let Host::Ip(ip) = frame.target.host else {
++            return Err(Error::Proto(
++                "UDP response domain cannot be represented as SocketAddr",
++            ));
++        };
++        Ok(UdpPacket {
++            src: SocketAddr::new(ip, frame.target.port),
++            dst: self.source,
++            data: frame.data,
++        })
++    }
++}
++
++/// Server-side only: destinations authenticated by the protocol are checked
++/// before resolution and passed through the generation's protected UDP helper.
++struct DirectFactory(Arc<crate::direct::DirectOutbound>);
++struct UdpIo {
++    socket: Arc<tokio::net::UdpSocket>,
++    destination: SocketAddr,
++}
++#[async_trait]
++impl Factory for DirectFactory {
++    async fn open(&self, dst: &DstAddr) -> Result<DatagramIo> {
++        validate_target(dst)?;
++        let target = self
++            .0
++            .resolve(dst)
++            .await?
++            .into_iter()
++            .next()
++            .ok_or_else(|| Error::Addr("UDP target has no address".into()))?;
++        let socket = Arc::new(vp_core::host_network::bind_udp(
++            target,
++            vp_core::host_network::Purpose::Proxy,
++        )?);
++        socket.connect(target).await?;
++        Ok((
++            Box::new(UdpIo {
++                socket: socket.clone(),
++                destination: target,
++            }),
++            Box::new(UdpIo {
++                socket,
++                destination: target,
++            }),
++        ))
++    }
++}
++#[async_trait]
++impl ReadDatagram for UdpIo {
++    async fn read(&mut self) -> Result<Frame> {
++        let mut data = vec![0; MAX_DATAGRAM + 1];
++        let n = self.socket.recv(&mut data).await?;
++        data.truncate(n);
++        validate_payload(&data)?;
++        Ok(Frame {
++            target: DstAddr::ip(self.destination.ip(), self.destination.port()),
++            data: data.into(),
++        })
++    }
++}
++#[async_trait]
++impl WriteDatagram for UdpIo {
++    async fn write(&mut self, frame: &Frame) -> Result<()> {
++        let n = self.socket.send(&frame.data).await?;
++        if n != frame.data.len() {
++            return Err(Error::Proto("short UDP write"));
++        }
++        Ok(())
++    }
++}
++pub(crate) async fn serve(
++    mut reader: Box<dyn ReadDatagram>,
++    mut writer: Box<dyn WriteDatagram>,
++    direct: Arc<crate::direct::DirectOutbound>,
++) -> Result<()> {
++    let (tx, mut responses) = mpsc::channel(QUEUE);
++    let pool = Pool {
++        factory: Arc::new(DirectFactory(direct)),
++        sessions: Mutex::new(HashMap::new()),
++        responses: tx,
++        scope: vp_core::task_scope::current_scope(),
++    };
++    let requests = async {
++        loop {
++            let frame = tokio::time::timeout(IDLE_TIMEOUT, reader.read())
++                .await
++                .map_err(|_| timed_out())??;
++            pool.send(frame).await?;
++        }
++        #[allow(unreachable_code)]
++        Ok::<(), Error>(())
++    };
++    let replies = async {
++        loop {
++            let frame = responses.recv().await.ok_or_else(closed)??;
++            tokio::time::timeout(IO_TIMEOUT, writer.write(&frame))
++                .await
++                .map_err(|_| timed_out())??;
++        }
++        #[allow(unreachable_code)]
++        Ok::<(), Error>(())
++    };
++    tokio::select! { result = requests => result, result = replies => result }
++}
++
++pub(crate) struct LengthReader<R> {
++    pub io: R,
++    pub target: DstAddr,
++    pub vless_response: bool,
++}
++pub(crate) struct LengthWriter<W> {
++    pub io: W,
++}
++#[async_trait]
++impl<R: AsyncRead + Unpin + Send> ReadDatagram for LengthReader<R> {
++    async fn read(&mut self) -> Result<Frame> {
++        if self.vless_response {
++            let version = self.io.read_u8().await?;
++            if version != 0 {
++                return Err(Error::Proto("VLESS UDP response version mismatch"));
++            }
++            let n = self.io.read_u8().await? as usize;
++            let mut addons = vec![0; n];
++            self.io.read_exact(&mut addons).await?;
++            self.vless_response = false;
++        }
++        let n = self.io.read_u16().await? as usize;
++        if n > MAX_DATAGRAM {
++            return Err(Error::Proto("UDP frame exceeds maximum datagram size"));
++        }
++        let mut data = vec![0; n];
++        self.io.read_exact(&mut data).await?;
++        Ok(Frame {
++            target: self.target.clone(),
++            data: data.into(),
++        })
++    }
++}
++#[async_trait]
++impl<W: AsyncWrite + Unpin + Send> WriteDatagram for LengthWriter<W> {
++    async fn write(&mut self, frame: &Frame) -> Result<()> {
++        validate_payload(&frame.data)?;
++        self.io.write_u16(frame.data.len() as u16).await?;
++        self.io.write_all(&frame.data).await?;
++        self.io.flush().await?;
++        Ok(())
++    }
++}
++
++pub(crate) async fn read_socks_addr<R: AsyncRead + Unpin + Send>(io: &mut R) -> Result<DstAddr> {
++    let atyp = io.read_u8().await?;
++    let mut encoded = vec![atyp];
++    let len = match atyp {
++        1 => 6,
++        4 => 18,
++        3 => {
++            let n = io.read_u8().await?;
++            if n == 0 {
++                return Err(Error::Proto("empty UDP domain"));
++            }
++            encoded.push(n);
++            n as usize + 2
++        }
++        _ => return Err(Error::Proto("invalid UDP address type")),
++    };
++    let offset = encoded.len();
++    encoded.resize(offset + len, 0);
++    io.read_exact(&mut encoded[offset..]).await?;
++    vp_common::addr::decode_socks_addr(&encoded).map(|(dst, _)| dst)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::sync::atomic::{AtomicUsize, Ordering};
++    struct FakeFactory(AtomicUsize);
++    struct PendingReader;
++    struct SinkWriter;
++    #[async_trait]
++    impl ReadDatagram for PendingReader {
++        async fn read(&mut self) -> Result<Frame> {
++            std::future::pending().await
++        }
++    }
++    #[async_trait]
++    impl WriteDatagram for SinkWriter {
++        async fn write(&mut self, _: &Frame) -> Result<()> {
++            Ok(())
++        }
++    }
++    #[async_trait]
++    impl Factory for FakeFactory {
++        async fn open(&self, _: &DstAddr) -> Result<DatagramIo> {
++            self.0.fetch_add(1, Ordering::SeqCst);
++            Ok((Box::new(PendingReader), Box::new(SinkWriter)))
++        }
++    }
++    #[tokio::test]
++    async fn session_limit_and_drop_close_all_owned_readers() {
++        let scope = vp_core::task_scope::TaskScope::new();
++        let factory = Arc::new(FakeFactory(AtomicUsize::new(0)));
++        scope
++            .run(async {
++                let conn = StreamPacketConn::new(factory.clone(), None);
++                let src = "127.0.0.1:1".parse().unwrap();
++                for port in 1..=MAX_SESSIONS as u16 {
++                    conn.send(&UdpPacket {
++                        src,
++                        dst: SocketAddr::new(src.ip(), port),
++                        data: Bytes::from_static(b"one"),
++                    })
++                    .await
++                    .unwrap();
++                }
++                assert!(
++                    conn.send(&UdpPacket {
++                        src,
++                        dst: SocketAddr::new(src.ip(), 99),
++                        data: Bytes::from_static(b"limit")
++                    })
++                    .await
++                    .is_err()
++                );
++                assert_eq!(factory.0.load(Ordering::SeqCst), MAX_SESSIONS);
++                drop(conn);
++            })
++            .await;
++        let report = scope
++            .shutdown(Duration::from_millis(20), Duration::from_secs(1))
++            .await;
++        assert_eq!(report.remaining_tasks, 0);
++        assert_eq!(report.forced_tasks, 0);
++    }
++    #[tokio::test]
++    async fn stopped_generation_cannot_reopen_packet_session() {
++        let scope = vp_core::task_scope::TaskScope::new();
++        let factory = Arc::new(FakeFactory(AtomicUsize::new(0)));
++        let conn = scope
++            .run(async { StreamPacketConn::new(factory.clone(), None) })
++            .await;
++        scope.shutdown(Duration::ZERO, Duration::from_secs(1)).await;
++        let addr = "127.0.0.1:1".parse().unwrap();
++        assert!(
++            conn.send(&UdpPacket {
++                src: addr,
++                dst: addr,
++                data: Bytes::from_static(b"late")
++            })
++            .await
++            .is_err()
++        );
++        assert_eq!(factory.0.load(Ordering::SeqCst), 0);
++    }
++    #[tokio::test]
++    async fn fragmented_length_reader_preserves_zero_datagrams() {
++        let (mut peer, io) = tokio::io::duplex(16);
++        let task = tokio::spawn(async move {
++            for byte in [0u8, 0, 0, 3, b'o', b'n', b'e'] {
++                peer.write_all(&[byte]).await.unwrap();
++                tokio::task::yield_now().await;
++            }
++        });
++        let mut reader = LengthReader {
++            io,
++            target: DstAddr::new("127.0.0.1", 9),
++            vless_response: false,
++        };
++        assert!(reader.read().await.unwrap().data.is_empty());
++        assert_eq!(&reader.read().await.unwrap().data[..], b"one");
++        task.await.unwrap();
++    }
++}
+diff --git a/crates/vp-protocol/src/trojan.rs b/crates/vp-protocol/src/trojan.rs
+index e1f78f6..92e9f7b 100644
+--- a/crates/vp-protocol/src/trojan.rs
++++ b/crates/vp-protocol/src/trojan.rs
+@@ -27,11 +27,13 @@ fn password_hash(pw: &str) -> [u8; 28] {
+ // 出站
+ // ---------------------------------------------------------------------------
+ 
++#[derive(Clone)]
+ pub struct TrojanOutbound {
+     name: Arc<str>,
+     server: String,
+     port: u16,
+     hash: [u8; 28],
++    udp: bool,
+     transport: transport::TransportConfig,
+ }
+ 
+@@ -63,6 +65,7 @@ impl TrojanOutbound {
+             server: cfg.server.clone(),
+             port: cfg.port,
+             hash: password_hash(&cfg.password),
++            udp: cfg.udp,
+             transport: t,
+         })
+     }
+@@ -118,11 +121,89 @@ impl Outbound for TrojanOutbound {
+         self.handshake(io, dst, None).await
+     }
+ 
++    fn support_udp(&self) -> bool {
++        self.udp
++    }
++
++    async fn connect_packet(
++        &self,
++        sess: &Session,
++        dst: &DstAddr,
++    ) -> Result<Box<dyn vp_core::PacketConn>> {
++        if !self.udp {
++            return Err(Error::Unsupported("Trojan UDP is disabled".into()));
++        }
++        crate::stream_udp::validate_target(dst)?;
++        Ok(Box::new(crate::stream_udp::StreamPacketConn::new(
++            Arc::new(self.clone()),
++            sess.src,
++        )))
++    }
++
+     fn remote_addr(&self) -> Option<(String, u16)> {
+         Some((self.server.clone(), self.port))
+     }
+ }
+ 
++#[async_trait]
++impl crate::stream_udp::Factory for TrojanOutbound {
++    async fn open(&self, dst: &DstAddr) -> Result<crate::stream_udp::DatagramIo> {
++        crate::stream_udp::validate_target(dst)?;
++        let mut io = transport::dial(&self.server, self.port, &self.transport).await?;
++        let mut header = self
++            .hash
++            .iter()
++            .map(|b| format!("{b:02x}"))
++            .collect::<String>()
++            .into_bytes();
++        header.extend_from_slice(b"\r\n");
++        header.push(3);
++        encode_socks_addr(dst, &mut header);
++        header.extend_from_slice(b"\r\n");
++        io.write_all(&header).await?;
++        io.flush().await?;
++        let (read, write) = tokio::io::split(io);
++        Ok((Box::new(TrojanReader(read)), Box::new(TrojanWriter(write))))
++    }
++}
++struct TrojanReader<R>(R);
++struct TrojanWriter<W>(W);
++#[async_trait]
++impl<R: AsyncRead + Unpin + Send> crate::stream_udp::ReadDatagram for TrojanReader<R> {
++    async fn read(&mut self) -> Result<crate::stream_udp::Frame> {
++        let target = crate::stream_udp::read_socks_addr(&mut self.0).await?;
++        let len = self.0.read_u16().await? as usize;
++        if len > crate::stream_udp::MAX_DATAGRAM {
++            return Err(Error::Proto("Trojan UDP frame exceeds datagram limit"));
++        }
++        let mut crlf = [0; 2];
++        self.0.read_exact(&mut crlf).await?;
++        if &crlf != b"\r\n" {
++            return Err(Error::Proto("Trojan UDP frame missing CRLF"));
++        }
++        let mut data = vec![0; len];
++        self.0.read_exact(&mut data).await?;
++        Ok(crate::stream_udp::Frame {
++            target,
++            data: data.into(),
++        })
++    }
++}
++#[async_trait]
++impl<W: AsyncWrite + Unpin + Send> crate::stream_udp::WriteDatagram for TrojanWriter<W> {
++    async fn write(&mut self, frame: &crate::stream_udp::Frame) -> Result<()> {
++        crate::stream_udp::validate_payload(&frame.data)?;
++        let mut data = Vec::with_capacity(frame.data.len() + 24);
++        encode_socks_addr(&frame.target, &mut data);
++        data.extend_from_slice(&(frame.data.len() as u16).to_be_bytes());
++        data.extend_from_slice(b"\r\n");
++        data.extend_from_slice(&frame.data);
++        self.0.write_all(&data).await?;
++        self.0.flush().await?;
++        Ok(())
++    }
++}
++
+ // ---------------------------------------------------------------------------
+ // 入站（默认要求 TLS；测试/明文场景可关）
+ // ---------------------------------------------------------------------------
+@@ -177,8 +258,10 @@ impl TrojanInbound {
+         }
+         let mut cmd = [0u8; 1];
+         stream.read_exact(&mut cmd).await?;
+-        if cmd[0] != 0x01 {
+-            return Err(Error::Unsupported("trojan 入站仅支持 TCP".into()));
++        if !matches!(cmd[0], 1 | 3) {
++            return Err(Error::Unsupported(
++                "Trojan command is not TCP or UDP".into(),
++            ));
+         }
+         // SOCKS 地址增量读
+         let mut addr_buf: Vec<u8> = Vec::with_capacity(300);
+@@ -203,6 +286,15 @@ impl TrojanInbound {
+             return Err(Error::Proto("trojan: 缺少结尾 CRLF"));
+         }
+ 
++        if cmd[0] == 3 {
++            let (read, write) = tokio::io::split(stream);
++            return crate::stream_udp::serve(
++                Box::new(TrojanReader(read)),
++                Box::new(TrojanWriter(write)),
++                self.direct.clone(),
++            )
++            .await;
++        }
+         let sess = Session::new_tcp(self.tag.clone(), Some(src), dst.clone());
+         let remote = self.direct.connect_stream(&sess, &dst).await?;
+         let meta = vp_core::conn_table::ConnMeta {
+diff --git a/crates/vp-protocol/src/vless.rs b/crates/vp-protocol/src/vless.rs
+index 06d05a1..2fe1452 100644
+--- a/crates/vp-protocol/src/vless.rs
++++ b/crates/vp-protocol/src/vless.rs
+@@ -23,8 +23,9 @@ use vp_transport as transport;
+ 
+ const VERSION: u8 = 0x00;
+ const CMD_TCP: u8 = 0x01;
++const CMD_UDP: u8 = 0x02;
+ 
+-fn encode_addr(dst: &DstAddr, is_vision: bool, out: &mut Vec<u8>) {
++fn encode_addr(dst: &DstAddr, is_vision: bool, cmd: u8, out: &mut Vec<u8>) {
+     // [addons len][cmd][port][atyp][addr]（版本与 UUID 由调用方前置）
+     if is_vision {
+         out.push(VISION_FLOW_BYTES.len() as u8);
+@@ -32,7 +33,7 @@ fn encode_addr(dst: &DstAddr, is_vision: bool, out: &mut Vec<u8>) {
+     } else {
+         out.push(0); // addons len
+     }
+-    out.push(CMD_TCP);
++    out.push(cmd);
+     out.extend_from_slice(&dst.port.to_be_bytes());
+     match &dst.host {
+         Host::Ip(std::net::IpAddr::V4(v4)) => {
+@@ -51,7 +52,7 @@ fn encode_addr(dst: &DstAddr, is_vision: bool, out: &mut Vec<u8>) {
+     }
+ }
+ 
+-fn decode_request(buf: &[u8]) -> Result<([u8; 16], DstAddr, bool, usize)> {
++fn decode_request(buf: &[u8]) -> Result<([u8; 16], DstAddr, bool, u8, usize)> {
+     if buf.len() < 18 {
+         return Err(Error::Proto("vless 请求头过短"));
+     }
+@@ -81,10 +82,8 @@ fn decode_request(buf: &[u8]) -> Result<([u8; 16], DstAddr, bool, usize)> {
+     }
+     let cmd = buf[i];
+     i += 1;
+-    if cmd != CMD_TCP {
+-        return Err(Error::Unsupported(
+-            "vless inbound UDP not yet implemented".into(),
+-        ));
++    if !matches!(cmd, CMD_TCP | CMD_UDP) {
++        return Err(Error::Unsupported("vless command is not TCP or UDP".into()));
+     }
+     let port = u16::from_be_bytes([buf[i], buf[i + 1]]);
+     i += 2;
+@@ -128,7 +127,7 @@ fn decode_request(buf: &[u8]) -> Result<([u8; 16], DstAddr, bool, usize)> {
+         }
+         _ => return Err(Error::Proto("vless atyp 非法")),
+     };
+-    Ok((uuid, DstAddr { host, port }, is_vision, i))
++    Ok((uuid, DstAddr { host, port }, is_vision, cmd, i))
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -142,6 +141,7 @@ pub struct VlessOutbound {
+     port: u16,
+     uuid: [u8; 16],
+     flow: Option<String>,
++    udp: bool,
+     transport: transport::TransportConfig,
+ }
+ 
+@@ -176,6 +176,7 @@ impl VlessOutbound {
+             port: cfg.port,
+             uuid,
+             flow: cfg.flow.clone(),
++            udp: cfg.udp,
+             transport: t,
+         })
+     }
+@@ -191,7 +192,7 @@ impl VlessOutbound {
+             .unwrap_or(false);
+ 
+         let mut req = Vec::with_capacity(48);
+-        encode_addr(dst, is_vision, &mut req);
++        encode_addr(dst, is_vision, CMD_TCP, &mut req);
+         let mut full = Vec::with_capacity(1 + 16 + req.len());
+         full.push(VERSION);
+         full.extend_from_slice(&self.uuid);
+@@ -408,11 +409,54 @@ impl Outbound for VlessOutbound {
+         self.handshake(io, dst).await
+     }
+ 
++    fn support_udp(&self) -> bool {
++        self.udp && self.flow.as_deref().is_none_or(str::is_empty)
++    }
++
++    async fn connect_packet(
++        &self,
++        sess: &Session,
++        dst: &DstAddr,
++    ) -> Result<Box<dyn vp_core::PacketConn>> {
++        if !self.support_udp() {
++            return Err(Error::Unsupported(
++                "VLESS UDP is disabled or uses unsupported Vision/XUDP flow".into(),
++            ));
++        }
++        crate::stream_udp::validate_target(dst)?;
++        Ok(Box::new(crate::stream_udp::StreamPacketConn::new(
++            Arc::new(self.clone()),
++            sess.src,
++        )))
++    }
++
+     fn remote_addr(&self) -> Option<(String, u16)> {
+         Some((self.server.clone(), self.port))
+     }
+ }
+ 
++#[async_trait]
++impl crate::stream_udp::Factory for VlessOutbound {
++    async fn open(&self, dst: &DstAddr) -> Result<crate::stream_udp::DatagramIo> {
++        crate::stream_udp::validate_target(dst)?;
++        let mut io = transport::dial(&self.server, self.port, &self.transport).await?;
++        let mut header = vec![VERSION];
++        header.extend_from_slice(&self.uuid);
++        encode_addr(dst, false, CMD_UDP, &mut header);
++        io.write_all(&header).await?;
++        io.flush().await?;
++        let (read, write) = tokio::io::split(io);
++        Ok((
++            Box::new(crate::stream_udp::LengthReader {
++                io: read,
++                target: dst.clone(),
++                vless_response: true,
++            }),
++            Box::new(crate::stream_udp::LengthWriter { io: write }),
++        ))
++    }
++}
++
+ // ---------------------------------------------------------------------------
+ // 入站
+ // ---------------------------------------------------------------------------
+@@ -501,14 +545,33 @@ impl VlessInbound {
+             }
+             filled += n;
+             match decode_request(&buf[..filled]) {
+-                Ok((uuid, dst, is_vision, used)) => {
++                Ok((uuid, dst, is_vision, cmd, used)) => {
+                     if !self.uuids.contains(&uuid) {
+                         return Err(Error::Proto("vless: 用户认证失败"));
+                     }
+                     if is_vision {
+                         return Err(Error::Unsupported("vless Vision needs the authenticated raw TLS record boundary; generic stream transport cannot provide it".into()));
+                     }
+-
++                    if cmd == CMD_UDP {
++                        crate::stream_udp::validate_target(&dst)?;
++                        stream.write_all(&[VERSION, 0]).await?;
++                        stream.flush().await?;
++                        let stream = RequestTailStream {
++                            inner: stream,
++                            tail: BytesMut::from(&buf[used..filled]),
++                        };
++                        let (read, write) = tokio::io::split(stream);
++                        return crate::stream_udp::serve(
++                            Box::new(crate::stream_udp::LengthReader {
++                                io: read,
++                                target: dst,
++                                vless_response: false,
++                            }),
++                            Box::new(crate::stream_udp::LengthWriter { io: write }),
++                            self.direct.clone(),
++                        )
++                        .await;
++                    }
+                     let sess = Session::new_tcp(self.tag.clone(), Some(src), dst.clone());
+                     let remote = self.direct.connect_stream(&sess, &dst).await?;
+                     stream.write_all(&[VERSION, 0]).await?;
+@@ -761,6 +824,7 @@ mod tests {
+             port: 9,
+             uuid: [1; 16],
+             flow: None,
++            udp: false,
+             transport: Default::default(),
+         };
+         let destination = DstAddr::new("127.0.0.1", 9);
+diff --git a/crates/vp-protocol/src/vmess.rs b/crates/vp-protocol/src/vmess.rs
+index 260612f..c1f3c04 100644
+--- a/crates/vp-protocol/src/vmess.rs
++++ b/crates/vp-protocol/src/vmess.rs
+@@ -887,6 +887,7 @@ pub struct VmessOutbound {
+     /// alterId>0 的旧版节点只认 legacy（MD5/HMAC-MD5 + AES-CFB）认证头
+     legacy: bool,
+     security: Security,
++    udp: bool,
+     transport: transport::TransportConfig,
+ }
+ 
+@@ -924,6 +925,7 @@ impl VmessOutbound {
+             cmd_key,
+             legacy: cfg.alter_id > 0,
+             security,
++            udp: cfg.udp,
+             transport: t,
+         })
+     }
+@@ -1028,11 +1030,116 @@ impl Outbound for VmessOutbound {
+         self.handshake(io, dst).await
+     }
+ 
++    fn support_udp(&self) -> bool {
++        self.udp && !self.legacy
++    }
++    async fn connect_packet(
++        &self,
++        sess: &Session,
++        dst: &DstAddr,
++    ) -> Result<Box<dyn vp_core::PacketConn>> {
++        if !self.support_udp() {
++            return Err(Error::Unsupported(
++                "VMess UDP is disabled or legacy alterId is unsupported".into(),
++            ));
++        }
++        crate::stream_udp::validate_target(dst)?;
++        Ok(Box::new(crate::stream_udp::StreamPacketConn::new(
++            Arc::new(self.clone()),
++            sess.src,
++        )))
++    }
+     fn remote_addr(&self) -> Option<(String, u16)> {
+         Some((self.server.clone(), self.port))
+     }
+ }
+ 
++#[async_trait]
++impl crate::stream_udp::Factory for VmessOutbound {
++    async fn open(&self, dst: &DstAddr) -> Result<crate::stream_udp::DatagramIo> {
++        crate::stream_udp::validate_target(dst)?;
++        let io = transport::dial(&self.server, self.port, &self.transport).await?;
++        let session = self.handshake_command(io, dst, 2).await?;
++        let (read, write) = tokio::io::split(session.inner);
++        Ok((
++            Box::new(VmessDatagramReader {
++                io: read,
++                codec: session.dec,
++                target: dst.clone(),
++                raw: BytesMut::new(),
++                response: session.resp_header,
++            }),
++            Box::new(VmessDatagramWriter {
++                io: write,
++                codec: session.enc,
++            }),
++        ))
++    }
++}
++struct VmessDatagramReader<R> {
++    io: R,
++    codec: BodyCodec,
++    target: DstAddr,
++    raw: BytesMut,
++    response: Option<RespHeader>,
++}
++struct VmessDatagramWriter<W> {
++    io: W,
++    codec: BodyCodec,
++}
++#[async_trait]
++impl<R: AsyncRead + Unpin + Send> crate::stream_udp::ReadDatagram for VmessDatagramReader<R> {
++    async fn read(&mut self) -> Result<crate::stream_udp::Frame> {
++        std::future::poll_fn(|cx| {
++            VmessStream::<tokio::io::DuplexStream>::poll_resp_header(
++                &mut self.response,
++                &mut self.io,
++                cx,
++            )
++        })
++        .await?;
++        loop {
++            if let Some(result) = self.codec.try_open_chunk(&self.raw) {
++                let (data, used) = result?;
++                self.raw.advance(used);
++                crate::stream_udp::validate_payload(&data)?;
++                return Ok(crate::stream_udp::Frame {
++                    target: self.target.clone(),
++                    data: data.into(),
++                });
++            }
++            let mut buf = [0; 8192];
++            let n = self.io.read(&mut buf).await?;
++            if n == 0 {
++                return Err(Error::Io(std::io::Error::new(
++                    std::io::ErrorKind::UnexpectedEof,
++                    "VMess UDP stream ended",
++                )));
++            }
++            self.raw.extend_from_slice(&buf[..n]);
++            if self.raw.len() > 65_537 + 8192 {
++                return Err(Error::Proto("VMess UDP frame buffer limit"));
++            }
++        }
++    }
++}
++#[async_trait]
++impl<W: AsyncWrite + Unpin + Send> crate::stream_udp::WriteDatagram for VmessDatagramWriter<W> {
++    async fn write(&mut self, frame: &crate::stream_udp::Frame) -> Result<()> {
++        use tokio::io::AsyncWriteExt;
++        crate::stream_udp::validate_payload(&frame.data)?;
++        if frame.data.is_empty() && self.codec.aead.is_none() {
++            return Err(Error::Unsupported(
++                "VMess security=none reserves zero-length chunks for EOF".into(),
++            ));
++        }
++        let chunk = self.codec.seal_chunk(&frame.data)?;
++        self.io.write_all(&chunk).await?;
++        self.io.flush().await?;
++        Ok(())
++    }
++}
++
+ // ---------------------------------------------------------------------------
+ // 入站
+ // ---------------------------------------------------------------------------
+@@ -1098,13 +1205,13 @@ impl VmessInbound {
+         let (cmd_key, timestamp) = matched.ok_or(Error::Proto("vmess: 用户认证失败"))?;
+         let plaintext = open_header(&cmd_key, &auth_id, &mut stream).await?;
+         let req = parse_request_plaintext(&plaintext)?;
+-        if req.cmd != 1 {
+-            return Err(Error::Unsupported(
+-                "VMess inbound UDP not yet implemented".into(),
+-            ));
++        if !matches!(req.cmd, 1 | 2) {
++            return Err(Error::Unsupported("VMess command is not TCP or UDP".into()));
+         }
+         validate_options(req.security, req.option)?;
+-
++        if req.cmd == 2 && req.option & OPT_CHUNK_STREAM == 0 {
++            return Err(Error::Proto("VMess UDP requires chunk framing"));
++        }
+         {
+             let mut replay = self
+                 .replay
+@@ -1126,7 +1233,31 @@ impl VmessInbound {
+         let resp = build_response_header(req.resp_auth, &resp_key, &resp_iv, req.option)?;
+         stream.write_all(&resp).await?;
+         stream.flush().await?;
+-
++        if req.cmd == 2 {
++            let (read, write) = tokio::io::split(stream);
++            let reader = VmessDatagramReader {
++                io: read,
++                codec: BodyCodec::with_options(
++                    req.security,
++                    &req.body_key,
++                    &req.body_iv,
++                    req.option,
++                )?,
++                target: req.dst,
++                raw: BytesMut::new(),
++                response: None,
++            };
++            let writer = VmessDatagramWriter {
++                io: write,
++                codec: BodyCodec::with_options(req.security, &resp_key, &resp_iv, req.option)?,
++            };
++            return crate::stream_udp::serve(
++                Box::new(reader),
++                Box::new(writer),
++                self.direct.clone(),
++            )
++            .await;
++        }
+         let sess = Session::new_tcp(self.tag.clone(), Some(src), req.dst.clone());
+         let remote = self.direct.connect_stream(&sess, &req.dst).await?;
+         let client = VmessStream {
+diff --git a/crates/vp-protocol/tests/STREAM_VERIFICATION.md b/crates/vp-protocol/tests/STREAM_VERIFICATION.md
+new file mode 100644
+index 0000000..7cf74ec
+--- /dev/null
++++ b/crates/vp-protocol/tests/STREAM_VERIFICATION.md
+@@ -0,0 +1,68 @@
++# Stream protocol UDP / framing verification — 2026-10-30
++
++## Identity and scope
++
++Authored in a detached product worktree based on clean generated core
++`74f4c88b6e6243d858f45e172f18e4aa845d5f7f`, following separate chained-UDP
++fail-closed commit `2f89852` (already integrated independently). Original upstream
++`/workspace/shared/vp_core` is not edited. No Cargo manifest/lock change.
++
++The first source patch corrects VLESS partial-write/response buffering and VMess
++request padding, security=none wire format, four-byte response header, partial
++header reads, buffered write acceptance, canonical TCP chunk size, body nonce
++exhaustion and bounded auth-ID replay rejection. The second adds command-UDP and
++its tests. Final combined source, not the intermediate first patch alone, was
++compiled and executed in the author worktree.
++
++## Actual executed results
++
++Rust `--locked`, jobs=1, incremental=0, dev/test debug=0; shared
++`.local-cache/product-core-target`. No worker binary was rebuilt or overwritten.
++
++- 24 focused unit/composition tests PASS: VLESS4, VMess8, Trojan1, packet pool3,
++  existing server stream composition8 (TLS/WS/H2/Upgrade TCP regressions included).
++- 4 local integration tests PASS: all five modes' TCP100KB; IPv4/IPv6 UDP
++  1/128/4096/8192/15000/60000-byte payloads (plus empty datagrams except
++  VMess-none); multi-target identity and stable per-target source; canceled
++  receive recovery; explicit oversize/UDP-disabled/host-denied errors; captured
++  host authority; nonloopback/domain rejection before DNS/socket; scope cleanup.
++- 2 explicitly enabled independent integration matrix tests PASS against
++  unmodified official protocol libraries, **both directions**, VLESS/Trojan and
++  VMess AES-128-GCM/ChaCha20-Poly1305/none. TCP, IPv4/IPv6 UDP, wrong credentials,
++  stale VMess timestamp, VMess auth-ID replay, authenticated-body corruption,
++  global padding, multi-target/multi-size and generation cleanup are exercised.
++- Official library references: sing-vmess `a0c58542bd9d`, sing-box v1.14.4
++  `transport/trojan`, Go1.26.10. `go mod verify` PASS. Every compiled dependency
++  other than the root module is compared to v1.14.4's official go.sum; the root
++  module is independently checksum-database verified.
++- Rustfmt on changed Rust source/tests and `git diff --check` PASS.
++
++Durable raw logs and reference build/module/binary hashes are in the product
++`integration/stream-evidence/`, with final and earlier failed runs separately
++named. Initial fixture buffer ownership/headroom errors and a real VMess TCP
++chunk-size incompatibility were corrected; only final reruns are PASS.
++
++## Bounds and deliberate fail-closed boundaries
++
++- Clients send UDP only over their configured proxy transport; no direct UDP
++  fallback. VLESS/VMess fixed-destination commands use one proxy stream per
++  destination. At most16 sessions,16 queued frames per session/response queue,
++  10-second open/write deadline,120-second request-idle lifetime. Owned tracked
++  open/read/write tasks abort on drop and generation shutdown. Direct server
++  forwarding checks destination policy before DNS and uses protected constructors.
++- Maximum ordinary UDP payload65507. Independent VMess acceptance is bounded to
++  15000 bytes because this official library's UDP writer chunks larger payloads;
++  larger same-engine framing tests are not independent interoperability evidence.
++- `udp:false` errors. Chained UDP errors instead of bypassing its dialer. VMess
++  legacy alterId UDP, authenticated-length/connection-reuse options and unknown
++  wire flags error explicitly. VMess-none zero-length chunks are reserved for EOF
++  and empty writes are rejected rather than silently discarded.
++- No XUDP/packetaddr/mux or REALITY/Vision claim. VLESS Vision remains fail closed.
++  Existing carrier composition tests are TCP regressions; this is not an
++  independent all-carrier/TLS/Android packet-runtime acceptance matrix.
++- VLESS/Trojan have no standalone UDP replay authentication; their authenticated
++  encrypted carrier is a separate security layer. The raw protocol tests do not
++  manufacture replay-protection claims for these protocols.
++- No capability catalog/readiness flags were promoted. This work does not reduce
++  the full21-preset product release scope or certify any merged identity until
++  the integration owner replays/tests the promoted patchset.
+diff --git a/crates/vp-protocol/tests/reference_stream/README.md b/crates/vp-protocol/tests/reference_stream/README.md
+new file mode 100644
+index 0000000..183163d
+--- /dev/null
++++ b/crates/vp-protocol/tests/reference_stream/README.md
+@@ -0,0 +1,39 @@
++# Independent stream protocol-library peer (test only)
++
++The adapter invokes unchanged `sing-vmess` commit
++`a0c58542bd9d99b00ea0c3cfacce6f03cf8a4017` and the `transport/trojan`
++package of official `sing-box v1.14.4`, commit
++`c005f35300ce76427dc285481ec5695f5b179cd2`.
++All compiled dependency identities are checked against that release's `go.sum`;
++the root sing-box module itself is Go-checksum-database verified. No protocol,
++KDF, cipher, authentication or wire framing is reimplemented by this Go adapter.
++It never constructs sing-box NetworkManager or invokes its CLI.
++
++Only `127.0.0.1`/`::1` listeners and explicitly checked loopback-IP forwarding
++are permitted. Credentials arrive over stdin and exist only for the test process.
++No host routes, firewall, TUN, system proxy, installation, persistent key, publishing
++or production engine substitution occurs. This Go module is never a Cargo
++production dependency or shipped runtime artifact.
++
++The VLESS adapter uses the library's `PacketConn.Read/Write` interface, converting
++only the caller's buffer ownership to sing's `network.PacketConn`. VMess disables
++only the library service's optional first-read packet-size heuristic so fragmented
++legitimate TCP writes can be tested; protocol validation/AEAD/replay remain intact.
++VLESS/Trojan UDP bodies are tested up to 60000 bytes; the pinned sing-vmess writer
++splits bodies above its 15000-byte chunk writer MTU, so independent VMess datagram
++acceptance is explicitly bounded to 15000 bytes (larger Rust-only framing tests are
++not presented as independent acceptance). Global-padding AEAD requests are tested.
++Authenticated-length, legacy alterId UDP, XUDP/packetaddr, mux and Vision UDP are
++explicit unsupported boundaries, not aliases of ordinary command-UDP.
++
++Authorized build and test (one job, conditional free-space guard):
++
++```
++GOMAXPROCS=1 GOFLAGS=-p=1 go mod verify
++GOMAXPROCS=1 CGO_ENABLED=0 go build -p=1 -mod=readonly -trimpath -buildvcs=false -o reference-stream .
++VP_STREAM_REFERENCE=/absolute/path/reference-stream cargo test --locked -p vp-protocol --test stream_library_interop -- --ignored --nocapture --test-threads=1
++```
++
++This directory is source and dependency provenance. See the durable project
++`integration/stream-evidence` for actual build/test outcomes; the existence of this
++harness does not assert that an ignored test was executed or passed.
+diff --git a/crates/vp-protocol/tests/reference_stream/go.mod b/crates/vp-protocol/tests/reference_stream/go.mod
+new file mode 100644
+index 0000000..2dfd040
+--- /dev/null
++++ b/crates/vp-protocol/tests/reference_stream/go.mod
+@@ -0,0 +1,20 @@
++module vp-product.test/reference-stream
++
++go 1.25.5
++
++require (
++	github.com/sagernet/sing v0.9.7-0.20261023115459-5dc452e537bf
++	github.com/sagernet/sing-box v1.14.4
++	github.com/sagernet/sing-vmess v0.2.9-0.20261019223527-a0c58542bd9d
++)
++
++require (
++	github.com/andybalholm/brotli v1.1.0 // indirect
++	github.com/gofrs/uuid/v5 v5.5.1 // indirect
++	github.com/klauspost/compress v1.19.1 // indirect
++	github.com/metacubex/utls v1.8.7 // indirect
++	github.com/sagernet/smux v1.5.50-sing-box-mod.1 // indirect
++	golang.org/x/crypto v0.54.0 // indirect
++	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f // indirect
++	golang.org/x/sys v0.47.0 // indirect
++)
+diff --git a/crates/vp-protocol/tests/reference_stream/go.sum b/crates/vp-protocol/tests/reference_stream/go.sum
+new file mode 100644
+index 0000000..7b32f10
+--- /dev/null
++++ b/crates/vp-protocol/tests/reference_stream/go.sum
+@@ -0,0 +1,26 @@
++github.com/andybalholm/brotli v1.1.0 h1:eLKJA0d02Lf0mVpIDgYnqXcUn0GqVmEFny3VuID1U3M=
++github.com/andybalholm/brotli v1.1.0/go.mod h1:sms7XGricyQI9K10gOSf56VKKWS4oLer58Q+mhRPtnY=
++github.com/gofrs/uuid/v5 v5.5.1 h1:z1Ce19/JwNidXpy3tOQc3241lnJLKdKyq/xlNvlD4Ng=
++github.com/gofrs/uuid/v5 v5.5.1/go.mod h1:bbAA98EoIlxyRHIVg6ektCSsZ5n8mSbwgEhvhMYlZgg=
++github.com/klauspost/compress v1.19.1 h1:VsB4HPswih7mmZ8WleSFQ75c/Ui1M4trX5oAsJnhSlk=
++github.com/klauspost/compress v1.19.1/go.mod h1:cwPg85FWrGar70rWktvGQj8/hthj3wpl0PGDogxkrSQ=
++github.com/metacubex/utls v1.8.7 h1:Cp+yWkNTFkSihETgGWq34hlVFds5HpYWVOR1xovUVTs=
++github.com/metacubex/utls v1.8.7/go.mod h1:kncGGVhFaoGn5M3pFe3SXhZCzsbCJayNOH4UEqTKTko=
++github.com/sagernet/sing v0.9.7-0.20261023115459-5dc452e537bf h1:qWlGERjsI0F1I9e1W5Z/ARk/9KEN7xIas6e2QHEypUM=
++github.com/sagernet/sing v0.9.7-0.20261023115459-5dc452e537bf/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
++github.com/sagernet/sing-box v1.14.4 h1:KV6J8v1zMUu7BZA93nD9HGMmQnNC46VTuYaKEHkP+gA=
++github.com/sagernet/sing-box v1.14.4/go.mod h1:hez15ThcG5PcR3tmuHZYDH46LTO9WGj53UzrCQ39744=
++github.com/sagernet/sing-vmess v0.2.9-0.20261019223527-a0c58542bd9d h1:K93710Sq6/TFl3GVs+NclQ3I+KPXFLluSsUFC0Sm0N8=
++github.com/sagernet/sing-vmess v0.2.9-0.20261019223527-a0c58542bd9d/go.mod h1:P11scgTxMxVVQ8dlM27yNm3Cro40mD0+gHbnqrNGDuY=
++github.com/sagernet/smux v1.5.50-sing-box-mod.1 h1:XkJcivBC9V4wBjiGXIXZ229aZCU1hzcbp6kSkkyQ478=
++github.com/sagernet/smux v1.5.50-sing-box-mod.1/go.mod h1:NjhsCEWedJm7eFLyhuBgIEzwfhRmytrUoiLluxs5Sk8=
++github.com/stretchr/testify v1.12.0 h1:K6Mr6jO9JICuend/5xzTM03ydSV3vdNRYAdPSukj8uI=
++github.com/stretchr/testify v1.12.0/go.mod h1:bOYBZb5qJ00vPzWfIqBUZPaxK8jWiXc6d3ErP4Ca9Gw=
++golang.org/x/crypto v0.54.0 h1:YLIA59K4fiNzHzjnZt2tUJQjQtUWfWbeHBqKtk3eScw=
++golang.org/x/crypto v0.54.0/go.mod h1:KWL8ny2AZdGR2cWmzeHrp2azQPGogOv+HeQaVEXC2dk=
++golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f h1:W3F4c+6OLc6H2lb//N1q4WpJkhzJCK5J6kUi1NTVXfM=
++golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f/go.mod h1:J1xhfL/vlindoeF/aINzNzt2Bket5bjo9sdOYzOsU80=
++golang.org/x/sys v0.47.0 h1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=
++golang.org/x/sys v0.47.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
++gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
++gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
+diff --git a/crates/vp-protocol/tests/reference_stream/main.go b/crates/vp-protocol/tests/reference_stream/main.go
+new file mode 100644
+index 0000000..b232ea1
+--- /dev/null
++++ b/crates/vp-protocol/tests/reference_stream/main.go
+@@ -0,0 +1,445 @@
++// Test-only adapter. Protocol framing/authentication/crypto are unmodified
++// official sing-vmess and sing-box transport/trojan libraries.
++package main
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"os"
++	"sync"
++	"time"
++
++	T "github.com/sagernet/sing-box/transport/trojan"
++	V "github.com/sagernet/sing-vmess"
++	L "github.com/sagernet/sing-vmess/vless"
++	"github.com/sagernet/sing/common/buf"
++	"github.com/sagernet/sing/common/logger"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++)
++
++type input struct {
++	Mode, Protocol, Credential, Security string
++	Port                                 uint16
++	Negative, Padding, Tamper, Replay    bool
++	TimeOffset                           int64
++}
++
++func deadline() time.Time { return time.Now().Add(8 * time.Second) }
++func loopback(a M.Socksaddr) error {
++	if !a.Addr.IsLoopback() || a.Port == 0 {
++		return errors.New("reference target must be a nonzero loopback IP address")
++	}
++	return nil
++}
++func emit(v any) error { return json.NewEncoder(os.Stdout).Encode(v) }
++func packetBuffer(data []byte) *buf.Buffer {
++	b := buf.NewSize(len(data) + 1024)
++	b.Resize(512, 0)
++	b.Write(data)
++	return b
++}
++
++type handler struct{}
++
++func (handler) NewConnectionEx(ctx context.Context, conn net.Conn, source, dst M.Socksaddr, onClose N.CloseHandlerFunc) {
++	go func() {
++		defer conn.Close()
++		if onClose != nil {
++			defer onClose(nil)
++		}
++		if loopback(dst) != nil {
++			return
++		}
++		remote, err := net.DialTimeout("tcp", dst.String(), 3*time.Second)
++		if err != nil {
++			return
++		}
++		defer remote.Close()
++		conn.SetDeadline(deadline())
++		remote.SetDeadline(deadline())
++		done := make(chan struct{})
++		go func() {
++			io.Copy(remote, conn)
++			if tcp, ok := remote.(*net.TCPConn); ok {
++				tcp.CloseWrite()
++			}
++			close(done)
++		}()
++		io.Copy(conn, remote)
++		conn.Close()
++		remote.Close()
++		<-done
++	}()
++}
++func (handler) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
++	go func() {
++		defer conn.Close()
++		if onClose != nil {
++			defer onClose(nil)
++		}
++		sockets := make(map[M.Socksaddr]*net.UDPConn)
++		defer func() {
++			for _, s := range sockets {
++				s.Close()
++			}
++		}()
++		for {
++			conn.SetDeadline(deadline())
++			buffer := buf.NewSize(65535)
++			dst, err := conn.ReadPacket(buffer)
++			if err != nil {
++				buffer.Release()
++				return
++			}
++			if loopback(dst) != nil {
++				buffer.Release()
++				return
++			}
++			socket := sockets[dst]
++			if socket == nil {
++				if len(sockets) >= 16 {
++					buffer.Release()
++					return
++				}
++				socket, err = net.DialUDP("udp", nil, dst.UDPAddr())
++				if err != nil {
++					buffer.Release()
++					return
++				}
++				sockets[dst] = socket
++			}
++			socket.SetDeadline(deadline())
++			_, err = socket.Write(buffer.Bytes())
++			buffer.Release()
++			if err != nil {
++				return
++			}
++			response := make([]byte, 65535)
++			n, err := socket.Read(response)
++			if err != nil {
++				return
++			}
++			if err = conn.WritePacket(packetBuffer(response[:n]), dst); err != nil {
++				return
++			}
++		}
++	}()
++}
++
++type service interface {
++	NewConnection(context.Context, net.Conn, M.Socksaddr, N.CloseHandlerFunc) error
++}
++
++func newService(c input) (service, error) {
++	switch c.Protocol {
++	case "vless":
++		s := L.NewService[string](logger.NOP(), handler{})
++		s.UpdateUsers([]string{"test"}, []string{c.Credential}, []string{""})
++		return s, nil
++	case "vmess":
++		s := V.NewService[string](handler{}, V.ServiceWithDisableHeaderProtection())
++		if err := s.UpdateUsers([]string{"test"}, []string{c.Credential}, []int{0}); err != nil {
++			return nil, err
++		}
++		return s, nil
++	case "trojan":
++		s := T.NewService[string](handler{}, nil, logger.NOP())
++		if err := s.UpdateUsers([]string{"test"}, []string{c.Credential}); err != nil {
++			return nil, err
++		}
++		return s, nil
++	default:
++		return nil, errors.New("unsupported reference protocol")
++	}
++}
++func runServer(c input) error {
++	s, err := newService(c)
++	if err != nil {
++		return err
++	}
++	listener, err := net.Listen("tcp4", "127.0.0.1:0")
++	if err != nil {
++		return err
++	}
++	defer listener.Close()
++	if err = emit(map[string]any{"port": listener.Addr().(*net.TCPAddr).Port, "kind": "official-protocol-library"}); err != nil {
++		return err
++	}
++	go func() {
++		for {
++			conn, e := listener.Accept()
++			if e != nil {
++				return
++			}
++			go func() {
++				conn.SetDeadline(deadline())
++				if e = s.NewConnection(context.Background(), conn, M.SocksaddrFromNet(conn.RemoteAddr()), nil); e != nil {
++					conn.Close()
++				}
++			}()
++		}
++	}()
++	_, err = io.Copy(io.Discard, os.Stdin)
++	return err
++}
++
++type capture struct {
++	net.Conn
++	bytes   []byte
++	corrupt bool
++}
++
++func (c *capture) Write(b []byte) (int, error) {
++	data := append([]byte(nil), b...)
++	if c.corrupt && len(data) > 2 {
++		data[2] ^= 0x80
++	}
++	c.bytes = append(c.bytes, data...)
++	return c.Conn.Write(data)
++}
++func vmessClient(c input) (*V.Client, error) {
++	var opts []V.ClientOption
++	if c.Padding {
++		opts = append(opts, V.ClientWithGlobalPadding())
++	}
++	if c.TimeOffset != 0 {
++		opts = append(opts, V.ClientWithTimeFunc(func() time.Time { return time.Now().Add(time.Duration(c.TimeOffset) * time.Second) }))
++	}
++	return V.NewClient(c.Credential, c.Security, 0, opts...)
++}
++func tcpClient(c input, raw net.Conn, dst M.Socksaddr) (net.Conn, error) {
++	switch c.Protocol {
++	case "vless":
++		client, e := L.NewClient(c.Credential, "", logger.NOP())
++		if e != nil {
++			return nil, e
++		}
++		return client.DialConn(raw, dst)
++	case "vmess":
++		client, e := vmessClient(c)
++		if e != nil {
++			return nil, e
++		}
++		return client.DialConn(raw, dst)
++	case "trojan":
++		return T.NewClientConn(raw, T.Key(c.Credential), dst), nil
++	}
++	return nil, errors.New("unsupported protocol")
++}
++
++type vlessPacket struct {
++	*L.PacketConn
++	dst M.Socksaddr
++}
++
++func (c *vlessPacket) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
++	_, err := buffer.ReadOnceFrom(c.PacketConn)
++	return c.dst, err
++}
++func (c *vlessPacket) WritePacket(buffer *buf.Buffer, _ M.Socksaddr) error {
++	defer buffer.Release()
++	_, err := c.PacketConn.Write(buffer.Bytes())
++	return err
++}
++func packetClient(c input, raw net.Conn, dst M.Socksaddr) (N.PacketConn, error) {
++	switch c.Protocol {
++	case "vless":
++		client, e := L.NewClient(c.Credential, "", logger.NOP())
++		if e != nil {
++			return nil, e
++		}
++		packet, err := client.DialEarlyPacketConn(raw, dst)
++		if err != nil {
++			return nil, err
++		}
++		return &vlessPacket{packet, dst}, nil
++	case "vmess":
++		client, e := vmessClient(c)
++		if e != nil {
++			return nil, e
++		}
++		return client.DialPacketConn(raw, dst)
++	case "trojan":
++		return T.NewClientPacketConn(raw, T.Key(c.Credential)), nil
++	}
++	return nil, errors.New("unsupported protocol")
++}
++func runClient(c input) error {
++	if c.Port == 0 {
++		return errors.New("missing loopback proxy port")
++	}
++	server := fmt.Sprintf("127.0.0.1:%d", c.Port)
++	tcpTarget, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
++	if err != nil {
++		return err
++	}
++	defer tcpTarget.Close()
++	u4, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
++	if err != nil {
++		return err
++	}
++	defer u4.Close()
++	u6, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback})
++	if err != nil {
++		return err
++	}
++	defer u6.Close()
++	raw, err := net.DialTimeout("tcp4", server, 3*time.Second)
++	if err != nil {
++		return err
++	}
++	defer raw.Close()
++	raw.SetDeadline(deadline())
++	captured := &capture{Conn: raw}
++	tcp, err := tcpClient(c, captured, M.SocksaddrFromNet(tcpTarget.Addr()))
++	if err != nil && !c.Negative {
++		return err
++	}
++	if c.Negative {
++		if err == nil {
++			tcp.Write([]byte("must-not-forward"))
++			tcp.Close()
++		}
++		wire, e := net.DialTimeout("tcp4", server, 3*time.Second)
++		if e != nil {
++			return e
++		}
++		defer wire.Close()
++		wire.SetDeadline(deadline())
++		packet, e := packetClient(c, wire, M.SocksaddrFromNet(u4.LocalAddr()))
++		if e == nil {
++			packet.WritePacket(packetBuffer([]byte("must-not-forward")), M.SocksaddrFromNet(u4.LocalAddr()))
++			packet.Close()
++		}
++		tcpTarget.SetDeadline(time.Now().Add(150 * time.Millisecond))
++		if conn, e := tcpTarget.Accept(); e == nil {
++			conn.Close()
++			return errors.New("invalid TCP request reached target")
++		}
++		u4.SetDeadline(time.Now().Add(150 * time.Millisecond))
++		if _, _, e := u4.ReadFrom(make([]byte, 100)); e == nil {
++			return errors.New("invalid UDP request reached target")
++		}
++		return emit(map[string]any{"ok": true, "negative": true, "kind": "official-protocol-library"})
++	}
++	var wg sync.WaitGroup
++	wg.Add(1)
++	go func() {
++		defer wg.Done()
++		remote, e := tcpTarget.AcceptTCP()
++		if e == nil {
++			defer remote.Close()
++			remote.SetDeadline(deadline())
++			io.Copy(remote, remote)
++		}
++	}()
++	payload := bytes.Repeat([]byte("independent-stream-tcp"), 2000)
++	if _, err = tcp.Write(payload); err != nil {
++		return err
++	}
++	response := make([]byte, len(payload))
++	if _, err = io.ReadFull(tcp, response); err != nil {
++		return fmt.Errorf("TCP response: %w", err)
++	}
++	if !bytes.Equal(payload, response) {
++		return errors.New("TCP mismatch")
++	}
++	tcp.Close()
++	wg.Wait()
++	if c.Replay && c.Protocol == "vmess" {
++		replay, e := net.DialTimeout("tcp4", server, 3*time.Second)
++		if e != nil {
++			return e
++		}
++		replay.SetDeadline(deadline())
++		replay.Write(captured.bytes)
++		defer replay.Close()
++		tcpTarget.SetDeadline(time.Now().Add(150 * time.Millisecond))
++		if conn, e := tcpTarget.Accept(); e == nil {
++			conn.Close()
++			return errors.New("VMess replay reached target")
++		}
++	}
++	for _, target := range []*net.UDPConn{u4, u6} {
++		wire, e := net.DialTimeout("tcp4", server, 3*time.Second)
++		if e != nil {
++			return e
++		}
++		wire.SetDeadline(deadline())
++		defer wire.Close()
++		cap := &capture{Conn: wire}
++		packet, e := packetClient(c, cap, M.SocksaddrFromNet(target.LocalAddr()))
++		if e != nil {
++			return e
++		}
++		defer packet.Close()
++		sizes := []int{1, 128, 4096, 8192, 15000, 1}
++		if c.Protocol != "vmess" {
++			sizes = append(sizes, 60000)
++		}
++		for index, size := range sizes {
++			body := bytes.Repeat([]byte{byte(index + 71)}, size)
++			dst := M.SocksaddrFromNet(target.LocalAddr())
++			if e = packet.WritePacket(packetBuffer(body), dst); e != nil {
++				return fmt.Errorf("UDP write %d: %w", size, e)
++			}
++			target.SetDeadline(deadline())
++			read := make([]byte, 65535)
++			n, from, e := target.ReadFrom(read)
++			if e != nil {
++				return fmt.Errorf("UDP target %d: %w", size, e)
++			}
++			if !bytes.Equal(body, read[:n]) {
++				return errors.New("UDP target mismatch")
++			}
++			target.WriteTo(read[:n], from)
++			reply := buf.NewSize(65535)
++			got, e := packet.ReadPacket(reply)
++			if e != nil {
++				reply.Release()
++				return fmt.Errorf("UDP reply %d: %w", size, e)
++			}
++			ok := got == dst && bytes.Equal(body, reply.Bytes())
++			reply.Release()
++			if !ok {
++				return errors.New("UDP reply or identity mismatch")
++			}
++		}
++		if c.Tamper && c.Protocol == "vmess" && c.Security != "none" {
++			cap.corrupt = true
++			packet.WritePacket(packetBuffer([]byte("tamper-must-not-arrive")), M.SocksaddrFromNet(target.LocalAddr()))
++			target.SetDeadline(time.Now().Add(150 * time.Millisecond))
++			if _, _, e := target.ReadFrom(make([]byte, 100)); e == nil {
++				return errors.New("tampered VMess UDP payload reached target")
++			}
++		}
++	}
++	return emit(map[string]any{"ok": true, "kind": "official-protocol-library", "tcp": true, "udp": true, "ipv4_ipv6": true, "vmess_replay": c.Replay && c.Protocol == "vmess", "vmess_tamper": c.Tamper && c.Protocol == "vmess" && c.Security != "none", "padding": c.Padding})
++}
++func main() {
++	var c input
++	dec := json.NewDecoder(os.Stdin)
++	if err := dec.Decode(&c); err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		os.Exit(1)
++	}
++	var err error
++	switch c.Mode {
++	case "server":
++		err = runServer(c)
++	case "client":
++		err = runClient(c)
++	default:
++		err = errors.New("invalid mode")
++	}
++	if err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		os.Exit(1)
++	}
++}
+diff --git a/crates/vp-protocol/tests/stream_library_interop.rs b/crates/vp-protocol/tests/stream_library_interop.rs
+new file mode 100644
+index 0000000..a3aca66
+--- /dev/null
++++ b/crates/vp-protocol/tests/stream_library_interop.rs
+@@ -0,0 +1,303 @@
++//! Real independent official-library acceptance, never a production fallback.
++use std::{
++    io::{BufRead, Read, Write},
++    process::{Child, Command, Stdio},
++    sync::Arc,
++    time::Duration,
++};
++use tokio::{
++    io::{AsyncReadExt, AsyncWriteExt},
++    net::{TcpListener, UdpSocket},
++    time::timeout,
++};
++use vp_common::DstAddr;
++use vp_core::{
++    Inbound, InboundCtx, Outbound, Session, UdpPacket,
++    task_scope::{DestinationPolicy, TaskScope},
++};
++const ID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
++struct Router;
++#[async_trait::async_trait]
++impl vp_core::Router for Router {
++    async fn pick(&self, _: &Session) -> vp_core::Resolution {
++        unreachable!()
++    }
++}
++fn ctx() -> InboundCtx {
++    InboundCtx {
++        router: Arc::new(Router),
++        stats: Arc::default(),
++        conns: Arc::new(vp_core::ConnTable::new()),
++    }
++}
++fn outbound(protocol: &str, port: u16, udp: bool) -> Box<dyn Outbound> {
++    let value = serde_json::json!({"server":"127.0.0.1","port":port,"uuid":ID,"password":ID,"tls":false,"udp":udp,"cipher":protocol.strip_prefix("vmess-").unwrap_or("auto")});
++    match protocol {
++        "vless" => Box::new(
++            vp_protocol::vless::VlessOutbound::new(&serde_json::from_value(value).unwrap())
++                .unwrap(),
++        ),
++        "trojan" => Box::new(
++            vp_protocol::trojan::TrojanOutbound::new(&serde_json::from_value(value).unwrap())
++                .unwrap(),
++        ),
++        _ => Box::new(
++            vp_protocol::vmess::VmessOutbound::new(&serde_json::from_value(value).unwrap())
++                .unwrap(),
++        ),
++    }
++}
++async fn server(protocol: &str) -> u16 {
++    let users = vec![ID.to_string()];
++    match protocol {
++        "vless" => {
++            Arc::new(vp_protocol::vless::VlessInbound::new("127.0.0.1", 0, "test", &users).unwrap())
++                .start(ctx())
++                .await
++                .unwrap()
++        }
++        "trojan" => Arc::new(
++            vp_protocol::trojan::TrojanInbound::new("127.0.0.1", 0, "test", &users).unwrap(),
++        )
++        .start(ctx())
++        .await
++        .unwrap(),
++        _ => {
++            Arc::new(vp_protocol::vmess::VmessInbound::new("127.0.0.1", 0, "test", &users).unwrap())
++                .start(ctx())
++                .await
++                .unwrap()
++        }
++    }
++}
++
++struct Peer(Child);
++impl Drop for Peer {
++    fn drop(&mut self) {
++        let _ = self.0.kill();
++        let _ = self.0.wait();
++    }
++}
++fn peer(config: serde_json::Value) -> Peer {
++    let binary = std::env::var_os("VP_STREAM_REFERENCE")
++        .expect("requires verified official protocol-library fixture");
++    let mut child = Command::new(binary)
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::piped())
++        .spawn()
++        .unwrap();
++    let mut bytes = serde_json::to_vec(&config).unwrap();
++    bytes.push(b'\n');
++    child.stdin.as_mut().unwrap().write_all(&bytes).unwrap();
++    Peer(child)
++}
++async fn finish(mut child: Peer) -> serde_json::Value {
++    let status = timeout(Duration::from_secs(45), async {
++        loop {
++            if let Some(status) = child.0.try_wait().unwrap() {
++                break status;
++            }
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .expect("official peer deadline");
++    let mut out = String::new();
++    let mut err = String::new();
++    child
++        .0
++        .stdout
++        .take()
++        .unwrap()
++        .read_to_string(&mut out)
++        .unwrap();
++    child
++        .0
++        .stderr
++        .take()
++        .unwrap()
++        .read_to_string(&mut err)
++        .unwrap();
++    assert!(
++        status.success(),
++        "official peer failed: {err}; stdout={out}"
++    );
++    serde_json::from_str(&out).unwrap()
++}
++fn name(protocol: &str) -> &str {
++    if protocol.starts_with("vmess-") {
++        "vmess"
++    } else {
++        protocol
++    }
++}
++#[tokio::test]
++#[ignore = "requires authorized pinned official Go stream protocol-library peer"]
++async fn official_client_to_vp_server_tcp_udp_auth_replay_tamper_padding() {
++    for protocol in [
++        "vless",
++        "trojan",
++        "vmess-aes-128-gcm",
++        "vmess-chacha20-poly1305",
++        "vmess-none",
++    ] {
++        eprintln!("official client -> vp server: {protocol}");
++        let scope = TaskScope::with_destination_policy(DestinationPolicy::LoopbackIpOnly);
++        let port = scope.run(server(protocol)).await;
++        let security = protocol.strip_prefix("vmess-").unwrap_or("auto");
++        for (negative, offset, padding) in [
++            (false, 0, false),
++            (true, 0, false),
++            (false, 0, true),
++            (true, -300, false),
++        ] {
++            if (padding || offset != 0) && !protocol.starts_with("vmess-") {
++                continue;
++            }
++            if padding && security == "none" {
++                continue;
++            }
++            let credential = if negative && offset == 0 {
++                "11111111-2222-3333-4444-555555555555"
++            } else {
++                ID
++            };
++            let mut child = peer(
++                serde_json::json!({"Mode":"client","Protocol":name(protocol),"Credential":credential,"Security":security,"Port":port,"Negative":negative,"Padding":padding,"TimeOffset":offset,"Tamper":true,"Replay":true}),
++            );
++            child.0.stdin.take();
++            let result = finish(child).await;
++            assert_eq!(
++                result["ok"], true,
++                "{protocol} {negative} {offset} {padding}"
++            );
++            assert_eq!(result["kind"], "official-protocol-library");
++        }
++        let report = scope
++            .shutdown(Duration::from_millis(50), Duration::from_secs(2))
++            .await;
++        assert_eq!(report.remaining_tasks, 0);
++        assert_eq!(report.panics, 0);
++    }
++}
++#[tokio::test]
++#[ignore = "requires authorized pinned official Go stream protocol-library peer"]
++async fn vp_client_to_official_server_multitarget_sizes_tcp_and_cleanup() {
++    for protocol in [
++        "vless",
++        "trojan",
++        "vmess-aes-128-gcm",
++        "vmess-chacha20-poly1305",
++        "vmess-none",
++    ] {
++        let mut child =
++            peer(serde_json::json!({"Mode":"server","Protocol":name(protocol),"Credential":ID}));
++        let stdout = child.0.stdout.take().unwrap();
++        let line = tokio::task::spawn_blocking(move || {
++            let mut line = String::new();
++            std::io::BufReader::new(stdout)
++                .read_line(&mut line)
++                .unwrap();
++            line
++        });
++        let line = timeout(Duration::from_secs(10), line)
++            .await
++            .unwrap()
++            .unwrap();
++        let ready: serde_json::Value = serde_json::from_str(&line).unwrap();
++        let port = ready["port"].as_u64().unwrap() as u16;
++        let scope = TaskScope::with_destination_policy(DestinationPolicy::LoopbackIpOnly);
++        scope
++            .run(async {
++                let out = outbound(protocol, port, true);
++                let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
++                let dst = DstAddr::new("127.0.0.1", echo.local_addr().unwrap().port());
++                vp_core::task_scope::spawn(async move {
++                    let (mut io, _) = echo.accept().await.unwrap();
++                    let (mut r, mut w) = io.split();
++                    let _ = tokio::io::copy(&mut r, &mut w).await;
++                });
++                let sess = Session::new_tcp("peer".into(), None, dst.clone());
++                let mut stream = out.connect_stream(&sess, &dst).await.unwrap();
++                let data = vec![91; 90000];
++                stream.write_all(&data).await.unwrap();
++                stream.flush().await.unwrap();
++                let mut response = vec![0; data.len()];
++                timeout(Duration::from_secs(8), stream.read_exact(&mut response))
++                    .await
++                    .unwrap()
++                    .unwrap();
++                assert_eq!(response, data);
++                drop(stream);
++                let target4 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
++                let target6 = UdpSocket::bind("[::1]:0").await.unwrap();
++                let addr = target4.local_addr().unwrap();
++                let dst = DstAddr::ip(addr.ip(), addr.port());
++                let src = "127.0.0.1:54321".parse().unwrap();
++                let sess = Session::new_udp("peer".into(), Some(src), dst.clone());
++                let mut packets = out.connect_packet(&sess, &dst).await.unwrap();
++                let mut previous = [None, None];
++                let mut sizes = vec![1, 128, 4096, 8192, 15000, 1];
++                if !protocol.starts_with("vmess-") {
++                    sizes.push(60000)
++                }
++                for (index, size) in sizes.into_iter().enumerate() {
++                    let family = index % 2;
++                    let target = if family == 0 { &target4 } else { &target6 };
++                    let addr = target.local_addr().unwrap();
++                    let data = vec![(index + 31) as u8; size];
++                    packets
++                        .send(&UdpPacket {
++                            src,
++                            dst: addr,
++                            data: data.clone().into(),
++                        })
++                        .await
++                        .unwrap();
++                    let mut got = vec![0; 65535];
++                    let (n, from) = timeout(Duration::from_secs(8), target.recv_from(&mut got))
++                        .await
++                        .unwrap()
++                        .unwrap();
++                    assert_eq!(&got[..n], data);
++                    if let Some(old) = previous[family] {
++                        assert_eq!(old, from)
++                    }
++                    previous[family] = Some(from);
++                    assert!(
++                        timeout(Duration::from_millis(2), packets.recv())
++                            .await
++                            .is_err()
++                    );
++                    target.send_to(&got[..n], from).await.unwrap();
++                    let response = timeout(Duration::from_secs(8), packets.recv())
++                        .await
++                        .unwrap()
++                        .unwrap();
++                    assert_eq!(response.src, addr);
++                    assert_eq!(response.dst, src);
++                    assert_eq!(&response.data[..], data);
++                }
++                drop(packets);
++            })
++            .await;
++        let report = scope
++            .shutdown(Duration::from_millis(20), Duration::from_secs(2))
++            .await;
++        assert_eq!(report.remaining_tasks, 0);
++        assert_eq!(report.panics, 0);
++        child.0.stdin.take();
++        let status = timeout(Duration::from_secs(5), async {
++            loop {
++                if let Some(status) = child.0.try_wait().unwrap() {
++                    break status;
++                }
++                tokio::time::sleep(Duration::from_millis(10)).await;
++            }
++        })
++        .await
++        .unwrap();
++        assert!(status.success());
++    }
++}
+diff --git a/crates/vp-protocol/tests/stream_udp.rs b/crates/vp-protocol/tests/stream_udp.rs
+new file mode 100644
+index 0000000..3390e4e
+--- /dev/null
++++ b/crates/vp-protocol/tests/stream_udp.rs
+@@ -0,0 +1,328 @@
++//! Local framing/lifecycle tests; independent library acceptance lives separately.
++use std::{
++    net::SocketAddr,
++    sync::{
++        Arc,
++        atomic::{AtomicUsize, Ordering},
++    },
++    time::Duration,
++};
++use tokio::{
++    io::{AsyncReadExt, AsyncWriteExt},
++    net::{TcpListener, UdpSocket},
++    time::timeout,
++};
++use vp_common::DstAddr;
++use vp_core::{
++    Inbound, InboundCtx, Outbound, Session, UdpPacket,
++    task_scope::{DestinationPolicy, TaskScope},
++};
++const ID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
++struct Router;
++#[async_trait::async_trait]
++impl vp_core::Router for Router {
++    async fn pick(&self, _: &Session) -> vp_core::Resolution {
++        unreachable!()
++    }
++}
++fn ctx() -> InboundCtx {
++    InboundCtx {
++        router: Arc::new(Router),
++        stats: Arc::default(),
++        conns: Arc::new(vp_core::ConnTable::new()),
++    }
++}
++fn outbound(protocol: &str, port: u16, udp: bool) -> Box<dyn Outbound> {
++    let value = serde_json::json!({"server":"127.0.0.1","port":port,"uuid":ID,"password":ID,"tls":false,"udp":udp,"cipher":protocol.strip_prefix("vmess-").unwrap_or("auto")});
++    match protocol {
++        "vless" => Box::new(
++            vp_protocol::vless::VlessOutbound::new(&serde_json::from_value(value).unwrap())
++                .unwrap(),
++        ),
++        "trojan" => Box::new(
++            vp_protocol::trojan::TrojanOutbound::new(&serde_json::from_value(value).unwrap())
++                .unwrap(),
++        ),
++        _ => Box::new(
++            vp_protocol::vmess::VmessOutbound::new(&serde_json::from_value(value).unwrap())
++                .unwrap(),
++        ),
++    }
++}
++async fn server(protocol: &str) -> u16 {
++    let users = vec![ID.to_string()];
++    match protocol {
++        "vless" => {
++            Arc::new(vp_protocol::vless::VlessInbound::new("127.0.0.1", 0, "test", &users).unwrap())
++                .start(ctx())
++                .await
++                .unwrap()
++        }
++        "trojan" => Arc::new(
++            vp_protocol::trojan::TrojanInbound::new("127.0.0.1", 0, "test", &users).unwrap(),
++        )
++        .start(ctx())
++        .await
++        .unwrap(),
++        _ => {
++            Arc::new(vp_protocol::vmess::VmessInbound::new("127.0.0.1", 0, "test", &users).unwrap())
++                .start(ctx())
++                .await
++                .unwrap()
++        }
++    }
++}
++struct Host {
++    tcp: AtomicUsize,
++    udp: AtomicUsize,
++    deny: bool,
++}
++impl vp_core::host_network::HostNetwork for Host {
++    fn before_connect(
++        &self,
++        _: u64,
++        protocol: vp_core::host_network::Protocol,
++        destination: SocketAddr,
++        _: vp_core::host_network::Purpose,
++    ) -> std::io::Result<()> {
++        assert!(destination.ip().is_loopback());
++        match protocol {
++            vp_core::host_network::Protocol::Tcp => &self.tcp,
++            vp_core::host_network::Protocol::Udp => &self.udp,
++        }
++        .fetch_add(1, Ordering::SeqCst);
++        if self.deny {
++            Err(std::io::ErrorKind::PermissionDenied.into())
++        } else {
++            Ok(())
++        }
++    }
++    fn dns_servers(&self) -> Vec<SocketAddr> {
++        vec![]
++    }
++}
++#[tokio::test]
++async fn stream_udp_multidestination_multisize_protected_and_drained() {
++    for protocol in [
++        "vless",
++        "trojan",
++        "vmess-aes-128-gcm",
++        "vmess-chacha20-poly1305",
++        "vmess-none",
++    ] {
++        let host = Arc::new(Host {
++            tcp: AtomicUsize::new(0),
++            udp: AtomicUsize::new(0),
++            deny: false,
++        });
++        let scope =
++            TaskScope::with_host_network(DestinationPolicy::LoopbackIpOnly, Some(host.clone()));
++        scope
++            .run(async {
++                let port = server(protocol).await;
++                let out = outbound(protocol, port, true);
++                assert!(out.support_udp());
++                let target4 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
++                let target6 = UdpSocket::bind("[::1]:0").await.unwrap();
++                let addr = target4.local_addr().unwrap();
++                let dst = DstAddr::ip(addr.ip(), addr.port());
++                let local = "127.0.0.1:54321".parse().unwrap();
++                let sess = Session::new_udp("test".into(), Some(local), dst.clone());
++                let mut conn = out.connect_packet(&sess, &dst).await.unwrap();
++                let mut previous = [None, None];
++                let mut sizes = vec![1, 128, 4096, 8192, 15000, 60000, 1];
++                if protocol != "vmess-none" {
++                    sizes.push(0);
++                }
++                for (i, size) in sizes.into_iter().enumerate() {
++                    let index = i % 2;
++                    let target = if index == 0 { &target4 } else { &target6 };
++                    let addr = target.local_addr().unwrap();
++                    let data = vec![(i + 1) as u8; size];
++                    timeout(
++                        Duration::from_secs(3),
++                        conn.send(&UdpPacket {
++                            src: local,
++                            dst: addr,
++                            data: data.clone().into(),
++                        }),
++                    )
++                    .await
++                    .unwrap()
++                    .unwrap();
++                    let mut received = vec![0; 65535];
++                    let (n, source) =
++                        timeout(Duration::from_secs(3), target.recv_from(&mut received))
++                            .await
++                            .unwrap()
++                            .unwrap();
++                    assert_eq!(&received[..n], data);
++                    if let Some(prev) = previous[index] {
++                        assert_eq!(prev, source)
++                    }
++                    previous[index] = Some(source);
++                    assert!(
++                        timeout(Duration::from_millis(2), conn.recv())
++                            .await
++                            .is_err(),
++                        "canceling receive before reply must not corrupt reader"
++                    );
++                    target.send_to(&received[..n], source).await.unwrap();
++                    let reply = timeout(Duration::from_secs(3), conn.recv())
++                        .await
++                        .unwrap()
++                        .unwrap();
++                    assert_eq!(reply.src, addr);
++                    assert_eq!(reply.dst, local);
++                    assert_eq!(&reply.data[..], data);
++                }
++                assert!(
++                    conn.send(&UdpPacket {
++                        src: local,
++                        dst: addr,
++                        data: vec![0; 65508].into()
++                    })
++                    .await
++                    .is_err()
++                );
++                assert_eq!(host.tcp.load(Ordering::SeqCst), 2);
++                assert_eq!(host.udp.load(Ordering::SeqCst), 2);
++                drop(conn);
++            })
++            .await;
++        let report = scope
++            .shutdown(Duration::from_millis(20), Duration::from_secs(2))
++            .await;
++        assert_eq!(report.remaining_tasks, 0, "{protocol}");
++        assert_eq!(report.panics, 0);
++    }
++}
++#[tokio::test]
++async fn udp_disabled_and_denied_host_create_no_unprotected_proxy_connection() {
++    for protocol in ["vless", "trojan", "vmess-aes-128-gcm"] {
++        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let dst = DstAddr::new("127.0.0.1", 9);
++        let sess = Session::new_udp("test".into(), None, dst.clone());
++        let off = outbound(protocol, listener.local_addr().unwrap().port(), false);
++        assert!(!off.support_udp());
++        assert!(off.connect_packet(&sess, &dst).await.is_err());
++        let host = Arc::new(Host {
++            tcp: AtomicUsize::new(0),
++            udp: AtomicUsize::new(0),
++            deny: true,
++        });
++        let scope =
++            TaskScope::with_host_network(DestinationPolicy::LoopbackIpOnly, Some(host.clone()));
++        let out = outbound(protocol, listener.local_addr().unwrap().port(), true);
++        // Scope is captured at PacketConn construction even if later called elsewhere.
++        let conn = scope.run(out.connect_packet(&sess, &dst)).await.unwrap();
++        let addr = "127.0.0.1:9".parse().unwrap();
++        assert!(
++            conn.send(&UdpPacket {
++                src: addr,
++                dst: addr,
++                data: b"deny".to_vec().into()
++            })
++            .await
++            .is_err()
++        );
++        assert_eq!(host.tcp.load(Ordering::SeqCst), 1);
++        assert_eq!(host.udp.load(Ordering::SeqCst), 0);
++        assert!(
++            timeout(Duration::from_millis(10), listener.accept())
++                .await
++                .is_err()
++        );
++        drop(conn);
++        assert_eq!(
++            scope
++                .shutdown(Duration::ZERO, Duration::from_secs(1))
++                .await
++                .remaining_tasks,
++            0
++        );
++    }
++}
++#[tokio::test]
++async fn stream_tcp_regression_large_payload_each_security() {
++    for protocol in [
++        "vless",
++        "trojan",
++        "vmess-aes-128-gcm",
++        "vmess-chacha20-poly1305",
++        "vmess-none",
++    ] {
++        let scope = TaskScope::new();
++        scope
++            .run(async {
++                let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
++                let addr = echo.local_addr().unwrap();
++                vp_core::task_scope::spawn(async move {
++                    let (mut stream, _) = echo.accept().await.unwrap();
++                    let (mut r, mut w) = stream.split();
++                    tokio::io::copy(&mut r, &mut w).await.unwrap();
++                });
++                let port = server(protocol).await;
++                let out = outbound(protocol, port, true);
++                let dst = DstAddr::ip(addr.ip(), addr.port());
++                let sess = Session::new_tcp("test".into(), None, dst.clone());
++                let mut stream = out.connect_stream(&sess, &dst).await.unwrap();
++                let data = vec![113; 100_000];
++                stream.write_all(&data).await.unwrap();
++                stream.flush().await.unwrap();
++                let mut reply = vec![0; data.len()];
++                timeout(Duration::from_secs(3), stream.read_exact(&mut reply))
++                    .await
++                    .unwrap()
++                    .unwrap();
++                assert_eq!(reply, data);
++            })
++            .await;
++        assert_eq!(
++            scope
++                .shutdown(Duration::from_millis(20), Duration::from_secs(2))
++                .await
++                .remaining_tasks,
++            0
++        );
++    }
++}
++
++#[tokio::test]
++async fn managed_destinations_fail_before_dns_or_socket_creation() {
++    for protocol in ["vless", "trojan", "vmess-aes-128-gcm"] {
++        let host = Arc::new(Host {
++            tcp: AtomicUsize::new(0),
++            udp: AtomicUsize::new(0),
++            deny: false,
++        });
++        let scope =
++            TaskScope::with_host_network(DestinationPolicy::LoopbackIpOnly, Some(host.clone()));
++        scope
++            .run(async {
++                let outbound = outbound(protocol, 9, true);
++                for dst in [
++                    DstAddr::new("localhost", 9),
++                    DstAddr::new("example.invalid", 9),
++                    DstAddr::new("192.0.2.1", 9),
++                    DstAddr::new("2001:db8::1", 9),
++                ] {
++                    let sess = Session::new_udp("policy".into(), None, dst.clone());
++                    assert!(matches!(
++                        outbound.connect_packet(&sess, &dst).await,
++                        Err(vp_common::Error::Unsupported(_))
++                    ));
++                }
++            })
++            .await;
++        assert_eq!(host.tcp.load(Ordering::SeqCst), 0);
++        assert_eq!(host.udp.load(Ordering::SeqCst), 0);
++        assert_eq!(
++            scope
++                .shutdown(Duration::ZERO, Duration::from_secs(1))
++                .await
++                .remaining_tasks,
++            0
++        );
++    }
++}
+-- 
+2.52.0
+

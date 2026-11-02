@@ -1,0 +1,8 @@
+.dart_tool/
+.packages
+build/
+.bootstrap/
+.flutter-plugins*
+
+# Reproducible motion frames retained in workspace; frozen clip + source are tracked.
+evidence/motion_frames/

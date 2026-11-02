@@ -1,0 +1,50 @@
+[package]
+name = "vp-product-managementd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "vp-product-maintenance"
+path = "src/bin/maintenance.rs"
+
+[[bin]]
+name = "vp-product-fresh"
+path = "src/bin/fresh.rs"
+
+[[bin]]
+name = "vp-product-fresh-runtime"
+path = "src/bin/fresh_runtime.rs"
+
+[dependencies]
+sha2 = "=0.10.8"
+vp-product-api = { path = "../vp-api" }
+vp-product-domain = { path = "../vp-domain" }
+vp-product-control = { path = "../vp-control" }
+vp-product-storage = { path = "../vp-storage" }
+vp-product-core-adapter = { path = "../vp-core-adapter" }
+serde.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true
+subtle = "=2.6.1"
+rustix = { version = "=1.1.6", features = ["fs", "process", "event"] }
+axum = { version = "=0.8.4", features = ["json", "tokio", "http1"] }
+tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync"] }
+
+[lints]
+workspace = true
+
+# The default executable still requires explicit --runtime-profile opt-in.
+# No product dependency on upstream crates exists outside vp-core-adapter.
+[dependencies.vp-product-runtime-executor]
+path = "../vp-runtime-executor"
+[dependencies.vp-product-secrets]
+path = "../vp-secrets"
+[dependencies.vp-product-compiler]
+path = "../vp-compiler"
+[dependencies.getrandom]
+version = "=0.3.4"
+
+[dev-dependencies]
+tempfile = "=3.19.1"

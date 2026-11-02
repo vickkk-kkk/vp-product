@@ -1,0 +1,1029 @@
+From 850d4d52bc6b1ef0d2478d3f198e1a3c2bbd8035 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Fri, 30 Oct 2026 13:29:36 +0900
+Subject: [PATCH] fix(protocol): correct VMess framing and preserve stream
+ partial IO
+
+---
+ crates/vp-protocol/src/vless.rs | 116 +++++--
+ crates/vp-protocol/src/vmess.rs | 527 ++++++++++++++++++++------------
+ 2 files changed, 433 insertions(+), 210 deletions(-)
+
+diff --git a/crates/vp-protocol/src/vless.rs b/crates/vp-protocol/src/vless.rs
+index 61533a7..06d05a1 100644
+--- a/crates/vp-protocol/src/vless.rs
++++ b/crates/vp-protocol/src/vless.rs
+@@ -52,7 +52,7 @@ fn encode_addr(dst: &DstAddr, is_vision: bool, out: &mut Vec<u8>) {
+ }
+ 
+ fn decode_request(buf: &[u8]) -> Result<([u8; 16], DstAddr, bool, usize)> {
+-    if buf.len() < 3 + 16 + 1 + 1 + 2 + 1 {
++    if buf.len() < 18 {
+         return Err(Error::Proto("vless 请求头过短"));
+     }
+     if buf[0] != VERSION {
+@@ -82,7 +82,9 @@ fn decode_request(buf: &[u8]) -> Result<([u8; 16], DstAddr, bool, usize)> {
+     let cmd = buf[i];
+     i += 1;
+     if cmd != CMD_TCP {
+-        return Err(Error::Unsupported("vless 入站仅支持 TCP".into()));
++        return Err(Error::Unsupported(
++            "vless inbound UDP not yet implemented".into(),
++        ));
+     }
+     let port = u16::from_be_bytes([buf[i], buf[i + 1]]);
+     i += 2;
+@@ -102,6 +104,9 @@ fn decode_request(buf: &[u8]) -> Result<([u8; 16], DstAddr, bool, usize)> {
+                 return Err(Error::Proto("vless 地址截断"));
+             }
+             let n = buf[i] as usize;
++            if n == 0 {
++                return Err(Error::Proto("vless empty domain"));
++            }
+             i += 1;
+             if buf.len() < i + n {
+                 return Err(Error::Proto("vless 地址截断"));
+@@ -130,6 +135,7 @@ fn decode_request(buf: &[u8]) -> Result<([u8; 16], DstAddr, bool, usize)> {
+ // 出站
+ // ---------------------------------------------------------------------------
+ 
++#[derive(Clone)]
+ pub struct VlessOutbound {
+     name: Arc<str>,
+     server: String,
+@@ -218,6 +224,7 @@ impl VlessOutbound {
+                 request: Some(full),
+                 strip: RespStrip::default(),
+                 decoded: BytesMut::new(),
++                outgoing: BytesMut::new(),
+             }))
+         }
+     }
+@@ -235,14 +242,19 @@ struct RespStrip {
+ 
+ impl RespStrip {
+     /// 从 data 头部剥离响应头，返回剩余透传字节
+-    fn strip<'a>(&mut self, mut data: &'a [u8]) -> &'a [u8] {
++    fn strip<'a>(&mut self, mut data: &'a [u8]) -> std::io::Result<&'a [u8]> {
+         while self.phase < 2 && !data.is_empty() {
+             match self.phase {
+                 0 => {
+                     let b = data[0];
+                     data = &data[1..];
+                     if self.header_idx == 0 {
+-                        // ver 字节（校验留给首连接——CF Worker 等兼容实现也回 0）
++                        if b != VERSION {
++                            return Err(std::io::Error::new(
++                                std::io::ErrorKind::InvalidData,
++                                "VLESS response version mismatch",
++                            ));
++                        }
+                         self.header_idx = 1;
+                     } else {
+                         self.addon_left = b as usize;
+@@ -261,7 +273,7 @@ impl RespStrip {
+                 _ => break,
+             }
+         }
+-        data
++        Ok(data)
+     }
+ }
+ 
+@@ -273,6 +285,7 @@ pub struct VlessStream<S> {
+     strip: RespStrip,
+     /// 剥离后待交付的明文余量
+     decoded: BytesMut,
++    outgoing: BytesMut,
+ }
+ 
+ impl<S> VlessStream<S> {
+@@ -283,9 +296,21 @@ impl<S> VlessStream<S> {
+         S: AsyncWrite + Unpin,
+     {
+         if let Some(req) = self.request.take() {
+-            let mut inner = Pin::new(&mut self.inner);
+-            std::task::ready!(inner.as_mut().poll_write(cx, &req))?;
+-            std::task::ready!(inner.as_mut().poll_flush(cx))?;
++            self.outgoing.extend_from_slice(&req);
++        }
++        std::task::ready!(self.flush_out(cx))?;
++        Pin::new(&mut self.inner).poll_flush(cx)
++    }
++    fn flush_out(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>>
++    where
++        S: AsyncWrite + Unpin,
++    {
++        while !self.outgoing.is_empty() {
++            let n = std::task::ready!(Pin::new(&mut self.inner).poll_write(cx, &self.outgoing))?;
++            if n == 0 {
++                return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
++            }
++            self.outgoing.advance(n);
+         }
+         Poll::Ready(Ok(()))
+     }
+@@ -298,8 +323,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for VlessStream<S> {
+         buf: &mut ReadBuf<'_>,
+     ) -> Poll<std::io::Result<()>> {
+         let this = self.get_mut();
+-        if this.request.is_some() {
+-            std::task::ready!(this.ensure_request_sent(cx))?;
++        std::task::ready!(this.ensure_request_sent(cx))?;
++        if !this.decoded.is_empty() {
++            let n = this.decoded.len().min(buf.remaining());
++            buf.put_slice(&this.decoded[..n]);
++            this.decoded.advance(n);
++            return Poll::Ready(Ok(()));
+         }
+         if this.strip.phase < 2 {
+             // 头未剥离完：经内部缓冲
+@@ -309,9 +338,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for VlessStream<S> {
+                 std::task::ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
+                 let filled = rb.filled();
+                 if filled.is_empty() {
+-                    return Poll::Ready(Ok(())); // EOF
++                    return Poll::Ready(Err(std::io::Error::new(
++                        std::io::ErrorKind::UnexpectedEof,
++                        "VLESS response header truncated",
++                    )));
+                 }
+-                let rest = this.strip.strip(filled);
++                let rest = this.strip.strip(filled)?;
+                 this.decoded.extend_from_slice(rest);
+             }
+             let n = this.decoded.len().min(buf.remaining());
+@@ -330,23 +362,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VlessStream<S> {
+         buf: &[u8],
+     ) -> Poll<std::io::Result<usize>> {
+         let this = self.get_mut();
+-        if let Some(mut req) = this.request.take() {
+-            // 首写：vless 请求 + 载荷同帧
+-            req.extend_from_slice(buf);
+-            Pin::new(&mut this.inner)
+-                .poll_write(cx, &req)
+-                .map(|p| p.map(|_| buf.len()))
+-        } else {
+-            Pin::new(&mut this.inner).poll_write(cx, buf)
++        std::task::ready!(this.flush_out(cx))?;
++        if buf.is_empty() {
++            return Poll::Ready(Ok(0));
+         }
++        if let Some(req) = this.request.take() {
++            this.outgoing.extend_from_slice(&req);
++        }
++        let n = buf.len().min(16 * 1024);
++        this.outgoing.extend_from_slice(&buf[..n]);
++        Poll::Ready(Ok(n))
+     }
+ 
+     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
++        let this = self.get_mut();
++        std::task::ready!(this.flush_out(cx))?;
++        Pin::new(&mut this.inner).poll_flush(cx)
+     }
+ 
+     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
++        let this = self.get_mut();
++        std::task::ready!(this.flush_out(cx))?;
++        Pin::new(&mut this.inner).poll_shutdown(cx)
+     }
+ }
+ 
+@@ -452,7 +489,7 @@ impl VlessInbound {
+         ctx: &InboundCtx,
+     ) -> Result<()> {
+         // 头部最长：1+16+1+1+2+1+255
+-        let mut buf = vec![0u8; 19 + 256];
++        let mut buf = vec![0u8; 1 + 16 + 1 + 255 + 1 + 2 + 1 + 1 + 255];
+         let mut filled = 0;
+         loop {
+             if filled >= buf.len() {
+@@ -471,6 +508,7 @@ impl VlessInbound {
+                     if is_vision {
+                         return Err(Error::Unsupported("vless Vision needs the authenticated raw TLS record boundary; generic stream transport cannot provide it".into()));
+                     }
++
+                     let sess = Session::new_tcp(self.tag.clone(), Some(src), dst.clone());
+                     let remote = self.direct.connect_stream(&sess, &dst).await?;
+                     stream.write_all(&[VERSION, 0]).await?;
+@@ -714,4 +752,36 @@ mod tests {
+             );
+         }
+     }
++    #[tokio::test]
++    async fn lazy_stream_handles_one_byte_writes_and_small_response_reads() {
++        let (client, mut peer) = tokio::io::duplex(1);
++        let outbound = VlessOutbound {
++            name: "partial".into(),
++            server: "127.0.0.1".into(),
++            port: 9,
++            uuid: [1; 16],
++            flow: None,
++            transport: Default::default(),
++        };
++        let destination = DstAddr::new("127.0.0.1", 9);
++        let payload = vec![93; 500];
++        let expected = payload.clone();
++        let task = tokio::spawn(async move {
++            let mut wire = vec![0; 26 + expected.len()];
++            peer.read_exact(&mut wire).await.unwrap();
++            assert_eq!(&wire[26..], expected);
++            assert_eq!(&wire[..2], &[0, 1]);
++            peer.write_all(&[0, 0]).await.unwrap();
++            peer.write_all(&expected).await.unwrap();
++        });
++        let mut stream = outbound.handshake(client, &destination).await.unwrap();
++        stream.write_all(&payload).await.unwrap();
++        stream.flush().await.unwrap();
++        let mut actual = Vec::new();
++        for _ in 0..500 {
++            actual.push(stream.read_u8().await.unwrap());
++        }
++        assert_eq!(actual, payload);
++        task.await.unwrap();
++    }
+ }
+diff --git a/crates/vp-protocol/src/vmess.rs b/crates/vp-protocol/src/vmess.rs
+index 059babc..260612f 100644
+--- a/crates/vp-protocol/src/vmess.rs
++++ b/crates/vp-protocol/src/vmess.rs
+@@ -27,6 +27,7 @@ pub const OPT_CHUNK_STREAM: u8 = 0x01;
+ /// 主流客户端（v2ray/sing-vmess/mihomo）对分块流一律启用长度掩码；
+ /// 服务端按掩码长度分帧，客户端发裸长度会被误分帧导致上游收到畸形数据。
+ pub const OPT_CHUNK_MASKING: u8 = 0x04;
++pub const OPT_GLOBAL_PADDING: u8 = 0x08;
+ pub const SEC_AES128_GCM: u8 = 0x03;
+ pub const SEC_CHACHA20: u8 = 0x04;
+ pub const SEC_NONE: u8 = 0x05;
+@@ -114,6 +115,9 @@ fn decode_v2ray_addr(buf: &[u8]) -> Result<(DstAddr, usize)> {
+                 return Err(Error::Proto("vmess 地址截断"));
+             }
+             let n = buf[3] as usize;
++            if n == 0 {
++                return Err(Error::Proto("VMess empty domain"));
++            }
+             if buf.len() < 4 + n {
+                 return Err(Error::Proto("vmess 地址截断"));
+             }
+@@ -156,7 +160,7 @@ fn build_request_plaintext(r: &VmessRequest) -> Vec<u8> {
+     p.extend_from_slice(&r.body_iv);
+     p.extend_from_slice(&r.body_key);
+     p.push(r.resp_auth);
+-    p.push(OPT_CHUNK_STREAM | OPT_CHUNK_MASKING);
++    p.push(r.option);
+     p.push(r.security.byte()); // (0 << 4) | security
+     p.push(0); // reserved
+     p.push(r.cmd);
+@@ -167,7 +171,7 @@ fn build_request_plaintext(r: &VmessRequest) -> Vec<u8> {
+ }
+ 
+ fn parse_request_plaintext(p: &[u8]) -> Result<VmessRequest> {
+-    if p.len() < 41 {
++    if p.len() < 45 {
+         return Err(Error::Proto("vmess 请求头过短"));
+     }
+     // 尾部 fnv 校验
+@@ -191,6 +195,7 @@ fn parse_request_plaintext(p: &[u8]) -> Result<VmessRequest> {
+     i += 1;
+     let option = body[i];
+     i += 1;
++    let padding_len = (body[i] >> 4) as usize;
+     let security = match body[i] & 0x0f {
+         SEC_AES128_GCM => Security::Aes128Gcm,
+         SEC_CHACHA20 => Security::ChaCha20,
+@@ -203,7 +208,7 @@ fn parse_request_plaintext(p: &[u8]) -> Result<VmessRequest> {
+     i += 1;
+     let (dst, used) = decode_v2ray_addr(&body[i..])?;
+     i += used;
+-    if i != body.len() {
++    if i + padding_len != body.len() {
+         return Err(Error::Proto("vmess 请求头长度异常"));
+     }
+     Ok(VmessRequest {
+@@ -345,13 +350,13 @@ fn build_response_header(
+     resp_iv: &[u8; 16],
+     option: u8,
+ ) -> Result<Vec<u8>> {
+-    let payload = [resp_auth, option];
++    let payload = [resp_auth, option, 0, 0];
+     let len_key = kdf::kdf16(resp_key, &[kdf::SALT_RESP_LEN_KEY.as_bytes()]);
+     let len_nonce = kdf::kdf_x(resp_iv, &[kdf::SALT_RESP_LEN_IV.as_bytes()], 12);
+     let mut n12 = [0u8; 12];
+     n12.copy_from_slice(&len_nonce);
+     let aead = AnyAead::new(AeadKind::Aes128Gcm, &len_key)?;
+-    let len_ct = aead.seal_nonce(&n12, &2u16.to_be_bytes(), b"");
++    let len_ct = aead.seal_nonce(&n12, &4u16.to_be_bytes(), b"");
+     let pay_key = kdf::kdf16(resp_key, &[kdf::SALT_RESP_KEY.as_bytes()]);
+     let pay_nonce = kdf::kdf_x(resp_iv, &[kdf::SALT_RESP_IV.as_bytes()], 12);
+     let mut pn12 = [0u8; 12];
+@@ -392,171 +397,149 @@ impl SizeMask {
+     }
+ }
+ 
+-/// xray/sing-vmess 对齐的 body 分块编解码：
+-/// chunk = [2B BE 掩码后的 ct 长度][AEAD(payload) ct+tag]
+-/// GCM nonce = [u16 chunk 序号 BE][IV[2..12]]（GenerateChunkNonce）
+-struct VmessBodyCodec {
+-    aead: AnyAead,
++/// VMess lengths include ciphertext/tag and optional random padding. The SHAKE
++/// stream consumes padding first, then masking, exactly once per frame.
++struct BodyCodec {
++    aead: Option<AnyAead>,
++    raw: bool,
+     base: [u8; 10],
+-    idx: u16,
+-    mask: Option<SizeMask>,
+-    expected_ct_len: Option<usize>,
++    index: u32,
++    xof: Option<SizeMask>,
++    masked: bool,
++    padded: bool,
++    expected: Option<(usize, usize)>,
+ }
+-
+-impl VmessBodyCodec {
+-    fn new(security: Security, key16: &[u8; 16], iv16: &[u8; 16], masked: bool) -> Result<Self> {
+-        let mut base = [0u8; 10];
+-        base.copy_from_slice(&iv16[2..12]);
+-        Ok(VmessBodyCodec {
+-            aead: body_aead(security, key16)?,
++impl BodyCodec {
++    #[cfg(test)]
++    fn new(security: Security, key: &[u8; 16], iv: &[u8; 16], masked: bool) -> Result<Self> {
++        Self::with_options(
++            security,
++            key,
++            iv,
++            OPT_CHUNK_STREAM | if masked { OPT_CHUNK_MASKING } else { 0 },
++        )
++    }
++    fn with_options(security: Security, key: &[u8; 16], iv: &[u8; 16], option: u8) -> Result<Self> {
++        validate_options(security, option)?;
++        let mut base = [0; 10];
++        base.copy_from_slice(&iv[2..12]);
++        Ok(Self {
++            aead: if security == Security::None {
++                None
++            } else {
++                Some(body_aead(security, key)?)
++            },
++            raw: option & OPT_CHUNK_STREAM == 0,
+             base,
+-            idx: 0,
+-            mask: masked.then(|| SizeMask::new(iv16)),
+-            expected_ct_len: None,
++            index: 0,
++            xof: (option & (OPT_CHUNK_MASKING | OPT_GLOBAL_PADDING) != 0)
++                .then(|| SizeMask::new(iv)),
++            masked: option & OPT_CHUNK_MASKING != 0,
++            padded: option & OPT_GLOBAL_PADDING != 0,
++            expected: None,
+         })
+     }
+-
+-    fn nonce(&self, idx: u16) -> [u8; 12] {
+-        let mut n = [0u8; 12];
+-        n[..2].copy_from_slice(&idx.to_be_bytes());
+-        n[2..].copy_from_slice(&self.base);
+-        n
++    fn nonce(&self) -> Result<[u8; 12]> {
++        let index = u16::try_from(self.index)
++            .map_err(|_| Error::Proto("VMess body nonce exhausted; reconnect required"))?;
++        let mut nonce = [0; 12];
++        nonce[..2].copy_from_slice(&index.to_be_bytes());
++        nonce[2..].copy_from_slice(&self.base);
++        Ok(nonce)
+     }
+-
+-    fn seal_chunk(&mut self, payload: &[u8]) -> Vec<u8> {
+-        let idx = self.idx;
+-        self.idx = self.idx.wrapping_add(1);
+-        let ct = self.aead.seal_nonce(&self.nonce(idx), payload, b"");
+-        // 线上 chunk = [2B 长度^掩码][ct]，长度值 = ct 长度（payload+tag）
+-        let mut len_field = ct.len() as u16;
+-        if let Some(m) = self.mask.as_mut() {
+-            len_field ^= m.next_u16();
++    fn seal_chunk(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
++        if self.raw {
++            return Ok(payload.to_vec());
+         }
+-        let mut out = Vec::with_capacity(ct.len() + 2);
+-        out.extend_from_slice(&len_field.to_be_bytes());
+-        out.extend_from_slice(&ct);
+-        out
++        let data = if let Some(aead) = &self.aead {
++            let data = aead.seal_nonce(&self.nonce()?, payload, b"");
++            self.index += 1;
++            data
++        } else {
++            payload.to_vec()
++        };
++        let padding = if self.padded {
++            self.xof.as_mut().unwrap().next_u16() as usize % 64
++        } else {
++            0
++        };
++        let len = data
++            .len()
++            .checked_add(padding)
++            .and_then(|len| u16::try_from(len).ok())
++            .ok_or(Error::Proto("VMess chunk too large"))?;
++        let masked = len
++            ^ if self.masked {
++                self.xof.as_mut().unwrap().next_u16()
++            } else {
++                0
++            };
++        let mut out = Vec::with_capacity(2 + len as usize);
++        out.extend_from_slice(&masked.to_be_bytes());
++        out.extend_from_slice(&data);
++        let start = out.len();
++        out.resize(start + padding, 0);
++        vp_common::rand_bytes(&mut out[start..]);
++        Ok(out)
+     }
+-
+-    /// 尝试从 buf 解出一条 payload；数据不足返回 None。
+-    /// 必须缓存已解出的分块长度，不能在分片到达时反复消费 SizeMask XOF 流，
+-    /// 否则会导致掩码失步与后续所有分块解密失败。
+     fn try_open_chunk(&mut self, buf: &[u8]) -> Option<Result<(Vec<u8>, usize)>> {
+-        let ct_len = match self.expected_ct_len {
+-            Some(len) => len,
++        if self.raw {
++            return (!buf.is_empty()).then(|| Ok((buf.to_vec(), buf.len())));
++        }
++        let (len, padding) = match self.expected {
++            Some(value) => value,
+             None => {
+                 if buf.len() < 2 {
+                     return None;
+                 }
+-                let mut ct_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+-                if let Some(m) = self.mask.as_mut() {
+-                    ct_len ^= m.next_u16() as usize;
+-                }
+-                self.expected_ct_len = Some(ct_len);
+-                ct_len
++                let padding = if self.padded {
++                    self.xof.as_mut().unwrap().next_u16() as usize % 64
++                } else {
++                    0
++                };
++                let len = u16::from_be_bytes([buf[0], buf[1]])
++                    ^ if self.masked {
++                        self.xof.as_mut().unwrap().next_u16()
++                    } else {
++                        0
++                    };
++                let value = (len as usize, padding);
++                self.expected = Some(value);
++                value
+             }
+         };
+-        let total = 2 + ct_len;
+-        if buf.len() < total {
+-            return None;
++        let overhead = if self.aead.is_some() { 16 } else { 0 };
++        if len < padding + overhead {
++            return Some(Err(Error::Proto("VMess invalid chunk length/padding")));
+         }
+-        self.expected_ct_len = None;
+-        if ct_len < 16 {
+-            return Some(Err(Error::Proto("vmess 分块长度小于 AEAD 标签")));
++        if buf.len() < 2 + len {
++            return None;
+         }
+-        let idx = self.idx;
+-        let data = match self.aead.open_nonce(&self.nonce(idx), &buf[2..total], b"") {
+-            Ok(p) => p,
+-            Err(e) => return Some(Err(e)),
++        self.expected = None;
++        let data = &buf[2..2 + len - padding];
++        let result = if let Some(aead) = &self.aead {
++            self.nonce()
++                .and_then(|nonce| aead.open_nonce(&nonce, data, b""))
++                .map(|plain| {
++                    self.index += 1;
++                    plain
++                })
++        } else {
++            Ok(data.to_vec())
+         };
+-        self.idx = self.idx.wrapping_add(1);
+-        Some(Ok((data, total)))
++        Some(result.map(|plain| (plain, 2 + len)))
+     }
+ }
+-
+-enum BodyCodec {
+-    Aead(VmessBodyCodec),
+-    Plain(PlainCodec),
+-}
+-
+-impl BodyCodec {
+-    fn new(security: Security, key16: &[u8; 16], iv16: &[u8; 16], masked: bool) -> Result<Self> {
+-        Ok(match security {
+-            Security::Aes128Gcm | Security::ChaCha20 => {
+-                BodyCodec::Aead(VmessBodyCodec::new(security, key16, iv16, masked)?)
+-            }
+-            Security::None => BodyCodec::Plain(PlainCodec::new(iv16, masked)),
+-        })
++fn validate_options(security: Security, option: u8) -> Result<()> {
++    if option & !(OPT_CHUNK_STREAM | OPT_CHUNK_MASKING | OPT_GLOBAL_PADDING) != 0 {
++        return Err(Error::Unsupported(
++            "VMess connection reuse/authenticated length/unknown option is not implemented".into(),
++        ));
+     }
+-
+-    fn seal_chunk(&mut self, payload: &[u8]) -> Vec<u8> {
+-        match self {
+-            BodyCodec::Aead(c) => c.seal_chunk(payload),
+-            BodyCodec::Plain(c) => c.seal_chunk(payload),
+-        }
+-    }
+-
+-    fn try_open_chunk(&mut self, buf: &[u8]) -> Option<Result<(Vec<u8>, usize)>> {
+-        match self {
+-            BodyCodec::Aead(c) => c.try_open_chunk(buf),
+-            BodyCodec::Plain(c) => c.try_open_chunk(buf),
+-        }
+-    }
+-}
+-
+-/// Security::None 的明文分块：chunk = [2B 掩码后长度][fnv32][payload]
+-struct PlainCodec {
+-    mask: Option<SizeMask>,
+-    expected_plen: Option<usize>,
+-}
+-
+-impl PlainCodec {
+-    fn new(iv16: &[u8; 16], masked: bool) -> Self {
+-        PlainCodec {
+-            mask: masked.then(|| SizeMask::new(iv16)),
+-            expected_plen: None,
+-        }
+-    }
+-
+-    fn seal_chunk(&mut self, payload: &[u8]) -> Vec<u8> {
+-        let mut len_field = payload.len() as u16;
+-        if let Some(m) = self.mask.as_mut() {
+-            len_field ^= m.next_u16();
+-        }
+-        let mut out = Vec::with_capacity(6 + payload.len());
+-        out.extend_from_slice(&len_field.to_be_bytes());
+-        out.extend_from_slice(&kdf::fnv1a32(payload).to_be_bytes());
+-        out.extend_from_slice(payload);
+-        out
+-    }
+-
+-    fn try_open_chunk(&mut self, buf: &[u8]) -> Option<Result<(Vec<u8>, usize)>> {
+-        let plen = match self.expected_plen {
+-            Some(len) => len,
+-            None => {
+-                if buf.len() < 2 {
+-                    return None;
+-                }
+-                let mut plen = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+-                if let Some(m) = self.mask.as_mut() {
+-                    plen ^= m.next_u16() as usize;
+-                }
+-                self.expected_plen = Some(plen);
+-                plen
+-            }
+-        };
+-        let total = 2 + 4 + plen;
+-        if buf.len() < total {
+-            return None;
+-        }
+-        self.expected_plen = None;
+-        let fnv = u32::from_be_bytes([buf[2], buf[3], buf[4], buf[5]]);
+-        let payload = &buf[6..total];
+-        if kdf::fnv1a32(payload) != fnv {
+-            return Some(Err(Error::Proto("vmess 明文块 fnv 校验失败")));
+-        }
+-        Some(Ok((payload.to_vec(), total)))
++    if option & OPT_CHUNK_STREAM == 0 && (security != Security::None || option != 0) {
++        return Err(Error::Proto("VMess chunk options require chunk-stream"));
+     }
++    Ok(())
+ }
+ 
+ pub struct VmessStream<S> {
+@@ -622,19 +605,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> VmessStream<S> {
+         Poll::Ready(Ok(()))
+     }
+ 
+-    fn try_progress(&mut self) {
++    fn try_progress(&mut self) -> std::io::Result<()> {
+         while let Some(r) = self.dec.try_open_chunk(&self.raw) {
+             match r {
+                 Ok((payload, used)) => {
+                     self.raw.advance(used);
++                    if payload.is_empty() && !self.dec.raw {
++                        self.closed = true;
++                        break;
++                    }
+                     self.pending.extend_from_slice(&payload);
+                 }
+-                Err(_) => {
++                Err(error) => {
+                     self.closed = true;
+-                    break;
++                    return Err(error.into());
+                 }
+             }
+         }
++        Ok(())
+     }
+ 
+     /// 首次 poll_read 时解析响应头（懒，显式状态机）
+@@ -651,7 +639,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> VmessStream<S> {
+                 RespState::AeadReadLen(buf) => {
+                     while buf.len() < 18 {
+                         let mut tmp = [0u8; 18];
+-                        let mut read = ReadBuf::new(&mut tmp);
++                        let mut read = ReadBuf::new(&mut tmp[..18 - buf.len()]);
+                         match Pin::new(&mut *io).poll_read(cx, &mut read) {
+                             Poll::Pending => return Poll::Pending,
+                             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+@@ -719,7 +707,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> VmessStream<S> {
+                             )));
+                         }
+                     };
+-                    if payload.len() < 2 || payload[0] != h.auth_expect {
++                    if payload.len() < 4
++                        || payload[0] != h.auth_expect
++                        || payload.len() != 4 + payload[3] as usize
++                    {
+                         return Poll::Ready(Err(std::io::Error::other(
+                             Error::Proto("vmess 响应认证不匹配").to_string(),
+                         )));
+@@ -729,7 +720,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> VmessStream<S> {
+                 RespState::LegacyReadHead(buf) => {
+                     while buf.len() < 4 {
+                         let mut tmp = [0u8; 4];
+-                        let mut read = ReadBuf::new(&mut tmp);
++                        let mut read = ReadBuf::new(&mut tmp[..4 - buf.len()]);
+                         match Pin::new(&mut *io).poll_read(cx, &mut read) {
+                             Poll::Pending => return Poll::Pending,
+                             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+@@ -777,7 +768,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> VmessStream<S> {
+                             )));
+                         }
+                         Poll::Ready(Ok(())) => {
+-                            h.state = RespState::Done;
++                            *n -= read.filled().len();
++                            if *n == 0 {
++                                h.state = RespState::Done;
++                            }
+                         }
+                     }
+                 }
+@@ -797,6 +791,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for VmessStream<S> {
+         buf: &mut ReadBuf<'_>,
+     ) -> Poll<std::io::Result<()>> {
+         let this = self.as_mut().get_mut();
++        std::task::ready!(this.flush_out(cx))?;
++        std::task::ready!(Pin::new(&mut this.inner).poll_flush(cx))?;
+         // 懒解析响应头（首次 read 触发）
+         std::task::ready!(Self::poll_resp_header(
+             &mut this.resp_header,
+@@ -813,7 +809,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for VmessStream<S> {
+             if this.closed {
+                 return Poll::Ready(Ok(()));
+             }
+-            this.try_progress();
++            this.try_progress()?;
++            if this.closed && this.pending.is_empty() {
++                return Poll::Ready(Ok(()));
++            }
+             if !this.pending.is_empty() {
+                 continue;
+             }
+@@ -845,10 +844,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VmessStream<S> {
+             )));
+         }
+         std::task::ready!(this.flush_out(cx))?;
+-        let chunk = this.enc.seal_chunk(buf);
++        if buf.is_empty() {
++            return Poll::Ready(Ok(0));
++        }
++        let n = buf.len().min(15_000);
++        let chunk = this.enc.seal_chunk(&buf[..n])?;
+         this.out.extend_from_slice(&chunk);
+-        std::task::ready!(this.flush_out(cx))?;
+-        Poll::Ready(Ok(buf.len()))
++        // Accepted bytes are retained across Pending. Returning Pending after
++        // enqueueing would encode the caller's same input twice on repoll.
++        Poll::Ready(Ok(n))
+     }
+ 
+     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+@@ -860,11 +864,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VmessStream<S> {
+     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+         let this = self.as_mut().get_mut();
+         if !this.closed {
+-            let chunk = this.enc.seal_chunk(&[]);
++            let chunk = this.enc.seal_chunk(&[])?;
+             this.out.extend_from_slice(&chunk);
+             this.closed = true;
+         }
+-        let _ = this.flush_out(cx);
++        std::task::ready!(this.flush_out(cx))?;
+         Pin::new(&mut this.inner).poll_shutdown(cx)
+     }
+ }
+@@ -873,6 +877,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for VmessStream<S> {
+ // 出站
+ // ---------------------------------------------------------------------------
+ 
++#[derive(Clone)]
+ pub struct VmessOutbound {
+     name: Arc<str>,
+     server: String,
+@@ -923,10 +928,31 @@ impl VmessOutbound {
+         })
+     }
+ 
+-    async fn handshake<S>(&self, mut io: S, dst: &DstAddr) -> Result<Box<dyn ProxyStream>>
++    async fn handshake<S>(&self, io: S, dst: &DstAddr) -> Result<Box<dyn ProxyStream>>
+     where
+         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+     {
++        Ok(Box::new(self.handshake_command(io, dst, 1).await?))
++    }
++    async fn handshake_command<S>(
++        &self,
++        mut io: S,
++        dst: &DstAddr,
++        cmd: u8,
++    ) -> Result<VmessStream<S>>
++    where
++        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
++    {
++        if let Host::Domain(name) = &dst.host {
++            if name.is_empty() || name.len() > 255 {
++                return Err(Error::Proto("VMess destination domain length is invalid"));
++            }
++        }
++        let option = if self.security == Security::None {
++            if cmd == 2 { OPT_CHUNK_STREAM } else { 0 }
++        } else {
++            OPT_CHUNK_STREAM | OPT_CHUNK_MASKING
++        };
+         let mut body_key = [0u8; 16];
+         let mut body_iv = [0u8; 16];
+         vp_common::rand_bytes(&mut body_key);
+@@ -938,9 +964,9 @@ impl VmessOutbound {
+             body_iv,
+             resp_auth: resp_auth[0],
+             security: self.security,
+-            cmd: 0x01,
++            cmd,
+             dst: dst.clone(),
+-            option: OPT_CHUNK_STREAM | OPT_CHUNK_MASKING,
++            option,
+         };
+         let pt = build_request_plaintext(&req);
+         use tokio::io::AsyncWriteExt;
+@@ -964,8 +990,8 @@ impl VmessOutbound {
+             inner: io,
+             // 主流服务端按请求头 Option 的 ChunkMasking 位分帧：
+             // 请求方向掩码 seed=body_iv，响应方向服务端镜像同一位、seed=resp_iv
+-            enc: BodyCodec::new(self.security, &body_key, &body_iv, true)?,
+-            dec: BodyCodec::new(self.security, &dec_key, &dec_iv, true)?,
++            enc: BodyCodec::with_options(self.security, &body_key, &body_iv, option)?,
++            dec: BodyCodec::with_options(self.security, &dec_key, &dec_iv, option)?,
+             raw: BytesMut::new(),
+             pending: BytesMut::new(),
+             out: BytesMut::new(),
+@@ -977,7 +1003,7 @@ impl VmessOutbound {
+                 legacy,
+             )),
+         };
+-        Ok(Box::new(stream))
++        Ok(stream)
+     }
+ }
+ 
+@@ -1021,6 +1047,7 @@ pub struct VmessInbound {
+     tag: Arc<str>,
+     users: Vec<([u8; 16], [u8; 16])>, // (uuid, cmd_key)
+     direct: Arc<DirectOutbound>,
++    replay: std::sync::Mutex<std::collections::HashMap<[u8; 16], i64>>,
+ }
+ 
+ impl VmessInbound {
+@@ -1039,6 +1066,7 @@ impl VmessInbound {
+             tag: tag.into(),
+             users,
+             direct: Arc::new(DirectOutbound::new(Arc::new(Resolver::system()), false)),
++            replay: std::sync::Mutex::new(std::collections::HashMap::new()),
+         })
+     }
+ 
+@@ -1058,39 +1086,53 @@ impl VmessInbound {
+             .duration_since(std::time::UNIX_EPOCH)
+             .map(|d| d.as_secs() as i64)
+             .unwrap_or(0);
+-        let mut matched: Option<[u8; 16]> = None;
++        let mut matched: Option<([u8; 16], i64)> = None;
+         for (_, cmd_key) in &self.users {
+             if let Some((ts, _)) = kdf::decode_auth_id(cmd_key, &auth_id) {
+-                if (ts - now).abs() <= kdf::AUTH_WINDOW_SECS {
+-                    matched = Some(*cmd_key);
++                if ts.abs_diff(now) <= kdf::AUTH_WINDOW_SECS as u64 {
++                    matched = Some((*cmd_key, ts));
+                     break;
+                 }
+             }
+         }
+-        let cmd_key = matched.ok_or(Error::Proto("vmess: 用户认证失败"))?;
++        let (cmd_key, timestamp) = matched.ok_or(Error::Proto("vmess: 用户认证失败"))?;
+         let plaintext = open_header(&cmd_key, &auth_id, &mut stream).await?;
+         let req = parse_request_plaintext(&plaintext)?;
+-        if req.cmd != 0x01 {
+-            return Err(Error::Unsupported("vmess 入站仅支持 TCP".into()));
++        if req.cmd != 1 {
++            return Err(Error::Unsupported(
++                "VMess inbound UDP not yet implemented".into(),
++            ));
+         }
+-        // 直连目标
+-        let sess = Session::new_tcp(self.tag.clone(), Some(src), req.dst.clone());
+-        let remote = self.direct.connect_stream(&sess, &req.dst).await?;
++        validate_options(req.security, req.option)?;
++
++        {
++            let mut replay = self
++                .replay
++                .lock()
++                .map_err(|_| Error::Proto("VMess replay state poisoned"))?;
++            replay.retain(|_, expires| *expires >= now);
++            if replay.contains_key(&auth_id) {
++                return Err(Error::Proto("VMess request replay rejected"));
++            }
++            if replay.len() >= 65_536 {
++                return Err(Error::Proto("VMess replay cache full"));
++            }
++            replay.insert(auth_id, timestamp.saturating_add(kdf::AUTH_WINDOW_SECS));
++        }
++        vp_core::task_scope::check_destination(&req.dst)?;
+         // 客户端 Option 的 ChunkMasking 位决定双向分块长度是否掩码
+-        let masked = req.option & OPT_CHUNK_MASKING != 0;
+         // 响应头
+         let (resp_key, resp_iv) = resp_keys(&req.body_key, &req.body_iv);
+-        let resp = build_response_header(
+-            req.resp_auth,
+-            &resp_key,
+-            &resp_iv,
+-            OPT_CHUNK_STREAM | if masked { OPT_CHUNK_MASKING } else { 0 },
+-        )?;
++        let resp = build_response_header(req.resp_auth, &resp_key, &resp_iv, req.option)?;
+         stream.write_all(&resp).await?;
++        stream.flush().await?;
++
++        let sess = Session::new_tcp(self.tag.clone(), Some(src), req.dst.clone());
++        let remote = self.direct.connect_stream(&sess, &req.dst).await?;
+         let client = VmessStream {
+             inner: stream,
+-            enc: BodyCodec::new(req.security, &resp_key, &resp_iv, masked)?,
+-            dec: BodyCodec::new(req.security, &req.body_key, &req.body_iv, masked)?,
++            enc: BodyCodec::with_options(req.security, &resp_key, &resp_iv, req.option)?,
++            dec: BodyCodec::with_options(req.security, &req.body_key, &req.body_iv, req.option)?,
+             raw: BytesMut::new(),
+             pending: BytesMut::new(),
+             out: BytesMut::new(),
+@@ -1273,8 +1315,8 @@ mod tests {
+         let mut enc = BodyCodec::new(Security::Aes128Gcm, &key, &iv, true).unwrap();
+         let mut dec = BodyCodec::new(Security::Aes128Gcm, &key, &iv, true).unwrap();
+ 
+-        let chunk1 = enc.seal_chunk(b"hello vmess chunk 1");
+-        let chunk2 = enc.seal_chunk(b"second chunk with more data here");
++        let chunk1 = enc.seal_chunk(b"hello vmess chunk 1").unwrap();
++        let chunk2 = enc.seal_chunk(b"second chunk with more data here").unwrap();
+ 
+         let mut stream_bytes = Vec::new();
+         stream_bytes.extend_from_slice(&chunk1);
+@@ -1295,4 +1337,115 @@ mod tests {
+         assert_eq!(&decoded[0], b"hello vmess chunk 1");
+         assert_eq!(&decoded[1], b"second chunk with more data here");
+     }
++    #[test]
++    fn standard_none_is_length_plus_payload_without_fnv() {
++        let mut codec = BodyCodec::new(Security::None, &[0; 16], &[0; 16], false).unwrap();
++        assert_eq!(codec.seal_chunk(b"abc").unwrap(), b"\0\x03abc");
++    }
++    #[test]
++    fn padded_masked_frames_fragment_authentication_and_nonce_limit() {
++        for security in [Security::Aes128Gcm, Security::ChaCha20, Security::None] {
++            let option = OPT_CHUNK_STREAM | OPT_CHUNK_MASKING | OPT_GLOBAL_PADDING;
++            let mut enc = BodyCodec::with_options(security, &[1; 16], &[2; 16], option).unwrap();
++            let mut dec = BodyCodec::with_options(security, &[1; 16], &[2; 16], option).unwrap();
++            let bytes = enc.seal_chunk(b"padded datagram").unwrap();
++            let mut raw = Vec::new();
++            for (i, byte) in bytes.iter().enumerate() {
++                raw.push(*byte);
++                let result = dec.try_open_chunk(&raw);
++                if i + 1 < bytes.len() {
++                    assert!(result.is_none())
++                } else {
++                    assert_eq!(result.unwrap().unwrap().0, b"padded datagram")
++                }
++            }
++        }
++        let mut codec = BodyCodec::new(Security::Aes128Gcm, &[1; 16], &[2; 16], true).unwrap();
++        codec.index = 65536;
++        assert!(codec.seal_chunk(b"never reuse nonce").is_err());
++        let mut enc = BodyCodec::new(Security::ChaCha20, &[1; 16], &[2; 16], true).unwrap();
++        let mut dec = BodyCodec::new(Security::ChaCha20, &[1; 16], &[2; 16], true).unwrap();
++        let mut bytes = enc.seal_chunk(b"auth").unwrap();
++        *bytes.last_mut().unwrap() ^= 1;
++        assert!(dec.try_open_chunk(&bytes).unwrap().is_err());
++    }
++    #[test]
++    fn request_random_padding_is_validated_not_treated_as_destination() {
++        let req = VmessRequest {
++            body_key: [1; 16],
++            body_iv: [2; 16],
++            resp_auth: 3,
++            security: Security::Aes128Gcm,
++            cmd: 2,
++            dst: DstAddr::new("127.0.0.1", 9),
++            option: 5,
++        };
++        let mut bytes = build_request_plaintext(&req);
++        bytes.truncate(bytes.len() - 4);
++        bytes[35] |= 3 << 4;
++        bytes.extend_from_slice(&[4, 5, 6]);
++        let checksum = kdf::fnv1a32(&bytes).to_be_bytes();
++        bytes.extend_from_slice(&checksum);
++        let parsed = parse_request_plaintext(&bytes).unwrap();
++        assert_eq!(parsed.cmd, 2);
++        assert_eq!(parsed.dst, req.dst);
++        assert!(validate_options(Security::Aes128Gcm, OPT_CHUNK_STREAM | 16).is_err());
++    }
++    #[tokio::test]
++    async fn response_header_parser_survives_one_byte_fragments() {
++        let (mut peer, mut io) = tokio::io::duplex(1);
++        let key = [1; 16];
++        let iv = [2; 16];
++        let header = build_response_header(7, &key, &iv, 5).unwrap();
++        let task = tokio::spawn(async move {
++            for byte in header {
++                peer.write_all(&[byte]).await.unwrap();
++                tokio::task::yield_now().await;
++            }
++            peer.write_all(b"body").await.unwrap();
++        });
++        let mut response = Some(RespHeader::new(7, key, iv.to_vec(), false));
++        std::future::poll_fn(|cx| {
++            VmessStream::<tokio::io::DuplexStream>::poll_resp_header(&mut response, &mut io, cx)
++        })
++        .await
++        .unwrap();
++        assert!(response.is_none());
++        let mut body = [0; 4];
++        io.read_exact(&mut body).await.unwrap();
++        assert_eq!(&body, b"body");
++        task.await.unwrap();
++    }
++    #[tokio::test]
++    async fn stream_write_pending_does_not_duplicate_accepted_payload() {
++        let (client, mut peer) = tokio::io::duplex(1);
++        let key = [1; 16];
++        let iv = [2; 16];
++        let payload = vec![9; 40_000];
++        let mut stream = VmessStream {
++            inner: client,
++            enc: BodyCodec::new(Security::None, &key, &iv, false).unwrap(),
++            dec: BodyCodec::new(Security::None, &key, &iv, false).unwrap(),
++            raw: BytesMut::new(),
++            pending: BytesMut::new(),
++            out: BytesMut::new(),
++            closed: false,
++            resp_header: None,
++        };
++        let expected = payload.clone();
++        let task = tokio::spawn(async move {
++            let mut got = Vec::new();
++            while got.len() < expected.len() {
++                let n = peer.read_u16().await.unwrap() as usize;
++                assert!(n <= 15_000);
++                let mut bytes = vec![0; n];
++                peer.read_exact(&mut bytes).await.unwrap();
++                got.extend_from_slice(&bytes);
++            }
++            assert_eq!(got, expected);
++        });
++        stream.write_all(&payload).await.unwrap();
++        stream.flush().await.unwrap();
++        task.await.unwrap();
++    }
+ }
+-- 
+2.52.0
+

@@ -1,0 +1,1957 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 4d4dd2c..e9f9ba7 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2891,12 +2891,16 @@ dependencies = [
+  "bytes",
+  "etherparse 0.17.0",
+  "ipstack",
++ "serde_json",
++ "sha2",
+  "tokio",
+  "tracing",
+  "tun",
+  "vp-common",
++ "vp-config",
+  "vp-core",
+  "vp-dns",
++ "vp-protocol",
+  "vp-rule",
+ ]
+ 
+diff --git a/crates/vp-core/src/host_network.rs b/crates/vp-core/src/host_network.rs
+index 49b09f2..1ef3188 100644
+--- a/crates/vp-core/src/host_network.rs
++++ b/crates/vp-core/src/host_network.rs
+@@ -27,6 +27,11 @@ pub trait HostNetwork: Send + Sync {
+     ) -> io::Result<()>;
+     /// Explicit IP-only bootstrap resolvers; never OS getaddrinfo on mobile.
+     fn dns_servers(&self) -> Vec<SocketAddr>;
++    /// Only this configured proxy endpoint may use protected direct bootstrap
++    /// DNS. None denies all domain bootstrap; numeric endpoints need no DNS.
++    fn bootstrap_host(&self) -> Option<String> {
++        None
++    }
+ }
+ pub fn current() -> Option<Arc<dyn HostNetwork>> {
+     crate::task_scope::current_scope().and_then(|s| s.host_network())
+@@ -49,6 +54,15 @@ fn before(
+     purpose: Purpose,
+ ) -> io::Result<()> {
+     if let Some(host) = current() {
++        if host.bootstrap_host().is_some()
++            && (purpose == Purpose::Dns
++                || (purpose == Purpose::Bootstrap && !host.dns_servers().contains(&destination)))
++        {
++            return Err(io::Error::new(
++                io::ErrorKind::PermissionDenied,
++                "explicit mobile DNS policy forbids direct user DNS",
++            ));
++        }
+         host.before_connect(socket, protocol, destination, purpose)
+     } else if cfg!(target_os = "android") {
+         Err(io::Error::new(
+@@ -181,3 +195,57 @@ mod tests {
+         assert_eq!(host.calls.load(Ordering::SeqCst), 1);
+     }
+ }
++
++#[cfg(test)]
++mod dns_policy_tests {
++    use super::*;
++    use crate::task_scope::{DestinationPolicy, TaskScope};
++    use std::sync::atomic::{AtomicUsize, Ordering};
++    struct Host {
++        dns: SocketAddr,
++        calls: AtomicUsize,
++    }
++    impl HostNetwork for Host {
++        fn before_connect(&self, _: u64, _: Protocol, _: SocketAddr, _: Purpose) -> io::Result<()> {
++            self.calls.fetch_add(1, Ordering::SeqCst);
++            Ok(())
++        }
++        fn dns_servers(&self) -> Vec<SocketAddr> {
++            vec![self.dns]
++        }
++        fn bootstrap_host(&self) -> Option<String> {
++            Some("proxy.fixture.invalid".into())
++        }
++    }
++    #[tokio::test]
++    async fn explicit_policy_denies_direct_user_dns_and_unlisted_bootstrap_before_platform_hook() {
++        let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
++        let host = Arc::new(Host {
++            dns: listener.local_addr().unwrap(),
++            calls: AtomicUsize::new(0),
++        });
++        let scope =
++            TaskScope::with_host_network(DestinationPolicy::LoopbackIpOnly, Some(host.clone()));
++        scope
++            .run(async {
++                assert!(bind_udp(host.dns, Purpose::Dns).is_err());
++                assert!(bind_udp("127.0.0.1:9".parse().unwrap(), Purpose::Bootstrap).is_err());
++                assert_eq!(host.calls.load(Ordering::SeqCst), 0);
++                drop(bind_udp(host.dns, Purpose::Bootstrap).unwrap());
++                assert_eq!(host.calls.load(Ordering::SeqCst), 1);
++                let mut buf = [0; 512];
++                assert_eq!(
++                    listener.try_recv_from(&mut buf).unwrap_err().kind(),
++                    io::ErrorKind::WouldBlock
++                );
++            })
++            .await;
++        assert_eq!(
++            scope
++                .shutdown(std::time::Duration::ZERO, std::time::Duration::from_secs(1))
++                .await
++                .remaining_tasks,
++            0
++        );
++    }
++}
+diff --git a/crates/vp-dns/src/lib.rs b/crates/vp-dns/src/lib.rs
+index 4971bd7..e2f085b 100644
+--- a/crates/vp-dns/src/lib.rs
++++ b/crates/vp-dns/src/lib.rs
+@@ -54,6 +54,7 @@ pub struct CompiledFallbackFilter {
+ 
+ /// DNS 解析器：多上游，UDP 优先 TCP 兜底；进程内共享缓存；支持 nameserver-policy 分流与 fallback-filter 污染过滤。
+ pub struct Resolver {
++    bootstrap_host: Option<String>,
+     servers: Vec<ServerAddr>,
+     fallbacks: Vec<ServerAddr>,
+     policies: Vec<PolicyRule>,
+@@ -73,6 +74,7 @@ struct ServerAddr {
+     addr: Option<SocketAddr>,
+     port: u16,
+     proto: Proto,
++    purpose: vp_core::host_network::Purpose,
+     /// DoH 路径（如 /dns-query）
+     path: String,
+     /// 跳过证书校验（URL 片段 #insecure）
+@@ -92,6 +94,7 @@ impl Resolver {
+         let parsed: Vec<ServerAddr> = servers.iter().filter_map(|s| parse_server(s)).collect();
+         let use_system = parsed.is_empty();
+         Resolver {
++            bootstrap_host: None,
+             servers: parsed,
+             fallbacks: Vec::new(),
+             policies: Vec::new(),
+@@ -102,6 +105,50 @@ impl Resolver {
+         }
+     }
+ 
++    /// Mobile proxy-endpoint startup resolver. Numeric upstreams only; no
++    /// system/public fallback and no authority for arbitrary application names.
++    pub fn bootstrap(servers: Vec<SocketAddr>, endpoint_host: &str) -> Result<Self> {
++        if servers.is_empty()
++            || servers.len() > 4
++            || endpoint_host.is_empty()
++            || servers
++                .iter()
++                .any(|s| s.port() == 0 || s.ip().is_unspecified() || s.ip().is_multicast())
++        {
++            return Err(Error::Config(
++                "invalid explicit bootstrap DNS configuration".into(),
++            ));
++        }
++        let mut resolver = Self::system();
++        resolver.use_system = false;
++        resolver.bootstrap_host = Some(endpoint_host.trim_end_matches('.').to_ascii_lowercase());
++        resolver.servers = servers
++            .into_iter()
++            .map(|addr| ServerAddr {
++                host: addr.ip().to_string(),
++                addr: Some(addr),
++                port: addr.port(),
++                proto: Proto::Udp,
++                purpose: vp_core::host_network::Purpose::Bootstrap,
++                path: String::new(),
++                skip_verify: false,
++            })
++            .collect();
++        Ok(resolver)
++    }
++    fn check_bootstrap_name(&self, domain: &str) -> Result<()> {
++        if self
++            .bootstrap_host
++            .as_ref()
++            .is_some_and(|allowed| allowed != &domain.trim_end_matches('.').to_ascii_lowercase())
++        {
++            return Err(Error::Unsupported(
++                "bootstrap DNS is restricted to the configured proxy endpoint".into(),
++            ));
++        }
++        Ok(())
++    }
++
+     pub fn build(
+         servers: Vec<String>,
+         fallbacks: Vec<String>,
+@@ -115,6 +162,7 @@ impl Resolver {
+         let use_system =
+             parsed_servers.is_empty() && parsed_fallbacks.is_empty() && policies.is_empty();
+         Resolver {
++            bootstrap_host: None,
+             servers: parsed_servers,
+             fallbacks: parsed_fallbacks,
+             policies,
+@@ -127,6 +175,7 @@ impl Resolver {
+ 
+     pub fn system() -> Self {
+         Resolver {
++            bootstrap_host: None,
+             servers: Vec::new(),
+             fallbacks: Vec::new(),
+             policies: Vec::new(),
+@@ -169,6 +218,7 @@ impl Resolver {
+     }
+ 
+     pub async fn resolve_domain(&self, domain: &str, ipv6: bool) -> Result<Arc<Vec<IpAddr>>> {
++        self.check_bootstrap_name(domain)?;
+         let key = (domain.to_ascii_lowercase(), ipv6);
+         {
+             let c = self.cache.lock().unwrap();
+@@ -285,6 +335,7 @@ impl Resolver {
+     /// 查询域名的 HTTPS(type65) 记录，取 ech SvcParam（ECHConfigList 原始字节）。
+     /// 结果缓存（None 也缓存，避免对不支持域名反复查询）。ECH 连接前调用，低频路径。
+     pub async fn query_https_ech(&self, domain: &str) -> Option<Arc<Vec<u8>>> {
++        self.check_bootstrap_name(domain).ok()?;
+         let key = domain.trim_end_matches('.').to_ascii_lowercase();
+         if let Some(hit) = self.ech_cache.lock().unwrap().get(&key) {
+             return hit.clone();
+@@ -430,6 +481,7 @@ fn parse_server(s: &str) -> Option<ServerAddr> {
+             addr: None,
+             port,
+             proto: Proto::Doh,
++            purpose: vp_core::host_network::Purpose::Dns,
+             path,
+             skip_verify,
+         });
+@@ -448,6 +500,7 @@ fn parse_server(s: &str) -> Option<ServerAddr> {
+         addr: Some(SocketAddr::new(ip, port)),
+         port,
+         proto,
++        purpose: vp_core::host_network::Purpose::Dns,
+         path: String::new(),
+         skip_verify,
+     })
+@@ -589,14 +642,31 @@ async fn query_server_raw(
+     qtype: QType,
+ ) -> Result<wire::Message> {
+     match server.proto {
+-        Proto::Udp => query_udp(server.addr.expect("udp 必为 IP"), current_domain, qtype).await,
+-        Proto::Tcp => query_tcp(server.addr.expect("tcp 必为 IP"), current_domain, qtype).await,
++        Proto::Udp => {
++            query_udp(
++                server.addr.expect("udp 必为 IP"),
++                current_domain,
++                qtype,
++                server.purpose,
++            )
++            .await
++        }
++        Proto::Tcp => {
++            query_tcp(
++                server.addr.expect("tcp 必为 IP"),
++                current_domain,
++                qtype,
++                server.purpose,
++            )
++            .await
++        }
+         Proto::Tls => {
+             query_tls(
+                 server.addr.expect("tls 必为 IP"),
+                 &server.host,
+                 current_domain,
+                 qtype,
++                server.purpose,
+             )
+             .await
+         }
+@@ -625,30 +695,39 @@ fn query_id() -> u16 {
+     u16::from_be_bytes(b)
+ }
+ 
+-async fn query_udp(addr: SocketAddr, domain: &str, qtype: QType) -> Result<wire::Message> {
++async fn query_udp(
++    addr: SocketAddr,
++    domain: &str,
++    qtype: QType,
++    purpose: vp_core::host_network::Purpose,
++) -> Result<wire::Message> {
+     let bind: SocketAddr = if addr.is_ipv4() {
+         "0.0.0.0:0".parse().unwrap()
+     } else {
+         "[::]:0".parse().unwrap()
+     };
+     let _ = bind;
+-    let sock = vp_core::host_network::bind_udp(addr, vp_core::host_network::Purpose::Dns)?;
++    let sock = vp_core::host_network::bind_udp(addr, purpose)?;
+     sock.connect(addr).await?;
+     let id = query_id();
+     let q = wire::build_query(id, domain, qtype);
+     sock.send(&q).await?;
+-    let mut buf = vec![0u8; 1500];
++    let mut buf = vec![0u8; 4097];
+     let n = with_timeout(sock.recv(&mut buf)).await?;
++    if !wire::response_matches_query(&q, &buf[..n]) {
++        return Err(Error::Proto("unassociated DNS response"));
++    }
+     wire::parse_response(&buf[..n]).ok_or(Error::Proto("DNS 响应解析失败"))
+ }
+ 
+-async fn query_tcp(addr: SocketAddr, domain: &str, qtype: QType) -> Result<wire::Message> {
++async fn query_tcp(
++    addr: SocketAddr,
++    domain: &str,
++    qtype: QType,
++    purpose: vp_core::host_network::Purpose,
++) -> Result<wire::Message> {
+     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+-    let mut stream = with_timeout(vp_core::host_network::connect_tcp(
+-        addr,
+-        vp_core::host_network::Purpose::Dns,
+-    ))
+-    .await?;
++    let mut stream = with_timeout(vp_core::host_network::connect_tcp(addr, purpose)).await?;
+     let id = query_id();
+     let q = wire::build_query(id, domain, qtype);
+     let mut framed = Vec::with_capacity(q.len() + 2);
+@@ -658,8 +737,14 @@ async fn query_tcp(addr: SocketAddr, domain: &str, qtype: QType) -> Result<wire:
+     let mut len_buf = [0u8; 2];
+     with_timeout(stream.read_exact(&mut len_buf)).await?;
+     let len = u16::from_be_bytes(len_buf) as usize;
++    if !(12..=4096).contains(&len) {
++        return Err(Error::Proto("DNS response exceeds bounds"));
++    }
+     let mut resp = vec![0u8; len];
+     with_timeout(stream.read_exact(&mut resp)).await?;
++    if !wire::response_matches_query(&q, &resp) {
++        return Err(Error::Proto("unassociated DNS response"));
++    }
+     wire::parse_response(&resp).ok_or(Error::Proto("DNS 响应解析失败"))
+ }
+ 
+@@ -669,12 +754,13 @@ async fn query_tls(
+     sni_host: &str,
+     domain: &str,
+     qtype: QType,
++    purpose: vp_core::host_network::Purpose,
+ ) -> Result<wire::Message> {
+     use tokio::io::AsyncWriteExt;
+ 
+     let connector = webpki_connector(false);
+     let sni = server_name(sni_host, addr.ip())?;
+-    let tcp = vp_core::host_network::connect_tcp(addr, vp_core::host_network::Purpose::Dns).await?;
++    let tcp = vp_core::host_network::connect_tcp(addr, purpose).await?;
+     let mut tls = connector.connect(sni, tcp).await?;
+ 
+     let id = query_id();
+@@ -686,8 +772,14 @@ async fn query_tls(
+     let mut len_buf = [0u8; 2];
+     with_timeout(stream_read_exact(&mut tls, &mut len_buf)).await?;
+     let len = u16::from_be_bytes(len_buf) as usize;
++    if !(12..=4096).contains(&len) {
++        return Err(Error::Proto("DNS response exceeds bounds"));
++    }
+     let mut resp = vec![0u8; len];
+     with_timeout(stream_read_exact(&mut tls, &mut resp)).await?;
++    if !wire::response_matches_query(&q, &resp) {
++        return Err(Error::Proto("unassociated DNS response"));
++    }
+     wire::parse_response(&resp).ok_or(Error::Proto("DoT 响应解析失败"))
+ }
+ 
+@@ -1206,7 +1298,7 @@ mod tests {
+         let mut policy_map = std::collections::HashMap::new();
+         policy_map.insert(
+             "*.google.com".into(),
+-            serde_yaml::Value::String(format!("udp://{}", policy_addr)),
++            serde_yaml::Value::String(format!("udp://{policy_addr}")),
+         );
+ 
+         let policies = compile_nameserver_policy(&policy_map, None);
+@@ -1314,7 +1406,13 @@ pub async fn lookup_host(host: &str, port: u16) -> std::io::Result<std::vec::Int
+                 "missing explicit DNS servers",
+             ));
+         }
+-        let resolver = Resolver::new(servers.iter().map(ToString::to_string).collect());
++        let endpoint = host_network.bootstrap_host().ok_or_else(|| {
++            std::io::Error::new(
++                std::io::ErrorKind::PermissionDenied,
++                "missing explicit bootstrap endpoint",
++            )
++        })?;
++        let resolver = Resolver::bootstrap(servers, &endpoint).map_err(std::io::Error::from)?;
+         let ips = resolver
+             .resolve_domain(host, false)
+             .await
+@@ -1330,3 +1428,86 @@ pub async fn lookup_host(host: &str, port: u16) -> std::io::Result<std::vec::Int
+         .collect::<Vec<_>>()
+         .into_iter())
+ }
++
++#[cfg(test)]
++mod bootstrap_policy_tests {
++    use super::*;
++    use vp_core::host_network::{HostNetwork, Protocol, Purpose};
++    use vp_core::task_scope::{DestinationPolicy, TaskScope};
++    struct Host {
++        dns: SocketAddr,
++        calls: Mutex<Vec<Purpose>>,
++    }
++    impl HostNetwork for Host {
++        fn before_connect(
++            &self,
++            _: u64,
++            protocol: Protocol,
++            destination: SocketAddr,
++            purpose: Purpose,
++        ) -> std::io::Result<()> {
++            assert_eq!(protocol, Protocol::Udp);
++            assert_eq!(destination, self.dns);
++            assert_eq!(purpose, Purpose::Bootstrap);
++            self.calls.lock().unwrap().push(purpose);
++            Ok(())
++        }
++        fn dns_servers(&self) -> Vec<SocketAddr> {
++            vec![self.dns]
++        }
++        fn bootstrap_host(&self) -> Option<String> {
++            Some("proxy.fixture.invalid".into())
++        }
++    }
++    #[tokio::test]
++    async fn bootstrap_endpoint_only_numeric_ipv6_and_response_association() {
++        let socket = UdpSocket::bind("[::1]:0").await.unwrap();
++        let host = Arc::new(Host {
++            dns: socket.local_addr().unwrap(),
++            calls: Mutex::new(vec![]),
++        });
++        let peer = tokio::spawn(async move {
++            for wrong in [false, true] {
++                let mut buf = [0; 4096];
++                let (n, addr) = socket.recv_from(&mut buf).await.unwrap();
++                assert_eq!(
++                    wire::parse_query(&buf[..n]).unwrap().1,
++                    "proxy.fixture.invalid"
++                );
++                let mut response = wire::build_a_response(&buf[..n], [127, 0, 0, 1].into());
++                if wrong {
++                    response[0] ^= 1;
++                }
++                socket.send_to(&response, addr).await.unwrap();
++            }
++        });
++        let scope =
++            TaskScope::with_host_network(DestinationPolicy::Unrestricted, Some(host.clone()));
++        scope
++            .run(async {
++                assert_eq!(
++                    lookup_host("proxy.fixture.invalid", 443)
++                        .await
++                        .unwrap()
++                        .next()
++                        .unwrap()
++                        .ip(),
++                    "127.0.0.1".parse::<IpAddr>().unwrap()
++                );
++                assert!(lookup_host("user.fixture.invalid", 443).await.is_err());
++                assert!(lookup_host("relay.fixture.invalid", 443).await.is_err());
++                assert!(lookup_host("proxy.fixture.invalid", 443).await.is_err());
++                assert!(lookup_host("::1", 443).await.is_ok());
++            })
++            .await;
++        peer.await.unwrap();
++        assert_eq!(host.calls.lock().unwrap().len(), 2);
++        assert_eq!(
++            scope
++                .shutdown(Duration::ZERO, Duration::from_secs(1))
++                .await
++                .remaining_tasks,
++            0
++        );
++    }
++}
+diff --git a/crates/vp-dns/src/wire.rs b/crates/vp-dns/src/wire.rs
+index 0559dd4..bec02e7 100644
+--- a/crates/vp-dns/src/wire.rs
++++ b/crates/vp-dns/src/wire.rs
+@@ -487,3 +487,209 @@ mod tests {
+         assert_eq!(extract_cname(&msg), Some("b.com".to_string()));
+     }
+ }
++
++/// A bounded, single-question DNS message used at the mobile trust boundary.
++/// Names are canonical wire labels (ASCII folded), not lossy UTF-8 strings.
++#[derive(Debug, PartialEq, Eq)]
++struct Question {
++    name: Vec<u8>,
++    kind: u16,
++    class: u16,
++    end: usize,
++}
++fn bounded_name(buf: &[u8], cursor: &mut usize) -> Option<Vec<u8>> {
++    let mut pos = *cursor;
++    let mut jumped = false;
++    let mut hops = 0;
++    let mut name = Vec::new();
++    loop {
++        let len = *buf.get(pos)?;
++        if len & 0xc0 == 0xc0 {
++            let next = *buf.get(pos + 1)?;
++            let target = ((len as usize & 63) << 8) | next as usize;
++            // Backward-only pointers exclude cycles and out-of-message aliases.
++            if target >= pos || target < 12 || hops >= 16 {
++                return None;
++            }
++            if !jumped {
++                *cursor = pos + 2;
++                jumped = true;
++            }
++            pos = target;
++            hops += 1;
++            continue;
++        }
++        if len > 63 {
++            return None;
++        }
++        pos += 1;
++        name.push(len);
++        if len == 0 {
++            if !jumped {
++                *cursor = pos;
++            }
++            return Some(name);
++        }
++        let label = buf.get(pos..pos.checked_add(len as usize)?)?;
++        name.extend(label.iter().map(u8::to_ascii_lowercase));
++        if name.len() >= 255 {
++            return None;
++        }
++        pos += len as usize;
++    }
++}
++fn bounded_question(buf: &[u8], response: bool) -> Option<Question> {
++    if !(12..=4096).contains(&buf.len())
++        || (buf[2] & 0x80 != 0) != response
++        || buf[2] & 0x78 != 0
++        || buf[4..6] != [0, 1]
++    {
++        return None;
++    }
++    let mut pos = 12;
++    let name = bounded_name(buf, &mut pos)?;
++    let kind = u16::from_be_bytes(buf.get(pos..pos + 2)?.try_into().ok()?);
++    let class = u16::from_be_bytes(buf.get(pos + 2..pos + 4)?.try_into().ok()?);
++    let end = pos + 4;
++    pos = end;
++    let count = [6, 8, 10]
++        .into_iter()
++        .map(|n| u16::from_be_bytes([buf[n], buf[n + 1]]) as usize)
++        .sum::<usize>();
++    if count > 128 {
++        return None;
++    }
++    for _ in 0..count {
++        bounded_name(buf, &mut pos)?;
++        let header = buf.get(pos..pos + 10)?;
++        let size = u16::from_be_bytes([header[8], header[9]]) as usize;
++        pos = pos.checked_add(10 + size)?;
++        if pos > buf.len() {
++            return None;
++        }
++    }
++    if pos != buf.len() {
++        return None;
++    }
++    Some(Question {
++        name,
++        kind,
++        class,
++        end,
++    })
++}
++/// Validate supported standard queries without network activity. One question,
++/// maximum 4096 bytes, bounded labels, records and compression traversal.
++pub fn valid_forward_query(query: &[u8]) -> bool {
++    bounded_question(query, false).is_some()
++}
++/// Never rewrite a received ID to make an unrelated response look associated.
++/// Require ID, QR/opcode, canonical question name, type, class and valid framing.
++pub fn response_matches_query(query: &[u8], response: &[u8]) -> bool {
++    let (Some(q), Some(r)) = (
++        bounded_question(query, false),
++        bounded_question(response, true),
++    ) else {
++        return false;
++    };
++    query[..2] == response[..2] && q.name == r.name && q.kind == r.kind && q.class == r.class
++}
++/// A local forwarding error is SERVFAIL, never a fabricated successful empty
++/// answer. Malformed input receives no answer. Question/source association stays
++/// with the caller's per-flow packet/stream; no synthetic address is allocated.
++pub fn build_servfail(query: &[u8]) -> Option<Vec<u8>> {
++    let q = bounded_question(query, false)?;
++    let mut out = query[..q.end].to_vec();
++    out[2] = 0x80 | (query[2] & 1);
++    out[3] = 0x82;
++    out[6..12].fill(0);
++    Some(out)
++}
++
++#[cfg(test)]
++mod forward_validation_tests {
++    use super::*;
++    #[test]
++    fn association_rejects_id_question_type_class_flags_size_and_bad_records() {
++        let query = build_query(42, "application.fixture.invalid", QType::A);
++        let response = build_a_response(&query, [127, 0, 0, 8].into());
++        assert!(response_matches_query(&query, &response));
++        for (offset, mask) in [
++            (0, 1),
++            (2, 128),
++            (13, 1),
++            (query.len() - 3, 1),
++            (query.len() - 1, 1),
++        ] {
++            let mut bad = response.clone();
++            bad[offset] ^= mask;
++            assert!(!response_matches_query(&query, &bad), "offset {offset}");
++        }
++        let mut bad = response.clone();
++        bad.pop();
++        assert!(!response_matches_query(&query, &bad));
++        let mut bad = response.clone();
++        bad.extend(vec![0; 4096]);
++        assert!(!response_matches_query(&query, &bad));
++        let mut bad = response.clone();
++        bad[4..6].copy_from_slice(&2u16.to_be_bytes());
++        assert!(!response_matches_query(&query, &bad));
++        let mut bad = query.clone();
++        bad[12] = 0xc0;
++        bad[13] = 12;
++        assert!(!valid_forward_query(&bad));
++        assert!(build_servfail(&[0; 8]).is_none());
++        let failed = build_servfail(&query).unwrap();
++        assert_eq!(failed[3] & 15, 2);
++        assert!(response_matches_query(&query, &failed));
++    }
++}
++
++/// UDP response budget advertised by EDNS(0), clamped to the supported message
++/// limit. Without OPT, RFC 1035's 512-byte limit applies.
++pub fn udp_response_limit(query: &[u8]) -> Option<usize> {
++    let question = bounded_question(query, false)?;
++    let mut pos = question.end;
++    let before_additional = u16::from_be_bytes([query[6], query[7]]) as usize
++        + u16::from_be_bytes([query[8], query[9]]) as usize;
++    let additional = u16::from_be_bytes([query[10], query[11]]) as usize;
++    let mut limit = 512;
++    for index in 0..before_additional + additional {
++        bounded_name(query, &mut pos)?;
++        let header = query.get(pos..pos + 10)?;
++        let kind = u16::from_be_bytes([header[0], header[1]]);
++        let class = u16::from_be_bytes([header[2], header[3]]) as usize;
++        let len = u16::from_be_bytes([header[8], header[9]]) as usize;
++        if index >= before_additional && kind == 41 {
++            limit = class.clamp(512, 4096);
++        }
++        pos += 10 + len;
++    }
++    Some(limit)
++}
++/// Truncate at DNS record boundaries, not IP-stack write boundaries. A client
++/// may retry over TCP, which uses the same selected-proxy policy.
++pub fn build_truncated_response(query: &[u8]) -> Option<Vec<u8>> {
++    let mut response = build_servfail(query)?;
++    response[2] |= 2;
++    response[3] = 0x80;
++    Some(response)
++}
++
++#[cfg(test)]
++mod truncate_tests {
++    use super::*;
++    #[test]
++    fn edns_budget_and_valid_truncation_preserve_question() {
++        let mut q = build_query(82, "size.fixture.invalid", QType::A);
++        assert_eq!(udp_response_limit(&q), Some(512));
++        q[10..12].copy_from_slice(&1u16.to_be_bytes());
++        q.extend_from_slice(&[0, 0, 41, 0x10, 0, 0, 0, 0, 0, 0, 0]);
++        assert_eq!(udp_response_limit(&q), Some(4096));
++        let truncated = build_truncated_response(&q).unwrap();
++        assert!(response_matches_query(&q, &truncated));
++        assert_ne!(truncated[2] & 2, 0);
++        assert_eq!(truncated[3] & 15, 0);
++        assert_eq!(&truncated[6..12], &[0; 6]);
++    }
++}
+diff --git a/crates/vp-protocol/src/tuic.rs b/crates/vp-protocol/src/tuic.rs
+index df51770..259528f 100644
+--- a/crates/vp-protocol/src/tuic.rs
++++ b/crates/vp-protocol/src/tuic.rs
+@@ -1223,7 +1223,7 @@ mod tests {
+     }
+ 
+     #[tokio::test]
+-    async fn udp_reply_domain_uses_protected_dns_and_denial_sends_nothing() {
++    async fn udp_reply_domain_cannot_use_endpoint_bootstrap_dns() {
+         use std::sync::atomic::{AtomicUsize, Ordering};
+         use vp_core::host_network::{HostNetwork, Protocol, Purpose};
+         use vp_core::task_scope::{DestinationPolicy, TaskScope};
+@@ -1267,7 +1267,7 @@ mod tests {
+         };
+         let result = scope.run(resolve_udp(&destination)).await;
+         assert!(result.is_err());
+-        assert!(host.calls.load(Ordering::SeqCst) > 0);
++        assert_eq!(host.calls.load(Ordering::SeqCst), 0);
+         let mut packet = [0u8; 512];
+         assert!(
+             matches!(listener.try_recv_from(&mut packet), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+diff --git a/crates/vp-tun/Cargo.toml b/crates/vp-tun/Cargo.toml
+index 5ce73ef..1db4628 100644
+--- a/crates/vp-tun/Cargo.toml
++++ b/crates/vp-tun/Cargo.toml
+@@ -21,3 +21,10 @@ etherparse.workspace = true
+ 
+ [features]
+ default = []
++
++[dev-dependencies]
++vp-protocol.workspace = true
++vp-config.workspace = true
++serde_json.workspace = true
++sha2.workspace = true
++tokio = { workspace = true, features = ["test-util"] }
+diff --git a/crates/vp-tun/PROXY_DNS.md b/crates/vp-tun/PROXY_DNS.md
+new file mode 100644
+index 0000000..b897563
+--- /dev/null
++++ b/crates/vp-tun/PROXY_DNS.md
+@@ -0,0 +1,141 @@
++# Explicit mobile DNS policy (candidate)
++
++This implements the missing privacy boundary; socket protection alone is not a
++privacy guarantee. Product engine remains vp_core. No public provider is selected.
++
++## Product contract agreed for the next candidate
++
++- C ABI stays 1.1. Connect **payload** `schemaVersion: 2`; outer command envelope and NodeProfile
++  remain version 1. Host checks advertised `connectPayloadVersions` before consent.
++- Required `dns.bootstrapServers`: 1..4 numeric `SocketAddr` values.
++- Required `dns.user`: `{ "route": "selected_proxy", "servers": [...] }`, with
++  1..4 explicit numeric resolver endpoints selected/configured by the user.
++- Ports nonzero; unspecified/multicast addresses rejected; IPv4/IPv6 accepted.
++  User upstreams reject nonzero IPv6 scope/flow info because proxy address
++  encodings cannot preserve them.
++- Legacy ambiguous `dnsServers` is rejected with `UPGRADE_INCOMPATIBLE` before action,
++  not reinterpreted. No direct user-DNS option is implemented in this candidate.
++- Underlying OS DNS may seed **bootstrap only**, never silently user DNS.
++- A missing user resolver blocks connection and asks for settings; no hardcoded
++  public DNS and no fallback from a private/unreachable resolver to public/direct.
++- Current b739844 guest APK remains a historical **direct-protected UDP DNS**
++  fixture. It is not changed or retroactively claimed to certify this policy.
++
++## Core API / integration ownership
++
++`vp_dns::Resolver::bootstrap(Vec<SocketAddr>, &endpoint_host) -> Result<Resolver>`
++is pure construction. It binds bootstrap resolution to that exact proxy endpoint
++(name comparison folds ASCII and strips a terminal dot); CNAME following remains
++part of that endpoint lookup. Socket purpose is `Bootstrap` and upstream endpoints
++are numeric, eliminating resolver bootstrap recursion.
++
++`vp_core::host_network::HostNetwork::bootstrap_host() -> Option<String>` defaults
++to None. A protected `lookup_host` permits only this configured endpoint. Numeric
++addresses need no DNS. Distinct SOCKS UDP relay domain names and TUIC peer-returned
++domain names fail closed rather than leak direct DNS. Once bootstrap_host is set,
++`Purpose::Dns` direct sockets are rejected, and Bootstrap destinations must belong
++to the configured list, before the platform hook is invoked.
++
++`vp_tun::user_dns::UserDns::selected_proxy(Arc<dyn vp_core::Outbound>,
++Vec<SocketAddr>) -> vp_common::Result<UserDns>` is pure. The mobile adapter supplies
++the exact selected proxy (its typed node contract excludes Direct); it never uses
++a router that could select Direct. UDP support is mandatory before startup.
++
++`vp_tun::run_with_device_proxy_dns(cfg, tag, ctx, Arc<UserDns>, device)` intercepts
++both UDP destination port 53 and TCP destination port 53. TCP uses DNS's two-byte
++length prefix and sequential bounded frames; UDP retains each datagram. Both are
++sent through the selected proxy to the explicit numeric user resolver. Other
++ports use the normal selected outbound path. No fake-IP answers or assumptions.
++
++Mobile owner integrates adapter+ABI metadata+fixtures, Android owner integrates
++bootstrap and pre-consent version check, data owner integrates settings/typed
++payload and user-facing route/resolver disclosure. Pipeline owner promotes the
++patch only after checks and the frozen guest baseline window. This document does
++not claim that those consumers or an Android APK are already integrated.
++
++## Safety and semantics
++
++- 64 active intercepted DNS flows; excess flows dropped before spawning a task.
++- 64 simultaneous exchanges; no unbounded exchange queue. 256 requests per flow.
++- 4096-byte message cap for both transports, 5-second whole exchange/write budget,
++  10-second client-frame idle/read budget. Larger TCP messages are unsupported.
++- UDP answers are clamped to the client's EDNS size (512 without OPT) and the
++  actual IP/UDP MTU payload budget. Oversize answers become valid DNS TC replies,
++  never ipstack's truncated/split datagrams; TCP retry retains the proxy policy.
++- One fresh proxy session per query, round-robin only among explicitly configured
++  servers. No retry or cross-policy fallback on failure.
++- Valid single standard question, bounded names/compression/record lengths.
++  Responses require exact transaction ID, canonical question name/type/class,
++  QR/opcode, structural bounds, and (UDP) exact source IP/port. IDs are never
++  rewritten to disguise a mismatched reply.
++- Valid query + transport/auth/validation failure => local SERVFAIL; invalid query
++  => no response. Not a forged empty NOERROR success. A valid upstream TC answer
++  is preserved; a client's TCP retry follows the same configured proxy policy.
++- Per-flow source and original intercepted DNS destination are retained by
++  ipstack; returned DNS payload contains the original query ID and question.
++- Cancellation drops the exchange/session and semaphore permit; generation
++  TaskScope owns spawned packet-device work.
++- These limits bound this DNS layer, not all upstream ipstack memory: ipstack
++  1.0.1 uses unbounded ingress/session channels. General TUN queue bounding is a
++  separate outstanding resource-hardening item; no total-memory bound is claimed.
++
++## Validation scope
++
++Authored tests include pure bounds/correlation, unsupported UDP, no-fallback auth
++errors, concurrency/timeout/cancel release, TCP framing, bootstrap endpoint-only
++purpose guard and IPv6 bootstrap. Independent loopback test uses the already
++pinned official sing-vmess reference library with authenticated VMess AES-128-GCM,
++not a replacement production engine. It checks both DNS transports, A/AAAA,
++IPv4/IPv6 resolver targets, packet-device IPv4/IPv6 UDP ingress/reply association,
++wrong credentials/ID/question, cancellation, target counters and query SHA-256s.
++Host hooks allow only proxy sockets and the explicit bootstrap endpoint, not a
++direct user resolver socket.
++
++## Executed evidence (author candidate, not promoted/mobile acceptance)
++
++Evidence directory: `integration/proxy-dns-evidence` in the product workspace.
++Official test peer SHA-256:
++`eca989fc22cc8d1918e7fb3e0187e24a6207de31b138574ce8b5660053b55631`,
++matching the prior verified official-library build manifest. Go remains test-only.
++
++- vp-tun: **7 passed** (includes DNS source/size checks, pure constructor failure,
++  SERVFAIL/TCP framing, 64-exchange limit, timeout and cancellation resource release).
++- vp-core host_network: **4 passed**, including direct-user-DNS and unauthorized
++  bootstrap denial before the platform hook and zero destination traffic.
++- vp-dns full library: **25 passed; 4 public-live tests intentionally not run**.
++  Includes 9 wire tests and endpoint-bound IPv6 bootstrap response association.
++- TUIC peer-returned-domain denial: **1 passed**, zero bootstrap socket hooks/sends.
++- Independent authenticated VMess AES-128-GCM proxy/DNS/TUN test: **1 passed**;
++  explicit bootstrap target observed 21 queries, user IPv4 DNS target 13 and IPv6
++  target 6, exact query SHA-256s recorded, no disallowed platform-hook destination,
++  and zero remaining generation tasks. Includes real raw packet-device UDP v4/v6,
++  A/AAAA, both upstream transports, oversized DNS TC/TCP retry, wrong credential,
++  wrong ID/question, and cancellation after destination-observed forwarding.
++- Warnings-denied Clippy: **passed** vp-tun/vp-dns all targets and vp-core library.
++  Broader vp-core all-target check is **not clean**: pre-existing
++  `task_scope.rs:438` test triggers `clippy::async_yields_async`. Not suppressed
++  or changed in this patch. One pre-existing DNS test format string was modernized.
++- Formatting and diff whitespace checks: **passed** for changed sources.
++
++Initial concurrency unit test expected one Tokio yield to start all 64 tasks;
++61 had started. The test was repaired to await observed starts and await aborted
++join completion; production logic did not change. Initial/final logs are retained.
++Standalone std-only wire execution also passed all 9 tests before Cargo admission;
++that duplicate run is not counted as additional coverage.
++
++All Cargo runs used one job, incremental disabled, dev/test debuginfo zero, and
++shared `product-core-target`; no second full cache. Final runs were locked/offline.
++No host routes, firewalls, system proxy, trust stores, public DNS requests or real
++user domains were used. Actual syscall tracing is blocked and not bypassed;
++trusted hook and destination observations are **not** syscall evidence.
++
++**Not verified here:** merged/promotion identity, adapter schema2 build, native
++Android permission/lifecycle/DNS journey on a new artifact, Apple/Windows, full
++protocol/preset matrices, all-library IP-stack memory bounds or full-suite release.
++The adapter/host/settings owners must integrate the coordinated payload before
++this is the product default. Protected bootstrap lookup retains the existing
++A-record-only hostname lookup; numeric IPv6 proxy endpoints are supported.
++The raw UDP/TCP/DoT resolver verification helper also now enforces the same
++4096-byte/128-record bounds; larger messages are explicitly unsupported.
++Full privacy acceptance requires the coordinated native guest journey on the
++exact promoted artifact; the historical b739 APK is not upgraded by this evidence.
+diff --git a/crates/vp-tun/src/lib.rs b/crates/vp-tun/src/lib.rs
+index 1be314e..b28c700 100644
+--- a/crates/vp-tun/src/lib.rs
++++ b/crates/vp-tun/src/lib.rs
+@@ -22,6 +22,7 @@ use vp_core::stream::UdpPacket;
+ use vp_dns::{FakeIpPool, Resolver};
+ 
+ pub mod auto_route;
++pub mod user_dns;
+ pub mod wintun_installer;
+ 
+ #[derive(Clone)]
+@@ -169,8 +170,10 @@ async fn run(cfg: TunConfig, tag: Arc<str>, ctx: InboundCtx) -> Result<()> {
+     run_with_device(cfg, tag, ctx, pool, resolver, dev).await
+ }
+ 
+-/// Start an externally owned packet device with real upstream DNS answers. This
+-/// avoids losing a fake-IP domain in protocols whose packet API carries only IPs.
++/// Legacy explicit-direct DNS entrypoint, retained for nonmobile compatibility.
++/// This is NOT privacy-preserving: UDP53 uses protected direct DNS. New mobile
++/// callers must use `run_with_device_proxy_dns`; protect alone is not proxying.
++/// Avoids losing fake-IP domains in protocols whose packet API carries only IPs.
+ pub async fn run_with_device_no_fake_ip<D>(
+     cfg: TunConfig,
+     tag: Arc<str>,
+@@ -181,11 +184,34 @@ pub async fn run_with_device_no_fake_ip<D>(
+ where
+     D: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+ {
+-    let pool = Arc::new(
+-        FakeIpPool::new(&cfg.fake_ip_range)
+-            .ok_or_else(|| Error::Config("invalid fake IP pool".into()))?,
+-    );
+-    run_packet_device(cfg, tag, ctx, pool, resolver, dev, false).await
++    run_packet_device(
++        cfg,
++        tag,
++        ctx,
++        DnsMode::Legacy {
++            pool: None,
++            resolver,
++        },
++        dev,
++    )
++    .await
++}
++
++/// Explicit full-tunnel privacy path. Both UDP53 and TCP53 use only the
++/// selected proxy and configured user resolver; bootstrap DNS is not accepted
++/// here. No fake-IP mapping, direct DNS fallback, OS DNS, or route bypass.
++pub async fn run_with_device_proxy_dns<D>(
++    mut cfg: TunConfig,
++    tag: Arc<str>,
++    ctx: InboundCtx,
++    user_dns: Arc<user_dns::UserDns>,
++    dev: D,
++) -> Result<()>
++where
++    D: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
++{
++    cfg.dns_hijack = true;
++    run_packet_device(cfg, tag, ctx, DnsMode::SelectedProxy(user_dns), dev).await
+ }
+ 
+ pub async fn run_with_device<D>(
+@@ -199,17 +225,52 @@ pub async fn run_with_device<D>(
+ where
+     D: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+ {
+-    run_packet_device(cfg, tag, ctx, pool, resolver, dev, true).await
++    run_packet_device(
++        cfg,
++        tag,
++        ctx,
++        DnsMode::Legacy {
++            pool: Some(pool),
++            resolver,
++        },
++        dev,
++    )
++    .await
++}
++
++/// The proxy variant has no resolver or fake-IP pool. It cannot enter the
++/// legacy direct-DNS branch even if another caller disables dns_hijack.
++#[derive(Clone)]
++enum DnsMode {
++    Legacy {
++        pool: Option<Arc<FakeIpPool>>,
++        resolver: Arc<Resolver>,
++    },
++    SelectedProxy(Arc<user_dns::UserDns>),
++}
++impl DnsMode {
++    fn fake_domain(&self, ip: IpAddr) -> Option<String> {
++        match self {
++            Self::Legacy {
++                pool: Some(pool), ..
++            } => pool.reverse(ip),
++            _ => None,
++        }
++    }
++    fn user_dns(&self) -> Option<&Arc<user_dns::UserDns>> {
++        match self {
++            Self::SelectedProxy(dns) => Some(dns),
++            _ => None,
++        }
++    }
+ }
+ 
+ async fn run_packet_device<D>(
+     cfg: TunConfig,
+     tag: Arc<str>,
+     ctx: InboundCtx,
+-    pool: Arc<FakeIpPool>,
+-    resolver: Arc<Resolver>,
++    dns_mode: DnsMode,
+     dev: D,
+-    fake_ip: bool,
+ ) -> Result<()>
+ where
+     D: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+@@ -230,15 +291,42 @@ where
+         };
+         let ctx = ctx.clone();
+         let tag = tag.clone();
+-        let pool = pool.clone();
+-        let resolver = resolver.clone();
++        let dns_mode = dns_mode.clone();
+         let dns_hijack = cfg.dns_hijack;
++        let mtu = cfg.mtu as usize;
++        let dns_stream = match &stream {
++            IpStackStream::Tcp(tcp) => tcp.peer_addr().port() == 53,
++            IpStackStream::Udp(udp) => udp.peer_addr().port() == 53,
++            _ => false,
++        };
++        // Acquire before spawning: excess DNS flows are dropped, never queued
++        // as unbounded tasks, and cannot fall through to a direct handler.
++        let dns_permit = if dns_stream {
++            if let Some(dns) = dns_mode.user_dns() {
++                match dns.acquire_session() {
++                    Some(p) => Some(p),
++                    None => continue,
++                }
++            } else {
++                None
++            }
++        } else {
++            None
++        };
+         vp_core::task_scope::spawn(async move {
++            let _dns_permit = dns_permit;
+             match stream {
+                 IpStackStream::Tcp(tcp) => {
++                    if tcp.peer_addr().port() == 53 {
++                        if let Some(dns) = dns_mode.user_dns() {
++                            let source = tcp.local_addr();
++                            dns.serve(tcp, true, tag, source, mtu).await;
++                            return;
++                        }
++                    }
+                     let dst_ip = tcp.peer_addr().ip();
+                     let dst_port = tcp.peer_addr().port();
+-                    let fake_domain = pool.reverse(dst_ip);
++                    let fake_domain = dns_mode.fake_domain(dst_ip);
+                     let dst = match &fake_domain {
+                         Some(d) => vp_common::DstAddr::new(d.clone(), dst_port),
+                         None => vp_common::DstAddr::ip(dst_ip, dst_port),
+@@ -252,10 +340,17 @@ where
+                     let dst_ip = udp.peer_addr().ip();
+                     let dst_port = udp.peer_addr().port();
+                     if dns_hijack && dst_port == 53 {
+-                        handle_dns(udp, pool, resolver, fake_ip).await;
++                        if let Some(dns) = dns_mode.user_dns() {
++                            let source = udp.local_addr();
++                            dns.serve(udp, false, tag, source, mtu).await;
++                            return;
++                        }
++                        if let DnsMode::Legacy { pool, resolver } = dns_mode {
++                            handle_dns(udp, pool, resolver).await;
++                        }
+                         return;
+                     }
+-                    let fake_domain = pool.reverse(dst_ip);
++                    let fake_domain = dns_mode.fake_domain(dst_ip);
+                     let dst = match &fake_domain {
+                         Some(d) => vp_common::DstAddr::new(d.clone(), dst_port),
+                         None => vp_common::DstAddr::ip(dst_ip, dst_port),
+@@ -397,9 +492,8 @@ async fn dispatch_udp(
+ /// DNS 劫持：就地应答（fake-ip / PTR / 上游转发）
+ async fn handle_dns(
+     mut udp: ipstack::IpStackUdpStream,
+-    pool: Arc<FakeIpPool>,
++    pool: Option<Arc<FakeIpPool>>,
+     resolver: Arc<Resolver>,
+-    fake_ip: bool,
+ ) {
+     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+     let mut buf = vec![0u8; 65535];
+@@ -408,8 +502,8 @@ async fn handle_dns(
+             Ok(n) if n > 0 => n,
+             _ => break,
+         };
+-        let resp = if fake_ip {
+-            build_dns_reply(&buf[..n], &pool, &resolver).await
++        let resp = if let Some(pool) = &pool {
++            build_dns_reply(&buf[..n], pool, &resolver).await
+         } else {
+             forward_dns(&buf[..n], &resolver).await
+         };
+diff --git a/crates/vp-tun/src/user_dns.rs b/crates/vp-tun/src/user_dns.rs
+new file mode 100644
+index 0000000..2f3dbd3
+--- /dev/null
++++ b/crates/vp-tun/src/user_dns.rs
+@@ -0,0 +1,451 @@
++//! Mobile user DNS: selected proxy only, never a protected-direct socket.
++//!
++//! Each query owns a fresh proxy session and validates the exact upstream source,
++//! ID and question. Numeric DNS destinations avoid recursive endpoint lookup.
++//! UDP53 and framed TCP53 are intercepted consistently; no fake IPs are produced.
++use std::{
++    net::SocketAddr,
++    sync::{
++        Arc,
++        atomic::{AtomicUsize, Ordering},
++    },
++    time::Duration,
++};
++use tokio::{
++    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
++    sync::{OwnedSemaphorePermit, Semaphore},
++    time::timeout,
++};
++use vp_common::{DstAddr, Error, Result};
++use vp_core::{Outbound, Session, UdpPacket};
++
++pub const MAX_MESSAGE: usize = 4096;
++pub const MAX_SESSIONS: usize = 64;
++pub const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
++const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
++const MAX_QUERIES_PER_FLOW: usize = 256;
++
++pub struct UserDns {
++    outbound: Arc<dyn Outbound>,
++    servers: Vec<SocketAddr>,
++    next: AtomicUsize,
++    sessions: Arc<Semaphore>,
++    exchanges: Semaphore,
++}
++impl UserDns {
++    /// Caller supplies the exact selected proxy object, not a route selector that
++    /// might choose DIRECT. There is deliberately no direct policy constructor.
++    pub fn selected_proxy(outbound: Arc<dyn Outbound>, servers: Vec<SocketAddr>) -> Result<Self> {
++        if servers.is_empty()
++            || servers.len() > 4
++            || servers.iter().any(|s| {
++                s.port() == 0
++                    || s.ip().is_unspecified()
++                    || s.ip().is_multicast()
++                    || matches!(s, SocketAddr::V6(v6) if v6.scope_id() != 0 || v6.flowinfo() != 0)
++            })
++        {
++            return Err(Error::Config(
++                "user DNS requires 1..4 numeric endpoints".into(),
++            ));
++        }
++        if !outbound.support_udp() {
++            return Err(Error::Unsupported(
++                "selected proxy does not support user DNS UDP".into(),
++            ));
++        }
++        Ok(Self {
++            outbound,
++            servers,
++            next: AtomicUsize::new(0),
++            sessions: Arc::new(Semaphore::new(MAX_SESSIONS)),
++            exchanges: Semaphore::new(MAX_SESSIONS),
++        })
++    }
++    pub(crate) fn acquire_session(&self) -> Option<OwnedSemaphorePermit> {
++        self.sessions.clone().try_acquire_owned().ok()
++    }
++    /// One attempt, one configured upstream, no retry to direct/system/public
++    /// resolvers on auth errors, malformed answers, timeouts or cancellation.
++    pub async fn exchange(
++        &self,
++        query: &[u8],
++        tcp: bool,
++        inbound: Arc<str>,
++        source: SocketAddr,
++    ) -> Result<Vec<u8>> {
++        if !vp_dns::wire::valid_forward_query(query) {
++            return Err(Error::Proto("invalid or oversized DNS query"));
++        }
++        let _permit = self
++            .exchanges
++            .try_acquire()
++            .map_err(|_| Error::Other("DNS concurrency limit".into()))?;
++        let server = self.servers[self.next.fetch_add(1, Ordering::Relaxed) % self.servers.len()];
++        let dst = DstAddr::ip(server.ip(), server.port());
++        vp_core::task_scope::check_destination(&dst)?;
++        let operation = async {
++            let response = if tcp {
++                let sess = Session::new_tcp(inbound, Some(source), dst.clone());
++                let mut conn = self.outbound.connect_stream(&sess, &dst).await?;
++                conn.write_u16(query.len() as u16).await?;
++                conn.write_all(query).await?;
++                conn.flush().await?;
++                let len = conn.read_u16().await? as usize;
++                if !(12..=MAX_MESSAGE).contains(&len) {
++                    return Err(Error::Proto("DNS TCP response exceeds bounds"));
++                }
++                let mut response = vec![0; len];
++                conn.read_exact(&mut response).await?;
++                response
++            } else {
++                let sess = Session::new_udp(inbound, Some(source), dst.clone());
++                let mut conn = self.outbound.connect_packet(&sess, &dst).await?;
++                conn.send(&UdpPacket {
++                    src: source,
++                    dst: server,
++                    data: query.to_vec().into(),
++                })
++                .await?;
++                let response = conn.recv().await?;
++                if response.src != server {
++                    return Err(Error::Proto("DNS response source mismatch"));
++                }
++                if response.data.len() > MAX_MESSAGE {
++                    return Err(Error::Proto("DNS UDP response exceeds bounds"));
++                }
++                response.data.to_vec()
++            };
++            if !vp_dns::wire::response_matches_query(query, &response) {
++                return Err(Error::Proto("DNS response ID/question/framing mismatch"));
++            }
++            Ok(response)
++        };
++        timeout(QUERY_TIMEOUT, operation).await.map_err(|_| {
++            Error::Io(std::io::Error::new(
++                std::io::ErrorKind::TimedOut,
++                "proxy DNS timeout",
++            ))
++        })?
++    }
++    pub(crate) async fn serve<S>(
++        &self,
++        mut stream: S,
++        tcp: bool,
++        inbound: Arc<str>,
++        source: SocketAddr,
++        mtu: usize,
++    ) where
++        S: AsyncRead + AsyncWrite + Unpin,
++    {
++        let mut buf = vec![0; MAX_MESSAGE + 1];
++        for _ in 0..MAX_QUERIES_PER_FLOW {
++            let read = async {
++                if tcp {
++                    let len = stream.read_u16().await? as usize;
++                    if !(12..=MAX_MESSAGE).contains(&len) {
++                        return Err(std::io::Error::other("DNS frame exceeds bounds"));
++                    }
++                    stream.read_exact(&mut buf[..len]).await?;
++                    Ok(len)
++                } else {
++                    stream.read(&mut buf).await
++                }
++            };
++            let len = match timeout(IDLE_TIMEOUT, read).await {
++                Ok(Ok(n)) if n > 0 && n <= MAX_MESSAGE => n,
++                _ => break,
++            };
++            let query = &buf[..len];
++            let mut response = match self.exchange(query, tcp, inbound.clone(), source).await {
++                Ok(response) => response,
++                Err(_) => match vp_dns::wire::build_servfail(query) {
++                    Some(response) => response,
++                    None => continue,
++                },
++            };
++            if !tcp {
++                // ipstack truncates writes to MTU and write_all would emit the
++                // tail as another UDP datagram. Return one valid DNS TC reply
++                // instead; never split a DNS response into corrupt datagrams.
++                let budget = mtu
++                    .saturating_sub(if source.is_ipv6() { 48 } else { 28 })
++                    .min(vp_dns::wire::udp_response_limit(query).unwrap_or(512));
++                if response.len() > budget {
++                    let Some(truncated) = vp_dns::wire::build_truncated_response(query) else {
++                        break;
++                    };
++                    if truncated.len() > budget {
++                        break;
++                    }
++                    response = truncated;
++                }
++            }
++            let write = async {
++                if tcp {
++                    stream.write_u16(response.len() as u16).await?;
++                    stream.write_all(&response).await?;
++                } else if stream.write(&response).await? != response.len() {
++                    return Err(std::io::Error::other("partial DNS datagram write"));
++                }
++                stream.flush().await
++            };
++            if !matches!(timeout(QUERY_TIMEOUT, write).await, Ok(Ok(()))) {
++                break;
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::sync::atomic::AtomicUsize;
++    use vp_core::{PacketConn, ProxyStream};
++    struct Reject {
++        calls: AtomicUsize,
++        udp: bool,
++    }
++    #[async_trait::async_trait]
++    impl Outbound for Reject {
++        fn name(&self) -> &str {
++            "test-reject"
++        }
++        fn support_udp(&self) -> bool {
++            self.udp
++        }
++        async fn connect_stream(&self, _: &Session, _: &DstAddr) -> Result<Box<dyn ProxyStream>> {
++            self.calls.fetch_add(1, Ordering::SeqCst);
++            Err(Error::Proto("test auth verification failure"))
++        }
++        async fn connect_packet(&self, _: &Session, _: &DstAddr) -> Result<Box<dyn PacketConn>> {
++            self.calls.fetch_add(1, Ordering::SeqCst);
++            Err(Error::Proto("test auth verification failure"))
++        }
++    }
++    fn source() -> SocketAddr {
++        "[::1]:45000".parse().unwrap()
++    }
++    fn query() -> Vec<u8> {
++        vp_dns::wire::build_query(17, "user.fixture.invalid", vp_dns::QType::Aaaa)
++    }
++    #[tokio::test]
++    async fn unsupported_invalid_and_auth_failures_never_fallback() {
++        let outbound = Arc::new(Reject {
++            calls: AtomicUsize::new(0),
++            udp: false,
++        });
++        assert!(UserDns::selected_proxy(outbound.clone(), vec![source()]).is_err());
++        assert_eq!(outbound.calls.load(Ordering::SeqCst), 0);
++        let outbound = Arc::new(Reject {
++            calls: AtomicUsize::new(0),
++            udp: true,
++        });
++        for servers in [
++            vec![],
++            vec!["0.0.0.0:53".parse().unwrap()],
++            vec![source(); 5],
++        ] {
++            assert!(UserDns::selected_proxy(outbound.clone(), servers).is_err());
++        }
++        let dns = UserDns::selected_proxy(outbound.clone(), vec![source()]).unwrap();
++        assert!(
++            dns.exchange(&[0; 8], false, "test".into(), source())
++                .await
++                .is_err()
++        );
++        assert_eq!(outbound.calls.load(Ordering::SeqCst), 0);
++        for tcp in [false, true] {
++            assert!(
++                dns.exchange(&query(), tcp, "test".into(), source())
++                    .await
++                    .is_err()
++            );
++        }
++        assert_eq!(outbound.calls.load(Ordering::SeqCst), 2);
++        let mut permits = Vec::new();
++        for _ in 0..MAX_SESSIONS {
++            permits.push(dns.acquire_session().unwrap());
++        }
++        assert!(dns.acquire_session().is_none());
++        permits.clear();
++        assert!(dns.acquire_session().is_some());
++    }
++    struct Pending {
++        live: Arc<AtomicUsize>,
++    }
++    struct Held(Arc<AtomicUsize>);
++    impl Drop for Held {
++        fn drop(&mut self) {
++            self.0.fetch_sub(1, Ordering::SeqCst);
++        }
++    }
++    #[async_trait::async_trait]
++    impl Outbound for Pending {
++        fn name(&self) -> &str {
++            "test-pending"
++        }
++        fn support_udp(&self) -> bool {
++            true
++        }
++        async fn connect_stream(&self, _: &Session, _: &DstAddr) -> Result<Box<dyn ProxyStream>> {
++            unreachable!()
++        }
++        async fn connect_packet(&self, _: &Session, _: &DstAddr) -> Result<Box<dyn PacketConn>> {
++            self.live.fetch_add(1, Ordering::SeqCst);
++            let _held = Held(self.live.clone());
++            std::future::pending().await
++        }
++    }
++    #[tokio::test(start_paused = true)]
++    async fn cancellation_timeout_and_global_exchange_limit_release_resources() {
++        let live = Arc::new(AtomicUsize::new(0));
++        let dns = Arc::new(
++            UserDns::selected_proxy(Arc::new(Pending { live: live.clone() }), vec![source()])
++                .unwrap(),
++        );
++        let mut tasks = Vec::new();
++        for _ in 0..MAX_SESSIONS {
++            let dns = dns.clone();
++            tasks.push(tokio::spawn(async move {
++                dns.exchange(&query(), false, "test".into(), source()).await
++            }));
++        }
++        for _ in 0..1000 {
++            if live.load(Ordering::SeqCst) == MAX_SESSIONS {
++                break;
++            }
++            tokio::task::yield_now().await;
++        }
++        assert_eq!(live.load(Ordering::SeqCst), MAX_SESSIONS);
++        assert!(
++            dns.exchange(&query(), false, "test".into(), source())
++                .await
++                .is_err()
++        );
++        let canceled = tasks.pop().unwrap();
++        canceled.abort();
++        assert!(canceled.await.unwrap_err().is_cancelled());
++        assert_eq!(live.load(Ordering::SeqCst), MAX_SESSIONS - 1);
++        tokio::time::advance(QUERY_TIMEOUT).await;
++        for task in tasks {
++            assert!(task.await.unwrap().is_err());
++        }
++        assert_eq!(live.load(Ordering::SeqCst), 0);
++        assert_eq!(dns.exchanges.available_permits(), MAX_SESSIONS);
++    }
++    #[tokio::test]
++    async fn tcp_client_framing_reports_servfail_and_preserves_id() {
++        let dns = Arc::new(
++            UserDns::selected_proxy(
++                Arc::new(Reject {
++                    calls: AtomicUsize::new(0),
++                    udp: true,
++                }),
++                vec![source()],
++            )
++            .unwrap(),
++        );
++        let (mut client, server) = tokio::io::duplex(8192);
++        let task = tokio::spawn(async move {
++            dns.serve(server, true, "test".into(), source(), 1500).await;
++        });
++        let q = query();
++        client.write_u16(q.len() as u16).await.unwrap();
++        client.write_all(&q).await.unwrap();
++        let len = client.read_u16().await.unwrap() as usize;
++        let mut response = vec![0; len];
++        client.read_exact(&mut response).await.unwrap();
++        assert!(vp_dns::wire::response_matches_query(&q, &response));
++        assert_eq!(response[3] & 15, 2);
++        drop(client);
++        task.await.unwrap();
++    }
++}
++
++#[cfg(test)]
++mod source_tests {
++    use super::*;
++    use vp_core::{PacketConn, ProxyStream};
++    struct Reply {
++        server: SocketAddr,
++        wrong_source: bool,
++        oversized: bool,
++    }
++    struct Packet {
++        server: SocketAddr,
++        wrong_source: bool,
++        oversized: bool,
++        query: std::sync::Mutex<Vec<u8>>,
++    }
++    #[async_trait::async_trait]
++    impl Outbound for Reply {
++        fn name(&self) -> &str {
++            "test-reply"
++        }
++        fn support_udp(&self) -> bool {
++            true
++        }
++        async fn connect_stream(&self, _: &Session, _: &DstAddr) -> Result<Box<dyn ProxyStream>> {
++            unreachable!()
++        }
++        async fn connect_packet(
++            &self,
++            session: &Session,
++            dst: &DstAddr,
++        ) -> Result<Box<dyn PacketConn>> {
++            assert_eq!(session.src.unwrap().port(), 45000);
++            assert_eq!(dst.port, self.server.port());
++            Ok(Box::new(Packet {
++                server: self.server,
++                wrong_source: self.wrong_source,
++                oversized: self.oversized,
++                query: std::sync::Mutex::new(vec![]),
++            }))
++        }
++    }
++    #[async_trait::async_trait]
++    impl PacketConn for Packet {
++        async fn send(&self, p: &UdpPacket) -> Result<()> {
++            assert_eq!(p.dst, self.server);
++            assert_eq!(p.src.port(), 45000);
++            *self.query.lock().unwrap() = p.data.to_vec();
++            Ok(())
++        }
++        async fn recv(&mut self) -> Result<UdpPacket> {
++            let q = self.query.lock().unwrap();
++            let mut response = vp_dns::wire::build_a_response(&q, [127, 0, 0, 1].into());
++            if self.oversized {
++                response.resize(MAX_MESSAGE + 1, 0);
++            }
++            let mut source = self.server;
++            if self.wrong_source {
++                source.set_port(source.port() + 1);
++            }
++            Ok(UdpPacket {
++                src: source,
++                dst: "127.0.0.1:45000".parse().unwrap(),
++                data: response.into(),
++            })
++        }
++    }
++    #[tokio::test]
++    async fn udp_source_and_response_limits_fail_closed_without_id_rewrite() {
++        let server = "[::1]:5353".parse().unwrap();
++        let source = "[::1]:45000".parse().unwrap();
++        let q = vp_dns::wire::build_query(0x9812, "app.fixture.invalid", vp_dns::QType::A);
++        for (wrong_source, oversized) in [(false, false), (true, false), (false, true)] {
++            let dns = UserDns::selected_proxy(
++                Arc::new(Reply {
++                    server,
++                    wrong_source,
++                    oversized,
++                }),
++                vec![server],
++            )
++            .unwrap();
++            let result = dns.exchange(&q, false, "test".into(), source).await;
++            assert_eq!(result.is_ok(), !wrong_source && !oversized);
++        }
++    }
++}
+diff --git a/crates/vp-tun/tests/proxy_dns.rs b/crates/vp-tun/tests/proxy_dns.rs
+new file mode 100644
+index 0000000..7c36c7a
+--- /dev/null
++++ b/crates/vp-tun/tests/proxy_dns.rs
+@@ -0,0 +1,409 @@
++//! Actual vp_core -> authenticated official sing-vmess peer -> loopback DNS.
++//! No public DNS, routing changes, guest VPN, or syscall tracing is involved.
++use sha2::{Digest, Sha256};
++use std::{
++    io::{BufRead, Write},
++    net::SocketAddr,
++    process::{Child, Command, Stdio},
++    sync::{
++        Arc, Mutex,
++        atomic::{AtomicUsize, Ordering},
++    },
++    time::Duration,
++};
++use tokio::{
++    io::{AsyncReadExt, AsyncWriteExt},
++    net::{TcpListener, UdpSocket},
++    time::timeout,
++};
++use vp_core::{
++    InboundCtx, Outbound, Session,
++    host_network::{HostNetwork, Protocol, Purpose},
++    task_scope::{DestinationPolicy, TaskScope},
++};
++use vp_tun::user_dns::UserDns;
++const ID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
++struct Peer(Child);
++impl Drop for Peer {
++    fn drop(&mut self) {
++        let _ = self.0.kill();
++        let _ = self.0.wait();
++    }
++}
++fn peer() -> (Peer, u16) {
++    let binary = std::env::var_os("VP_STREAM_REFERENCE")
++        .expect("requires authorized pinned official stream library peer");
++    let mut child = Command::new(binary)
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::piped())
++        .spawn()
++        .unwrap();
++    writeln!(
++        child.stdin.as_mut().unwrap(),
++        "{}",
++        serde_json::json!({"mode":"server","protocol":"vmess","credential":ID})
++    )
++    .unwrap();
++    let mut line = String::new();
++    std::io::BufReader::new(child.stdout.take().unwrap())
++        .read_line(&mut line)
++        .unwrap();
++    let ready: serde_json::Value = serde_json::from_str(&line).expect("official peer readiness");
++    assert_eq!(ready["kind"], "official-protocol-library");
++    (Peer(child), ready["port"].as_u64().unwrap() as u16)
++}
++fn outbound(port: u16, id: &str) -> Arc<dyn Outbound> {
++    let cfg=serde_json::from_value(serde_json::json!({"server":"proxy.fixture.invalid","port":port,"uuid":id,"cipher":"aes-128-gcm","tls":false,"udp":true})).unwrap();
++    Arc::new(vp_protocol::vmess::VmessOutbound::new(&cfg).unwrap())
++}
++struct Host {
++    bootstrap: SocketAddr,
++    proxy: SocketAddr,
++    calls: Mutex<Vec<(Purpose, SocketAddr)>>,
++    denied: AtomicUsize,
++}
++impl HostNetwork for Host {
++    fn before_connect(
++        &self,
++        _: u64,
++        protocol: Protocol,
++        destination: SocketAddr,
++        purpose: Purpose,
++    ) -> std::io::Result<()> {
++        self.calls.lock().unwrap().push((purpose, destination));
++        if (purpose == Purpose::Bootstrap
++            && protocol == Protocol::Udp
++            && destination == self.bootstrap)
++            || (purpose == Purpose::Proxy && protocol == Protocol::Tcp && destination == self.proxy)
++        {
++            Ok(())
++        } else {
++            self.denied.fetch_add(1, Ordering::SeqCst);
++            Err(std::io::Error::new(
++                std::io::ErrorKind::PermissionDenied,
++                "test forbids direct user DNS",
++            ))
++        }
++    }
++    fn dns_servers(&self) -> Vec<SocketAddr> {
++        vec![self.bootstrap]
++    }
++    fn bootstrap_host(&self) -> Option<String> {
++        Some("proxy.fixture.invalid".into())
++    }
++}
++fn answer(query: &[u8]) -> Vec<u8> {
++    let (_, name, kind) = vp_dns::wire::parse_query(query).unwrap();
++    let mut out = query.to_vec();
++    out[2] = 0x81;
++    out[3] = 0x80;
++    out[6..8].copy_from_slice(&1u16.to_be_bytes());
++    out.extend_from_slice(&[0xc0, 0x0c]);
++    out.extend_from_slice(&kind.to_be_bytes());
++    out.extend_from_slice(&[0, 1, 0, 0, 0, 30]);
++    if kind == 28 {
++        out.extend_from_slice(&16u16.to_be_bytes());
++        out.extend_from_slice(&"::1".parse::<std::net::Ipv6Addr>().unwrap().octets());
++    } else {
++        out.extend_from_slice(&4u16.to_be_bytes());
++        out.extend_from_slice(&[127, 0, 0, 1]);
++    }
++    if name.starts_with("large.") {
++        let rr = out[query.len()..].to_vec();
++        for _ in 1..100 {
++            out.extend_from_slice(&rr);
++        }
++        out[6..8].copy_from_slice(&100u16.to_be_bytes());
++    }
++    if name.starts_with("bad-id.") {
++        out[0] ^= 1;
++    }
++    if name.starts_with("bad-question.") {
++        out[13] ^= 1;
++    }
++    out
++}
++struct DnsTarget {
++    addr: SocketAddr,
++    count: Arc<AtomicUsize>,
++    hashes: Arc<Mutex<Vec<String>>>,
++    tasks: Vec<tokio::task::JoinHandle<()>>,
++}
++impl Drop for DnsTarget {
++    fn drop(&mut self) {
++        for t in &self.tasks {
++            t.abort();
++        }
++    }
++}
++async fn target(ipv6: bool) -> DnsTarget {
++    let tcp = TcpListener::bind(if ipv6 { "[::1]:0" } else { "127.0.0.1:0" })
++        .await
++        .unwrap();
++    let addr = tcp.local_addr().unwrap();
++    let udp = UdpSocket::bind(addr).await.unwrap();
++    let count = Arc::new(AtomicUsize::new(0));
++    let hashes = Arc::new(Mutex::new(Vec::new()));
++    let c = count.clone();
++    let h = hashes.clone();
++    let u = tokio::spawn(async move {
++        loop {
++            let mut buf = [0; 4097];
++            let (n, src) = udp.recv_from(&mut buf).await.unwrap();
++            assert!(src.ip().is_loopback());
++            c.fetch_add(1, Ordering::SeqCst);
++            h.lock()
++                .unwrap()
++                .push(format!("{:x}", Sha256::digest(&buf[..n])));
++            if vp_dns::wire::parse_query(&buf[..n])
++                .unwrap()
++                .1
++                .starts_with("silent.")
++            {
++                continue;
++            }
++            udp.send_to(&answer(&buf[..n]), src).await.unwrap();
++        }
++    });
++    let c = count.clone();
++    let h = hashes.clone();
++    let t = tokio::spawn(async move {
++        loop {
++            let (mut conn, src) = tcp.accept().await.unwrap();
++            assert!(src.ip().is_loopback());
++            let n = conn.read_u16().await.unwrap() as usize;
++            assert!(n <= 4096);
++            let mut q = vec![0; n];
++            conn.read_exact(&mut q).await.unwrap();
++            c.fetch_add(1, Ordering::SeqCst);
++            h.lock().unwrap().push(format!("{:x}", Sha256::digest(&q)));
++            let a = answer(&q);
++            conn.write_u16(a.len() as u16).await.unwrap();
++            conn.write_all(&a).await.unwrap();
++        }
++    });
++    DnsTarget {
++        addr,
++        count,
++        hashes,
++        tasks: vec![u, t],
++    }
++}
++struct NoRouting;
++#[async_trait::async_trait]
++impl vp_core::Router for NoRouting {
++    async fn pick(&self, _: &Session) -> vp_core::Resolution {
++        panic!("DNS must never fall through to router or DIRECT");
++    }
++}
++fn ctx() -> InboundCtx {
++    InboundCtx {
++        router: Arc::new(NoRouting),
++        stats: Arc::default(),
++        conns: Arc::new(vp_core::ConnTable::new()),
++    }
++}
++
++#[tokio::test]
++#[ignore = "requires authorized pinned official sing-vmess peer"]
++async fn authenticated_proxy_dns_a_aaaa_udp_tcp_ipv6_tun_negative_and_cancel() {
++    let (_peer, port) = peer();
++    let boot = target(true).await;
++    let host = Arc::new(Host {
++        bootstrap: boot.addr,
++        proxy: ([127, 0, 0, 1], port).into(),
++        calls: Mutex::new(vec![]),
++        denied: AtomicUsize::new(0),
++    });
++    let scope = TaskScope::with_host_network(DestinationPolicy::Unrestricted, Some(host.clone()));
++    let user4 = target(false).await;
++    let user6 = target(true).await;
++    let proxy = outbound(port, ID);
++    let source = "[::1]:45678".parse().unwrap();
++    scope
++        .run(async {
++            for target in [&user4, &user6] {
++                let dns = UserDns::selected_proxy(proxy.clone(), vec![target.addr]).unwrap();
++                for tcp in [false, true] {
++                    for kind in [vp_dns::QType::A, vp_dns::QType::Aaaa] {
++                        let query = vp_dns::wire::build_query(0x43, "app.fixture.invalid", kind);
++                        let response = dns
++                            .exchange(&query, tcp, "test".into(), source)
++                            .await
++                            .unwrap();
++                        assert!(vp_dns::wire::response_matches_query(&query, &response));
++                        assert_eq!(
++                            vp_dns::wire::extract_ips(
++                                &vp_dns::wire::parse_response(&response).unwrap(),
++                                kind.code()
++                            )
++                            .len(),
++                            1
++                        );
++                        assert!(
++                            target
++                                .hashes
++                                .lock()
++                                .unwrap()
++                                .contains(&format!("{:x}", Sha256::digest(&query)))
++                        );
++                    }
++                }
++                assert_eq!(target.count.load(Ordering::SeqCst), 4);
++                for name in ["bad-id.fixture.invalid", "bad-question.fixture.invalid"] {
++                    let query = vp_dns::wire::build_query(7, name, vp_dns::QType::A);
++                    assert!(
++                        dns.exchange(&query, false, "test".into(), source)
++                            .await
++                            .is_err()
++                    );
++                }
++                // Bad credentials cannot cause target traffic or protected/direct fallback.
++                let before = target.count.load(Ordering::SeqCst);
++                let bad = UserDns::selected_proxy(
++                    outbound(port, "00000000-0000-0000-0000-000000000001"),
++                    vec![target.addr],
++                )
++                .unwrap();
++                assert!(
++                    bad.exchange(
++                        &vp_dns::wire::build_query(9, "auth.fixture.invalid", vp_dns::QType::A),
++                        false,
++                        "test".into(),
++                        source
++                    )
++                    .await
++                    .is_err()
++                );
++                assert_eq!(target.count.load(Ordering::SeqCst), before);
++            }
++            // Actual packet-device UDP interception preserves original source/destination
++            // and question for IPv4 and IPv6, even though configured upstream differs.
++            let dns = Arc::new(UserDns::selected_proxy(proxy.clone(), vec![user4.addr]).unwrap());
++            let (mut app, device) = tokio::io::duplex(32768);
++            let tun = vp_core::task_scope::spawn(vp_tun::run_with_device_proxy_dns(
++                vp_tun::TunConfig::default(),
++                "test-tun".into(),
++                ctx(),
++                dns,
++                device,
++            ));
++            for (v6, large) in [(false, false), (true, false), (false, true), (true, true)] {
++                let q = vp_dns::wire::build_query(
++                    0x77,
++                    if large {
++                        "large.fixture.invalid"
++                    } else {
++                        "tun.fixture.invalid"
++                    },
++                    if v6 {
++                        vp_dns::QType::Aaaa
++                    } else {
++                        vp_dns::QType::A
++                    },
++                );
++                let mut packet = Vec::new();
++                if v6 {
++                    etherparse::PacketBuilder::ipv6(
++                        "fd00::2".parse::<std::net::Ipv6Addr>().unwrap().octets(),
++                        "fd00::53".parse::<std::net::Ipv6Addr>().unwrap().octets(),
++                        64,
++                    )
++                    .udp(45678, 53)
++                    .write(&mut packet, &q)
++                    .unwrap();
++                } else {
++                    etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [10, 0, 0, 53], 64)
++                        .udp(45678, 53)
++                        .write(&mut packet, &q)
++                        .unwrap();
++                }
++                app.write_all(&packet).await.unwrap();
++                let mut out = [0; 8192];
++                let header = if v6 { 40 } else { 20 };
++                timeout(Duration::from_secs(6), app.read_exact(&mut out[..header]))
++                    .await
++                    .unwrap()
++                    .unwrap();
++                let n = if v6 {
++                    40 + u16::from_be_bytes([out[4], out[5]]) as usize
++                } else {
++                    u16::from_be_bytes([out[2], out[3]]) as usize
++                };
++                assert!((header + 8..=8192).contains(&n));
++                timeout(Duration::from_secs(6), app.read_exact(&mut out[header..n]))
++                    .await
++                    .unwrap()
++                    .unwrap();
++                assert_eq!(&out[header..header + 4], &[0, 53, 0xb2, 0x6e]);
++                assert!(vp_dns::wire::response_matches_query(
++                    &q,
++                    &out[header + 8..n]
++                ));
++                assert_eq!(out[header + 8 + 2] & 2 != 0, large);
++                if large {
++                    assert!(n - header - 8 <= 512);
++                    let dns = UserDns::selected_proxy(proxy.clone(), vec![user4.addr]).unwrap();
++                    let full = dns
++                        .exchange(&q, true, "tcp-retry".into(), source)
++                        .await
++                        .unwrap();
++                    assert!(full.len() > 512);
++                    assert_eq!(full[2] & 2, 0);
++                }
++                if v6 {
++                    assert_eq!(&out[8..24], &packet[24..40]);
++                    assert_eq!(&out[24..40], &packet[8..24]);
++                } else {
++                    assert_eq!(&out[12..16], &packet[16..20]);
++                    assert_eq!(&out[16..20], &packet[12..16]);
++                }
++            }
++            tun.abort();
++            let _ = tun.await;
++            // Cancel an actually forwarded unanswered query and drain generation tasks.
++            let dns = Arc::new(UserDns::selected_proxy(proxy.clone(), vec![user4.addr]).unwrap());
++            let before = user4.count.load(Ordering::SeqCst);
++            let pending = vp_core::task_scope::spawn(async move {
++                dns.exchange(
++                    &vp_dns::wire::build_query(11, "silent.fixture.invalid", vp_dns::QType::A),
++                    false,
++                    "test".into(),
++                    source,
++                )
++                .await
++            });
++            timeout(Duration::from_secs(3), async {
++                while user4.count.load(Ordering::SeqCst) == before {
++                    tokio::time::sleep(Duration::from_millis(5)).await;
++                }
++            })
++            .await
++            .unwrap();
++            pending.abort();
++            assert!(pending.await.unwrap_err().is_cancelled());
++        })
++        .await;
++    let report = scope.shutdown(Duration::ZERO, Duration::from_secs(2)).await;
++    assert_eq!(report.remaining_tasks, 0);
++    assert_eq!(report.panics, 0);
++    assert_eq!(host.denied.load(Ordering::SeqCst), 0);
++    assert!(boot.count.load(Ordering::SeqCst) > 0);
++    assert!(
++        host.calls
++            .lock()
++            .unwrap()
++            .iter()
++            .all(|(p, d)| (*p == Purpose::Bootstrap && *d == boot.addr)
++                || (*p == Purpose::Proxy && *d == host.proxy))
++    );
++    eprintln!(
++        "PASS official authenticated VMess: bootstrap={} user4={} user6={} hook_denials=0 remaining_tasks=0 user4_hashes={:?} user6_hashes={:?}",
++        boot.count.load(Ordering::SeqCst),
++        user4.count.load(Ordering::SeqCst),
++        user6.count.load(Ordering::SeqCst),
++        user4.hashes.lock().unwrap(),
++        user6.hashes.lock().unwrap()
++    );
++}

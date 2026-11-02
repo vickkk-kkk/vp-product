@@ -1,0 +1,84 @@
+From 6c3840a6e4b16b0d0cd11f4c0f95fbef298d8245 Mon Sep 17 00:00:00 2001
+From: VP product engineering <vp-engineering@example.invalid>
+Date: Fri, 30 Oct 2026 13:53:40 +0900
+Subject: [PATCH] Protect TUIC UDP reply domain resolution in mobile task scope
+
+---
+ crates/vp-protocol/src/tuic.rs | 56 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 55 insertions(+), 1 deletion(-)
+
+diff --git a/crates/vp-protocol/src/tuic.rs b/crates/vp-protocol/src/tuic.rs
+index 836b336..df51770 100644
+--- a/crates/vp-protocol/src/tuic.rs
++++ b/crates/vp-protocol/src/tuic.rs
+@@ -493,7 +493,7 @@ async fn resolve_udp(dst: &DstAddr) -> Result<SocketAddr> {
+         Host::Ip(ip) => Ok(SocketAddr::new(*ip, dst.port)),
+         Host::Domain(host) => tokio::time::timeout(
+             HEADER_TIMEOUT,
+-            tokio::net::lookup_host((host.as_str(), dst.port)),
++            vp_dns::lookup_host(host.as_str(), dst.port),
+         )
+         .await
+         .map_err(|_| Error::Proto("tuic: DNS timeout"))??
+@@ -1221,4 +1221,58 @@ mod tests {
+         assert_eq!(p.dst.unwrap().to_string(), "9.9.9.9:53");
+         assert_eq!(&p.payload[..], b"hello");
+     }
++
++    #[tokio::test]
++    async fn udp_reply_domain_uses_protected_dns_and_denial_sends_nothing() {
++        use std::sync::atomic::{AtomicUsize, Ordering};
++        use vp_core::host_network::{HostNetwork, Protocol, Purpose};
++        use vp_core::task_scope::{DestinationPolicy, TaskScope};
++        struct DenyDns {
++            server: SocketAddr,
++            calls: AtomicUsize,
++        }
++        impl HostNetwork for DenyDns {
++            fn before_connect(
++                &self,
++                _socket: u64,
++                protocol: Protocol,
++                destination: SocketAddr,
++                purpose: Purpose,
++            ) -> std::io::Result<()> {
++                assert_eq!(protocol, Protocol::Udp);
++                assert_eq!(purpose, Purpose::Dns);
++                assert_eq!(destination, self.server);
++                self.calls.fetch_add(1, Ordering::SeqCst);
++                Err(std::io::Error::new(
++                    std::io::ErrorKind::PermissionDenied,
++                    "test denial",
++                ))
++            }
++            fn dns_servers(&self) -> Vec<SocketAddr> {
++                vec![self.server]
++            }
++        }
++        let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
++        let host = Arc::new(DenyDns {
++            server: listener.local_addr().unwrap(),
++            calls: AtomicUsize::new(0),
++        });
++        let scope =
++            TaskScope::with_host_network(DestinationPolicy::Unrestricted, Some(host.clone()));
++        // This helper is also used by client PacketConn::recv, where the peer
++        // chooses the packet address. Never let that bypass host DNS authority.
++        let destination = DstAddr {
++            host: Host::Domain("localhost".into()),
++            port: 53,
++        };
++        let result = scope.run(resolve_udp(&destination)).await;
++        assert!(result.is_err());
++        assert!(host.calls.load(Ordering::SeqCst) > 0);
++        let mut packet = [0u8; 512];
++        assert!(
++            matches!(listener.try_recv_from(&mut packet), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
++        );
++        let report = scope.shutdown(Duration::ZERO, Duration::from_secs(1)).await;
++        assert_eq!(report.remaining_tasks, 0);
++    }
+ }
+-- 
+2.52.0
+

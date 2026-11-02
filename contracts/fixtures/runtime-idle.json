@@ -1,0 +1,70 @@
+{
+  "schemaVersion": 1,
+  "instanceId": "fixture-process",
+  "generation": 0,
+  "sequence": 0,
+  "observedAt": 0,
+  "validUntil": 0,
+  "desired": {
+    "kind": "disconnected"
+  },
+  "phase": "idle",
+  "configRevision": null,
+  "desiredRevision": null,
+  "nodeId": null,
+  "operationId": null,
+  "health": {
+    "core": {
+      "status": "not_run",
+      "observedAt": null,
+      "evidenceId": null,
+      "detailKey": "health.not_measured"
+    },
+    "takeover": {
+      "status": "not_run",
+      "observedAt": null,
+      "evidenceId": null,
+      "detailKey": "health.not_measured"
+    },
+    "tunnel": {
+      "status": "not_run",
+      "observedAt": null,
+      "evidenceId": null,
+      "detailKey": "health.not_measured"
+    },
+    "dns": {
+      "status": "not_run",
+      "observedAt": null,
+      "evidenceId": null,
+      "detailKey": "health.not_measured"
+    },
+    "ipv4": {
+      "status": "not_run",
+      "observedAt": null,
+      "evidenceId": null,
+      "detailKey": "health.not_measured"
+    },
+    "ipv6": {
+      "status": "not_run",
+      "observedAt": null,
+      "evidenceId": null,
+      "detailKey": "health.not_measured"
+    },
+    "forwarding": {
+      "status": "not_run",
+      "observedAt": null,
+      "evidenceId": null,
+      "detailKey": "health.not_measured"
+    },
+    "requiredProbes": [
+      "core",
+      "takeover",
+      "tunnel",
+      "dns",
+      "ipv4",
+      "ipv6",
+      "forwarding"
+    ]
+  },
+  "error": null
+}

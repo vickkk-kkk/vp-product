@@ -1,0 +1,27 @@
+[package]
+name = "vp-product-codec-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Bounded pure native codec ABI with explicit ephemeral secret transfers"
+
+[lib]
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[dependencies]
+vp-product-domain.workspace = true
+vp-product-import.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true
+getrandom = "=0.3.4"
+
+# Only src/ffi.rs admits reviewed C-boundary unsafe operations. No workspace
+# relaxation; the pure implementation retains deny(unsafe_code).
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"

@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "minimumReaderVersion": 1,
+  "nodes": [],
+  "subscriptions": [],
+  "listeners": [
+    {
+      "schemaVersion": 1,
+      "id": "vless-local",
+      "name": "Explicit local development listener",
+      "enabled": true,
+      "bind": {
+        "address": "127.0.0.1",
+        "port": 18081
+      },
+      "protocol": {
+        "kind": "proxy",
+        "protocol": {
+          "kind": "vless",
+          "flow": null
+        },
+        "users": [
+          {
+            "id": "synthetic-user",
+            "credentialRef": "secret:synthetic-old-v1",
+            "enabled": true
+          }
+        ]
+      },
+      "transport": {
+        "kind": "tcp"
+      },
+      "security": {
+        "kind": "none"
+      },
+      "requirements": []
+    }
+  ]
+}

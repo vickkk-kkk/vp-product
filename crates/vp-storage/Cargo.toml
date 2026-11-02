@@ -1,0 +1,32 @@
+[package]
+name = "vp-product-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+private-tls = ["vp-product-control/private-tls"]
+
+[dependencies]
+vp-product-control = { path = "../vp-control" }
+serde.workspace = true
+serde_json.workspace = true
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
+fs2 = "=0.4.3"
+rustix = { version = "=1.1.6", features = ["fs", "process", "rand"] }
+sha2 = "=0.10.8"
+tempfile = "=3.19.1"
+
+[dev-dependencies]
+vp-product-domain.workspace = true
+tempfile = "=3.19.1"
+
+[lints]
+workspace = true
+
+[[test]]
+name = "tls_profile"
+path = "tests/tls_profile.rs"
+harness = false

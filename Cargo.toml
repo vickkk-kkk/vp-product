@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vp-domain",
+    "crates/vp-core-adapter",
+    "crates/vp-control",
+    "crates/vp-storage",
+    "crates/vp-import",
+    "crates/vp-api",
+    "crates/vp-managementd",
+    "crates/vp-compiler",
+    "crates/vp-runtime-executor",
+    "crates/vp-codec-ffi",
+    "crates/vp-secrets",
+]
+exclude = ["integration/vp_core"]
+
+[workspace.package]
+version = "0.1.0-dev.1"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+
+# Exact direct pins and the resolved Cargo.lock are retained for reproducible builds.
+[workspace.dependencies]
+vp-product-domain = { path = "crates/vp-domain" }
+vp-product-core-adapter = { path = "crates/vp-core-adapter" }
+vp-product-control = { path = "crates/vp-control" }
+vp-product-storage = { path = "crates/vp-storage" }
+vp-product-import = { path = "crates/vp-import" }
+vp-product-api = { path = "crates/vp-api" }
+vp-product-compiler = { path = "crates/vp-compiler" }
+vp-product-runtime-executor = { path = "crates/vp-runtime-executor" }
+vp-product-codec-ffi = { path = "crates/vp-codec-ffi" }
+vp-product-secrets = { path = "crates/vp-secrets" }
+serde = { version = "=1.0.219", features = ["derive"] }
+serde_json = "=1.0.140"
+schemars = "=0.8.22"
+zeroize = "=1.8.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

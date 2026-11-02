@@ -2,8 +2,9 @@
 
 ## Repository boundaries
 
-- Read README.md and docs/architecture.md first. The foundation commit contains documentation and the client submodule; other product sources are integrated separately after review.
+- Read README.md and docs/architecture.md first. This source snapshot contains the client submodule, server baseline, administration Web and installation tooling. Source inclusion is not build or runtime acceptance.
 - `client/` is a real Git submodule. Make client changes in its fork, review and commit there, then update the parent gitlink to an exact commit. Never vendor a second active client or follow a floating branch silently.
+- Reconstruct `integration/vp_core` from the exact core lock and ordered patches before Cargo resolution; see tools/core/README.md. Do not vendor caches or silently update pins.
 - Keep the server Cargo workspace and existing relative paths intact until a separately reviewed migration verifies dependency resolution, tests and packaging.
 - Keep only the administration Web app and its required shared packages. Do not reintroduce the legacy Flutter client as another active product client.
 

@@ -1,0 +1,3273 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 0f38731..6c48e80 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2799,6 +2799,7 @@ dependencies = [
+  "sha2",
+  "sha3",
+  "smoltcp",
++ "socket2",
+  "tokio",
+  "tracing",
+  "tracing-subscriber",
+diff --git a/crates/vp-crypto/src/ss.rs b/crates/vp-crypto/src/ss.rs
+index 1a84fec..e91618a 100644
+--- a/crates/vp-crypto/src/ss.rs
++++ b/crates/vp-crypto/src/ss.rs
+@@ -8,6 +8,8 @@ use sha1::Sha1;
+ use vp_common::{Error, Result};
+ 
+ use crate::{AeadKind, AnyAead};
++use chacha20poly1305::aead::{Aead, KeyInit};
++use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+ 
+ /// 加密套件描述
+ #[derive(Debug, Clone)]
+@@ -71,8 +73,8 @@ impl Cipher {
+     /// 由主密钥 + salt 派生子密钥
+     pub fn subkey(&self, key: &[u8], salt: &[u8]) -> Result<Vec<u8>> {
+         if self.is_2022 {
+-            // 2022: blake3(key || salt) 截断 key_len
+-            let mut h = blake3::Hasher::new();
++            // SIP022 §2.2: BLAKE3 derive-key mode, not an ordinary hash.
++            let mut h = blake3::Hasher::new_derive_key("shadowsocks 2022 session subkey");
+             h.update(key);
+             h.update(salt);
+             let out = h.finalize();
+@@ -87,7 +89,14 @@ impl Cipher {
+         }
+     }
+ 
++    /// The shared 12-byte-nonce API cannot express XChaCha. The dedicated SS
++    /// TCP and UDP codecs below select the 24-byte-nonce primitive instead.
+     pub fn aead(&self, key: &[u8]) -> Result<AnyAead> {
++        if self.name == "xchacha20-ietf-poly1305" {
++            return Err(Error::Proto(
++                "XChaCha requires the dedicated 24-byte-nonce SS codec",
++            ));
++        }
+         AnyAead::new(self.kind, key)
+     }
+ }
+@@ -108,85 +117,330 @@ pub fn evp_bytes_to_key(password: &[u8], key_len: usize) -> Vec<u8> {
+     out
+ }
+ 
+-/// 单方向 AEAD 分块编解码（计数递增 nonce）
++/// Shadowsocks AEAD wrapper. XChaCha is NOT an alias of IETF ChaCha:
++/// it uses the RustCrypto XChaCha20Poly1305 construction and a 24-byte nonce.
++enum SsAead {
++    Standard(AnyAead),
++    XChaCha(Box<XChaCha20Poly1305>),
++}
++
++impl SsAead {
++    fn new(cipher: &Cipher, key: &[u8]) -> Result<Self> {
++        if cipher.name == "xchacha20-ietf-poly1305" {
++            Ok(Self::XChaCha(Box::new(
++                XChaCha20Poly1305::new_from_slice(key)
++                    .map_err(|_| Error::Proto("invalid XChaCha key"))?,
++            )))
++        } else {
++            Ok(Self::Standard(cipher.aead(key)?))
++        }
++    }
++
++    fn seal(&self, nonce: &[u8; 24], plaintext: &[u8]) -> Vec<u8> {
++        match self {
++            Self::Standard(a) => a.seal_nonce(nonce[..12].try_into().unwrap(), plaintext, b""),
++            Self::XChaCha(a) => a
++                .encrypt(XNonce::from_slice(nonce), plaintext)
++                .expect("AEAD size bounded"),
++        }
++    }
++
++    fn open(&self, nonce: &[u8; 24], ciphertext: &[u8]) -> Result<Vec<u8>> {
++        match self {
++            Self::Standard(a) => a.open_nonce(nonce[..12].try_into().unwrap(), ciphertext, b""),
++            Self::XChaCha(a) => a
++                .decrypt(XNonce::from_slice(nonce), ciphertext)
++                .map_err(|_| Error::Proto("XChaCha authentication failed")),
++        }
++    }
++}
++
++/// Single-direction AEAD chunk codec, with the full little-endian nonce.
+ pub struct AeadChunkCodec {
+-    aead: AnyAead,
+-    counter: u64,
+-    tag_len: usize,
++    aead: SsAead,
++    nonce: [u8; 24],
++    exhausted: bool,
++    max_payload: usize,
+ }
+ 
+ impl AeadChunkCodec {
+     pub fn new(cipher: &Cipher, key: &[u8]) -> Result<Self> {
+-        Ok(AeadChunkCodec {
+-            aead: cipher.aead(key)?,
+-            counter: 0,
+-            tag_len: cipher.kind.tag_len(),
++        Ok(Self {
++            aead: SsAead::new(cipher, key)?,
++            nonce: [0; 24],
++            exhausted: false,
++            max_payload: if cipher.is_2022 { 0xffff } else { 0x3fff },
+         })
+     }
+ 
+-    /// 直接以现成 AEAD 构造（vmess body 用）
+     pub fn from_aead(aead: AnyAead) -> Self {
+-        AeadChunkCodec {
+-            aead,
+-            counter: 0,
+-            tag_len: 16,
++        Self {
++            aead: SsAead::Standard(aead),
++            nonce: [0; 24],
++            exhausted: false,
++            max_payload: 0xffff,
+         }
+     }
+ 
+-    fn next_nonce(&mut self) -> u64 {
+-        let n = self.counter;
+-        self.counter += 1;
+-        n
++    fn advance_nonce(&mut self) {
++        let width = if matches!(self.aead, SsAead::XChaCha(_)) {
++            24
++        } else {
++            12
++        };
++        for n in &mut self.nonce[..width] {
++            *n = n.wrapping_add(1);
++            if *n != 0 {
++                return;
++            }
++        }
++        self.exhausted = true;
+     }
+ 
+-    /// shadowsocks AEAD 的 nonce：u64 counter 小端置于前 8 字节，后 4 字节为零
+-    fn ss_nonce(counter: u64) -> [u8; 12] {
+-        let mut n = [0u8; 12];
+-        n[..8].copy_from_slice(&counter.to_le_bytes());
+-        n
++    /// A standalone SIP022 header/payload chunk (no encrypted length prefix).
++    pub fn seal_record(&mut self, plaintext: &[u8]) -> Vec<u8> {
++        assert!(!self.exhausted, "AEAD nonce exhausted");
++        let ciphertext = self.aead.seal(&self.nonce, plaintext);
++        self.advance_nonce();
++        ciphertext
++    }
++
++    pub fn open_record(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>> {
++        if self.exhausted {
++            return Err(Error::Proto("AEAD nonce exhausted"));
++        }
++        let plaintext = self.aead.open(&self.nonce, ciphertext)?;
++        self.advance_nonce();
++        Ok(plaintext)
+     }
+ 
+-    /// 加密为一个分块（[2B len ct][len tag][payload ct][payload tag]）
+     pub fn seal_chunk(&mut self, payload: &[u8]) -> Vec<u8> {
+-        let mut out = Vec::with_capacity(payload.len() + 2 + 2 * self.tag_len);
+-        let n1 = Self::ss_nonce(self.next_nonce());
+-        let len_ct = self
+-            .aead
+-            .seal_nonce(&n1, &(payload.len() as u16).to_be_bytes(), b"");
+-        out.extend_from_slice(&len_ct);
+-        let n2 = Self::ss_nonce(self.next_nonce());
+-        let data_ct = self.aead.seal_nonce(&n2, payload, b"");
+-        out.extend_from_slice(&data_ct);
++        // Keep the existing infallible API for Snell. Stream callers split first.
++        assert!(
++            payload.len() <= self.max_payload,
++            "AEAD chunk exceeds protocol limit"
++        );
++        let mut out = self.seal_record(&(payload.len() as u16).to_be_bytes());
++        out.extend_from_slice(&self.seal_record(payload));
+         out
+     }
+ 
+-    /// 尝试从 buf 解出一条 payload；数据不足返回 None
+-    /// 返回 (payload, consumed)
+     pub fn try_open_chunk(&mut self, buf: &[u8]) -> Option<Result<(Vec<u8>, usize)>> {
+-        let len_ct_len = 2 + self.tag_len;
+-        if buf.len() < len_ct_len {
++        if self.exhausted {
++            return Some(Err(Error::Proto("AEAD nonce exhausted")));
++        }
++        if buf.len() < 18 {
+             return None;
+         }
+-        let n1 = Self::ss_nonce(self.counter);
+-        let len_pt = match self.aead.open_nonce(&n1, &buf[..len_ct_len], b"") {
+-            Ok(p) => p,
++        let length = match self.aead.open(&self.nonce, &buf[..18]) {
++            Ok(p) => u16::from_be_bytes([p[0], p[1]]) as usize,
+             Err(e) => return Some(Err(e)),
+         };
+-        if len_pt.len() != 2 {
+-            return Some(Err(Error::Proto("长度块非法")));
++        if length > self.max_payload {
++            return Some(Err(Error::Proto(
++                "AEAD payload length exceeds protocol limit",
++            )));
+         }
+-        let plen = u16::from_be_bytes([len_pt[0], len_pt[1]]) as usize;
+-        let total = len_ct_len + plen + self.tag_len;
++        let total = 18 + length + 16;
+         if buf.len() < total {
+             return None;
+         }
+-        let n2 = Self::ss_nonce(self.counter + 1);
+-        let data = match self.aead.open_nonce(&n2, &buf[len_ct_len..total], b"") {
+-            Ok(p) => p,
+-            Err(e) => return Some(Err(e)),
++        self.advance_nonce();
++        Some(self.open_record(&buf[18..total]).map(|p| (p, total)))
++    }
++}
++
++pub fn unix_seconds() -> u64 {
++    std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map(|d| d.as_secs())
++        .unwrap_or(0)
++}
++
++pub fn validate_timestamp(timestamp: u64) -> Result<()> {
++    if unix_seconds().abs_diff(timestamp) > 30 {
++        return Err(Error::Proto("SS2022 timestamp outside 30 second window"));
++    }
++    Ok(())
++}
++
++/// Authenticated UDP frame. `payload` is SOCKS address followed by application data.
++/// Replay state is deliberately separate and may only be advanced after address
++/// and session association validation by the caller.
++pub struct UdpFrame {
++    pub session_id: u64,
++    pub packet_id: u64,
++    pub client_session_id: Option<u64>,
++    pub payload: Vec<u8>,
++    pub salt: Vec<u8>,
++}
++
++impl Cipher {
++    pub fn seal_udp(
++        &self,
++        key: &[u8],
++        payload: &[u8],
++        session_id: u64,
++        packet_id: u64,
++        client_session_id: Option<u64>,
++    ) -> Result<Vec<u8>> {
++        if !self.is_2022 {
++            let mut salt = vec![0; self.salt_len()];
++            vp_common::rand_bytes(&mut salt);
++            let subkey = self.subkey(key, &salt)?;
++            salt.extend_from_slice(&SsAead::new(self, &subkey)?.seal(&[0; 24], payload));
++            return Ok(salt);
++        }
++        let mut separate = [0; 16];
++        separate[..8].copy_from_slice(&session_id.to_be_bytes());
++        separate[8..].copy_from_slice(&packet_id.to_be_bytes());
++        let mut body = vec![u8::from(client_session_id.is_some())];
++        body.extend_from_slice(&unix_seconds().to_be_bytes());
++        if let Some(client) = client_session_id {
++            body.extend_from_slice(&client.to_be_bytes());
++        }
++        body.extend_from_slice(&0u16.to_be_bytes()); // UDP padding is optional.
++        body.extend_from_slice(payload);
++        if self.kind == AeadKind::ChaCha20Poly1305 {
++            let mut nonce = [0; 24];
++            vp_common::rand_bytes(&mut nonce);
++            let aead = XChaCha20Poly1305::new_from_slice(key)
++                .map_err(|_| Error::Proto("invalid XChaCha key"))?;
++            let mut plain = separate.to_vec();
++            plain.extend_from_slice(&body);
++            let mut out = nonce.to_vec();
++            out.extend_from_slice(
++                &aead
++                    .encrypt(XNonce::from_slice(&nonce), plain.as_slice())
++                    .map_err(|_| Error::Proto("SS2022 UDP encryption failed"))?,
++            );
++            Ok(out)
++        } else {
++            let subkey = self.subkey(key, &separate[..8])?;
++            let ciphertext =
++                self.aead(&subkey)?
++                    .seal_nonce(separate[4..].try_into().unwrap(), &body, b"");
++            aes_header(self.kind, key, &mut separate, false)?;
++            let mut out = separate.to_vec();
++            out.extend_from_slice(&ciphertext);
++            Ok(out)
++        }
++    }
++
++    pub fn open_udp(&self, key: &[u8], packet: &[u8], server_response: bool) -> Result<UdpFrame> {
++        if !self.is_2022 {
++            let size = self.salt_len();
++            if packet.len() < size + 16 {
++                return Err(Error::Proto("short SS UDP packet"));
++            }
++            let salt = packet[..size].to_vec();
++            let subkey = self.subkey(key, &salt)?;
++            let payload = SsAead::new(self, &subkey)?.open(&[0; 24], &packet[size..])?;
++            return Ok(UdpFrame {
++                session_id: 0,
++                packet_id: 0,
++                client_session_id: None,
++                payload,
++                salt,
++            });
++        }
++        let (separate, body) = if self.kind == AeadKind::ChaCha20Poly1305 {
++            if packet.len() < 24 + 16 + 16 {
++                return Err(Error::Proto("short SS2022 UDP packet"));
++            }
++            let aead = XChaCha20Poly1305::new_from_slice(key)
++                .map_err(|_| Error::Proto("invalid XChaCha key"))?;
++            let plain = aead
++                .decrypt(XNonce::from_slice(&packet[..24]), &packet[24..])
++                .map_err(|_| Error::Proto("SS2022 UDP authentication failed"))?;
++            (plain[..16].to_vec(), plain[16..].to_vec())
++        } else {
++            if packet.len() < 32 {
++                return Err(Error::Proto("short SS2022 UDP packet"));
++            }
++            let mut separate: [u8; 16] = packet[..16].try_into().unwrap();
++            aes_header(self.kind, key, &mut separate, true)?;
++            let subkey = self.subkey(key, &separate[..8])?;
++            let body = self.aead(&subkey)?.open_nonce(
++                separate[4..].try_into().unwrap(),
++                &packet[16..],
++                b"",
++            )?;
++            (separate.to_vec(), body)
++        };
++        let prefix = 9 + if server_response { 8 } else { 0 };
++        if body.len() < prefix + 2 || body[0] != u8::from(server_response) {
++            return Err(Error::Proto("invalid SS2022 UDP header type/size"));
++        }
++        validate_timestamp(u64::from_be_bytes(body[1..9].try_into().unwrap()))?;
++        let client_session_id = if server_response {
++            Some(u64::from_be_bytes(body[9..17].try_into().unwrap()))
++        } else {
++            None
+         };
+-        self.counter += 2;
+-        Some(Ok((data, total)))
++        let padding = u16::from_be_bytes(body[prefix..prefix + 2].try_into().unwrap()) as usize;
++        let offset = prefix + 2 + padding;
++        if offset >= body.len() {
++            return Err(Error::Proto("invalid SS2022 UDP padding"));
++        }
++        Ok(UdpFrame {
++            session_id: u64::from_be_bytes(separate[..8].try_into().unwrap()),
++            packet_id: u64::from_be_bytes(separate[8..].try_into().unwrap()),
++            client_session_id,
++            payload: body[offset..].to_vec(),
++            salt: Vec::new(),
++        })
++    }
++}
++
++fn aes_header(kind: AeadKind, key: &[u8], header: &mut [u8; 16], decrypt: bool) -> Result<()> {
++    use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
++    let block = aes::cipher::generic_array::GenericArray::from_mut_slice(header);
++    match kind {
++        AeadKind::Aes128Gcm => {
++            let aes =
++                aes::Aes128::new_from_slice(key).map_err(|_| Error::Proto("invalid AES key"))?;
++            if decrypt {
++                aes.decrypt_block(block);
++            } else {
++                aes.encrypt_block(block);
++            }
++        }
++        AeadKind::Aes256Gcm => {
++            let aes =
++                aes::Aes256::new_from_slice(key).map_err(|_| Error::Proto("invalid AES key"))?;
++            if decrypt {
++                aes.decrypt_block(block);
++            } else {
++                aes.encrypt_block(block);
++            }
++        }
++        _ => return Err(Error::Proto("AES header requested for non-AES cipher")),
++    }
++    Ok(())
++}
++
++/// Exact 1024-packet replay window. Advancing is only allowed after authentication
++/// and complete semantic validation. An old/out-of-window packet fails closed.
++#[derive(Default)]
++pub struct ReplayWindow {
++    highest: Option<u64>,
++    seen: std::collections::BTreeSet<u64>,
++}
++impl ReplayWindow {
++    pub fn accept(&mut self, packet: u64) -> bool {
++        if self.seen.contains(&packet)
++            || self
++                .highest
++                .is_some_and(|h| h.saturating_sub(packet) >= 1024)
++        {
++            return false;
++        }
++        let highest = self.highest.map_or(packet, |h| h.max(packet));
++        self.highest = Some(highest);
++        self.seen.retain(|p| highest.saturating_sub(*p) < 1024);
++        self.seen.insert(packet);
++        true
+     }
+ }
+ 
+@@ -198,7 +452,13 @@ mod tests {
+     fn evp_kdf_matches_known() {
+         // "test" aes-128-gcm → 32 字节推导，取前 16
+         let k = evp_bytes_to_key(b"test", 16);
+-        assert_eq!(k.len(), 16);
++        assert_eq!(
++            k,
++            [
++                0x09, 0x8f, 0x6b, 0xcd, 0x46, 0x21, 0xd3, 0x73, 0xca, 0xde, 0x4e, 0x83, 0x26, 0x27,
++                0xb4, 0xf6
++            ]
++        );
+     }
+ 
+     #[test]
+@@ -249,6 +509,142 @@ mod tests {
+         assert!(c.derive_key("!!!not-base64###").is_err());
+     }
+ 
++    #[test]
++    fn session_key_uses_blake3_derive_key_context() {
++        for name in [
++            "2022-blake3-aes-128-gcm",
++            "2022-blake3-aes-256-gcm",
++            "2022-blake3-chacha20-poly1305",
++        ] {
++            let cipher = Cipher::parse(name).unwrap();
++            let key = vec![0x11; cipher.key_len()];
++            for salt in [vec![0x22; cipher.salt_len()], vec![0x33; 8]] {
++                let material = [key.as_slice(), salt.as_slice()].concat();
++                let derived = blake3::derive_key("shadowsocks 2022 session subkey", &material);
++                assert_eq!(
++                    cipher.subkey(&key, &salt).unwrap(),
++                    derived[..cipher.key_len()]
++                );
++                assert_ne!(
++                    cipher.subkey(&key, &salt).unwrap(),
++                    blake3::hash(&material).as_bytes()[..cipher.key_len()]
++                );
++            }
++        }
++    }
++
++    #[test]
++    fn legacy_udp_is_one_zero_nonce_record_and_xchacha_is_distinct() {
++        for name in [
++            "aes-128-gcm",
++            "aes-256-gcm",
++            "chacha20-ietf-poly1305",
++            "xchacha20-ietf-poly1305",
++        ] {
++            let cipher = Cipher::parse(name).unwrap();
++            let key = cipher.derive_key("ephemeral-unit-fixture").unwrap();
++            let packet = cipher
++                .seal_udp(&key, b"address-and-payload", 0, 0, None)
++                .unwrap();
++            assert_eq!(
++                packet.len(),
++                cipher.salt_len() + 16 + b"address-and-payload".len()
++            );
++            let sub = cipher.subkey(&key, &packet[..cipher.salt_len()]).unwrap();
++            let ciphertext = &packet[cipher.salt_len()..];
++            let plain = if name.starts_with('x') {
++                assert!(
++                    cipher.aead(&sub).is_err(),
++                    "never silently alias XChaCha to ChaCha"
++                );
++                let aead = XChaCha20Poly1305::new_from_slice(&sub).unwrap();
++                assert!(
++                    AnyAead::new(AeadKind::ChaCha20Poly1305, &sub)
++                        .unwrap()
++                        .open_nonce(&[0; 12], ciphertext, b"")
++                        .is_err()
++                );
++                aead.decrypt(XNonce::from_slice(&[0; 24]), ciphertext)
++                    .unwrap()
++            } else {
++                cipher
++                    .aead(&sub)
++                    .unwrap()
++                    .open_nonce(&[0; 12], ciphertext, b"")
++                    .unwrap()
++            };
++            assert_eq!(plain, b"address-and-payload");
++            assert_eq!(
++                cipher.open_udp(&key, &packet, false).unwrap().payload,
++                plain
++            );
++        }
++    }
++
++    #[test]
++    fn udp_2022_authentication_direction_association_and_length() {
++        for name in [
++            "2022-blake3-aes-128-gcm",
++            "2022-blake3-aes-256-gcm",
++            "2022-blake3-chacha20-poly1305",
++        ] {
++            let cipher = Cipher::parse(name).unwrap();
++            let key = vec![7; cipher.key_len()];
++            let packet = cipher
++                .seal_udp(&key, b"address+payload", 2, 3, Some(1))
++                .unwrap();
++            let frame = cipher.open_udp(&key, &packet, true).unwrap();
++            assert_eq!(
++                (frame.session_id, frame.packet_id, frame.client_session_id),
++                (2, 3, Some(1))
++            );
++            assert!(cipher.open_udp(&key, &packet, false).is_err());
++            for length in 0..packet.len() {
++                assert!(cipher.open_udp(&key, &packet[..length], true).is_err());
++            }
++            let mut bad = packet;
++            *bad.last_mut().unwrap() ^= 1;
++            assert!(cipher.open_udp(&key, &bad, true).is_err());
++        }
++    }
++
++    #[test]
++    fn replay_window_duplicates_reordering_and_boundaries() {
++        let mut window = ReplayWindow::default();
++        assert!(window.accept(1000));
++        assert!(window.accept(999));
++        assert!(!window.accept(999));
++        assert!(window.accept(2023));
++        assert!(!window.accept(999));
++        assert!(!window.accept(1000));
++        assert!(window.accept(1001));
++        assert!(window.accept(u64::MAX));
++        assert!(!window.accept(2023));
++        assert!(!window.accept(u64::MAX));
++    }
++
++    #[test]
++    fn nonce_exhaustion_fails_closed_instead_of_reusing_nonce() {
++        for name in ["aes-128-gcm", "xchacha20-ietf-poly1305"] {
++            let cipher = Cipher::parse(name).unwrap();
++            let mut codec = AeadChunkCodec::new(&cipher, &vec![7; cipher.key_len()]).unwrap();
++            let width = if name.starts_with('x') { 24 } else { 12 };
++            codec.nonce[..width].fill(255);
++            codec.seal_record(b"last");
++            assert!(codec.exhausted);
++            assert!(codec.open_record(&[0; 16]).is_err());
++            assert!(codec.try_open_chunk(&[0; 34]).unwrap().is_err());
++        }
++    }
++
++    #[test]
++    fn timestamp_window_is_thirty_seconds() {
++        let now = unix_seconds();
++        assert!(validate_timestamp(now).is_ok());
++        assert!(validate_timestamp(now - 31).is_err());
++        assert!(validate_timestamp(now + 32).is_err());
++    }
++
+     #[test]
+     fn hmac_sha1_available() {
+         use hmac::Mac as _;
+diff --git a/crates/vp-protocol/Cargo.toml b/crates/vp-protocol/Cargo.toml
+index c9e4f95..850ac63 100644
+--- a/crates/vp-protocol/Cargo.toml
++++ b/crates/vp-protocol/Cargo.toml
+@@ -26,6 +26,7 @@ vp-router.workspace = true
+ vp-plugin.workspace = true
+ vp-rule.workspace = true
+ tokio.workspace = true
++socket2.workspace = true
+ bytes.workspace = true
+ async-trait.workspace = true
+ tracing.workspace = true
+diff --git a/crates/vp-protocol/src/ss.rs b/crates/vp-protocol/src/ss.rs
+index fa7d68f..4e457e0 100644
+--- a/crates/vp-protocol/src/ss.rs
++++ b/crates/vp-protocol/src/ss.rs
+@@ -5,8 +5,8 @@ use std::sync::Arc;
+ use std::task::{Context, Poll};
+ 
+ use async_trait::async_trait;
+-use bytes::{Buf, BufMut, BytesMut};
+-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
++use bytes::{Buf, BytesMut};
++use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+ use tracing::warn;
+ 
+ use vp_common::addr::{decode_socks_addr, encode_socks_addr};
+@@ -30,68 +30,104 @@ pub struct SsCryptoStream<S> {
+     inner: S,
+     cipher: Cipher,
+     key: Vec<u8>,
+-    enc: Option<AeadChunkCodec>,
++    enc: AeadChunkCodec,
+     dec: Option<AeadChunkCodec>,
+-    /// 是否需要从对端读取 salt（客户端方向）
+-    expect_peer_salt: bool,
+     raw: BytesMut,
+     pending: BytesMut,
+     out: BytesMut,
+-    closed: bool,
++    read_closed: bool,
++    write_closed: bool,
++    /// Present until the server's first payload is written, or the client's
++    /// response fixed header is authenticated and associated with this request.
++    response_salt: Option<Vec<u8>>,
++    expect_response_header: bool,
++    first_response_length: Option<usize>,
+ }
+ 
+ impl<S> SsCryptoStream<S> {
+-    /// 客户端：立即发送自身 salt + 首块（目标地址），接收方向等待对端 salt
+     pub fn new_client(
+         inner: S,
+         cipher: Cipher,
+         key: Vec<u8>,
+-        first_payload: Vec<u8>,
++        mut first_payload: Vec<u8>,
+     ) -> Result<Self> {
+-        let mut salt = vec![0u8; cipher.salt_len()];
++        let mut salt = vec![0; cipher.salt_len()];
+         vp_common::rand_bytes(&mut salt);
+         let sub = cipher.subkey(&key, &salt)?;
+         let mut enc = AeadChunkCodec::new(&cipher, &sub)?;
+         let mut out = BytesMut::from(&salt[..]);
+-        let chunk = enc.seal_chunk(&first_payload);
+-        out.extend_from_slice(&chunk);
+-        Ok(SsCryptoStream {
++        if cipher.is_2022 {
++            // No application payload is available yet: SIP022 requires non-zero
++            // random-length padding in this case. Address is wholly in this header.
++            let mut random = [0; 2];
++            vp_common::rand_bytes(&mut random);
++            let padding = 1 + u16::from_le_bytes(random) % 900;
++            first_payload.extend_from_slice(&padding.to_be_bytes());
++            let start = first_payload.len();
++            first_payload.resize(start + padding as usize, 0);
++            vp_common::rand_bytes(&mut first_payload[start..]);
++            let mut fixed = vec![0];
++            fixed.extend_from_slice(&vp_crypto::ss::unix_seconds().to_be_bytes());
++            fixed.extend_from_slice(&(first_payload.len() as u16).to_be_bytes());
++            out.extend_from_slice(&enc.seal_record(&fixed));
++            out.extend_from_slice(&enc.seal_record(&first_payload));
++        } else {
++            out.extend_from_slice(&enc.seal_chunk(&first_payload));
++        }
++        let expect_response_header = cipher.is_2022;
++        Ok(Self {
+             inner,
+             cipher,
+             key,
+-            enc: Some(enc),
++            enc,
+             dec: None,
+-            expect_peer_salt: true,
+             raw: BytesMut::new(),
+             pending: BytesMut::new(),
+             out,
+-            closed: false,
++            read_closed: false,
++            write_closed: false,
++            response_salt: if expect_response_header {
++                Some(salt)
++            } else {
++                None
++            },
++            expect_response_header,
++            first_response_length: None,
+         })
+     }
+ 
+-    /// 服务端：接收方向的 codec 已在外部消耗过首块（保留计数），发送方向使用自己的新 salt
+     pub fn new_server(
+         inner: S,
+         cipher: Cipher,
+         key: Vec<u8>,
+         dec: AeadChunkCodec,
+         initial_raw: BytesMut,
++        request_salt: Vec<u8>,
++        early_data: &[u8],
+     ) -> Result<Self> {
+-        let mut own_salt = vec![0u8; cipher.salt_len()];
++        let mut own_salt = vec![0; cipher.salt_len()];
+         vp_common::rand_bytes(&mut own_salt);
+         let own_sub = cipher.subkey(&key, &own_salt)?;
+         let enc = AeadChunkCodec::new(&cipher, &own_sub)?;
+-        Ok(SsCryptoStream {
++        let response_salt = if cipher.is_2022 {
++            Some(request_salt)
++        } else {
++            None
++        };
++        Ok(Self {
+             inner,
+             cipher,
+             key,
+-            enc: Some(enc),
++            enc,
+             dec: Some(dec),
+-            expect_peer_salt: false,
+             raw: initial_raw,
+-            pending: BytesMut::new(),
++            pending: BytesMut::from(early_data),
+             out: BytesMut::from(&own_salt[..]),
+-            closed: false,
++            read_closed: false,
++            write_closed: false,
++            response_salt,
++            expect_response_header: false,
++            first_response_length: None,
+         })
+     }
+ 
+@@ -99,52 +135,83 @@ impl<S> SsCryptoStream<S> {
+     where
+         S: AsyncWrite + Unpin,
+     {
++        // A 2022 response must not emit salt before the response payload exists.
++        if self.cipher.is_2022
++            && !self.expect_response_header
++            && self.dec.is_some()
++            && self.response_salt.is_some()
++        {
++            return Poll::Ready(Ok(()));
++        }
+         while !self.out.is_empty() {
+-            let mut inner = Pin::new(&mut self.inner);
+-            match inner.as_mut().poll_write(cx, &self.out) {
+-                Poll::Ready(Ok(0)) => {
+-                    return Poll::Ready(Err(std::io::Error::new(
+-                        std::io::ErrorKind::WriteZero,
+-                        "ss: 写入 0 字节",
+-                    )));
+-                }
+-                Poll::Ready(Ok(n)) => self.out.advance(n),
+-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+-                Poll::Pending => return Poll::Pending,
++            match std::task::ready!(Pin::new(&mut self.inner).poll_write(cx, &self.out)) {
++                Ok(0) => return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into())),
++                Ok(n) => self.out.advance(n),
++                Err(e) => return Poll::Ready(Err(e)),
+             }
+         }
+         Poll::Ready(Ok(()))
+     }
+ 
+-    fn try_progress(&mut self) {
+-        if self.dec.is_none() && self.expect_peer_salt {
+-            if self.raw.len() >= self.cipher.salt_len() {
+-                let salt = self.raw.split_to(self.cipher.salt_len()).to_vec();
+-                match self
+-                    .cipher
+-                    .subkey(&self.key, &salt)
+-                    .and_then(|sub| AeadChunkCodec::new(&self.cipher, &sub))
+-                {
+-                    Ok(c) => self.dec = Some(c),
+-                    Err(_) => self.closed = true,
+-                }
++    fn try_progress(&mut self) -> Result<()> {
++        if self.dec.is_none() {
++            let fixed = if self.expect_response_header {
++                11 + self.cipher.salt_len() + 16
+             } else {
+-                return;
++                0
++            };
++            if self.raw.len() < self.cipher.salt_len() + fixed {
++                return Ok(());
+             }
++            let salt = self.raw.split_to(self.cipher.salt_len()).to_vec();
++            let sub = self.cipher.subkey(&self.key, &salt)?;
++            self.dec = Some(AeadChunkCodec::new(&self.cipher, &sub)?);
+         }
+-        while let Some(dec) = self.dec.as_mut() {
+-            match dec.try_open_chunk(&self.raw) {
+-                None => break,
+-                Some(Ok((payload, used))) => {
+-                    self.raw.advance(used);
+-                    self.pending.extend_from_slice(&payload);
+-                }
+-                Some(Err(_)) => {
+-                    self.closed = true;
+-                    break;
+-                }
++        let dec = self.dec.as_mut().unwrap();
++        if self.expect_response_header {
++            let size = 11 + self.cipher.salt_len() + 16;
++            if self.raw.len() < size {
++                return Ok(());
++            }
++            let header = dec.open_record(&self.raw.split_to(size))?;
++            if header[0] != 1 {
++                return Err(Error::Proto("SS2022 invalid response type"));
++            }
++            vp_crypto::ss::validate_timestamp(u64::from_be_bytes(
++                header[1..9].try_into().unwrap(),
++            ))?;
++            let salt_end = 9 + self.cipher.salt_len();
++            if Some(&header[9..salt_end]) != self.response_salt.as_deref() {
++                return Err(Error::Proto("SS2022 response request salt mismatch"));
+             }
++            self.first_response_length =
++                Some(u16::from_be_bytes(header[salt_end..].try_into().unwrap()) as usize);
++            if self.first_response_length == Some(0) {
++                return Err(Error::Proto(
++                    "SS2022 response header requires initial payload",
++                ));
++            }
++            self.expect_response_header = false;
++            self.response_salt = None;
++        }
++        if let Some(length) = self.first_response_length {
++            if self.raw.len() < length + 16 {
++                return Ok(());
++            }
++            self.pending
++                .extend_from_slice(&dec.open_record(&self.raw.split_to(length + 16))?);
++            self.first_response_length = None;
+         }
++        while self.pending.is_empty() {
++            if let Some(record) = dec.try_open_chunk(&self.raw) {
++                let (payload, used) = record?;
++                self.raw.advance(used);
++                self.pending.extend_from_slice(&payload);
++            } else {
++                break;
++            }
++        }
++        Ok(())
+     }
+ }
+ 
+@@ -155,33 +222,54 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for SsCryptoStream<S> {
+         buf: &mut ReadBuf<'_>,
+     ) -> Poll<std::io::Result<()>> {
+         let this = self.as_mut().get_mut();
++        if buf.remaining() == 0 {
++            return Poll::Ready(Ok(()));
++        }
++        std::task::ready!(this.flush_out(cx))?;
+         loop {
+             if !this.pending.is_empty() {
+                 let n = this.pending.len().min(buf.remaining());
+-                buf.put_slice(&this.pending[..n]);
+-                this.pending.advance(n);
++                buf.put_slice(&this.pending.split_to(n));
+                 return Poll::Ready(Ok(()));
+             }
+-            if this.closed {
++            if this.read_closed {
+                 return Poll::Ready(Ok(()));
+             }
+-            this.try_progress();
++            if let Err(e) = this.try_progress() {
++                this.read_closed = true;
++                return Poll::Ready(Err(std::io::Error::new(
++                    std::io::ErrorKind::InvalidData,
++                    e.to_string(),
++                )));
++            }
+             if !this.pending.is_empty() {
+                 continue;
+             }
+-            if this.closed {
+-                return Poll::Ready(Ok(()));
+-            }
+-            this.raw.reserve(16 * 1024);
+-            let spare = this.raw.spare_capacity_mut();
+-            let mut rb = ReadBuf::uninit(spare);
++            let mut data = [0; 16 * 1024];
++            // SIP022 also requires a single read for the response salt+fixed header.
++            let initial_response = this.dec.is_none() && this.expect_response_header;
++            let read_size = if initial_response {
++                2 * this.cipher.salt_len() + 27
++            } else {
++                data.len()
++            };
++            let mut rb = ReadBuf::new(&mut data[..read_size]);
+             std::task::ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
+-            let filled = rb.filled().len();
+-            if filled == 0 {
+-                this.closed = true;
++            if rb.filled().is_empty() {
++                this.read_closed = true;
++                if !this.raw.is_empty() || this.first_response_length.is_some() {
++                    return Poll::Ready(Err(std::io::ErrorKind::UnexpectedEof.into()));
++                }
+                 return Poll::Ready(Ok(()));
+             }
+-            unsafe { this.raw.advance_mut(filled) };
++            if initial_response && rb.filled().len() != read_size {
++                this.read_closed = true;
++                return Poll::Ready(Err(std::io::Error::new(
++                    std::io::ErrorKind::InvalidData,
++                    "SS2022 truncated response fixed header",
++                )));
++            }
++            this.raw.extend_from_slice(rb.filled());
+         }
+     }
+ }
+@@ -193,21 +281,37 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SsCryptoStream<S> {
+         buf: &[u8],
+     ) -> Poll<std::io::Result<usize>> {
+         let this = self.as_mut().get_mut();
+-        if this.closed {
+-            return Poll::Ready(Err(std::io::Error::new(
+-                std::io::ErrorKind::ConnectionAborted,
+-                "ss: 已关闭",
+-            )));
++        if this.write_closed {
++            return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+         }
+-        std::task::ready!(this.flush_out(cx))?;
+-        if let Some(enc) = this.enc.as_mut() {
+-            let chunk = enc.seal_chunk(buf);
+-            this.out.extend_from_slice(&chunk);
+-        } else {
+-            this.out.extend_from_slice(buf);
++        if buf.is_empty() {
++            return Poll::Ready(Ok(0));
+         }
+         std::task::ready!(this.flush_out(cx))?;
+-        Poll::Ready(Ok(buf.len()))
++        let n = buf
++            .len()
++            .min(if this.cipher.is_2022 { 0xffff } else { 0x3fff });
++        if !this.expect_response_header && this.dec.is_some() {
++            if let Some(request_salt) = this.response_salt.take() {
++                let mut fixed = vec![1];
++                fixed.extend_from_slice(&vp_crypto::ss::unix_seconds().to_be_bytes());
++                fixed.extend_from_slice(&request_salt);
++                fixed.extend_from_slice(&(n as u16).to_be_bytes());
++                this.out.extend_from_slice(&this.enc.seal_record(&fixed));
++                this.out.extend_from_slice(&this.enc.seal_record(&buf[..n]));
++                if let Poll::Ready(Err(e)) = this.flush_out(cx) {
++                    return Poll::Ready(Err(e));
++                }
++                return Poll::Ready(Ok(n));
++            }
++        }
++        this.out.extend_from_slice(&this.enc.seal_chunk(&buf[..n]));
++        if let Poll::Ready(Err(e)) = this.flush_out(cx) {
++            return Poll::Ready(Err(e));
++        }
++        // Bytes are accepted once buffered. Never return Pending after consuming
++        // input: the caller would retry the same input and duplicate plaintext.
++        Poll::Ready(Ok(n))
+     }
+ 
+     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+@@ -218,15 +322,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SsCryptoStream<S> {
+ 
+     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+         let this = self.as_mut().get_mut();
+-        if !this.closed {
+-            if let Some(enc) = this.enc.as_mut() {
+-                // 0 长度块作为结束信号
+-                let chunk = enc.seal_chunk(&[]);
+-                this.out.extend_from_slice(&chunk);
+-            }
+-            this.closed = true;
+-        }
+-        let _ = this.flush_out(cx);
++        std::task::ready!(this.flush_out(cx))?;
++        this.write_closed = true;
++        // Shadowsocks EOF is transport EOF, not an invented zero-length marker.
+         Pin::new(&mut this.inner).poll_shutdown(cx)
+     }
+ }
+@@ -295,13 +393,6 @@ impl SsOutbound {
+ 
+     fn first_payload(&self, dst: &DstAddr) -> Vec<u8> {
+         let mut p = Vec::with_capacity(64);
+-        if self.cipher.is_2022 {
+-            let ts = std::time::SystemTime::now()
+-                .duration_since(std::time::UNIX_EPOCH)
+-                .map(|d| d.as_secs())
+-                .unwrap_or(0);
+-            p.extend_from_slice(&ts.to_be_bytes());
+-        }
+         encode_socks_addr(dst, &mut p);
+         p
+     }
+@@ -310,12 +401,14 @@ impl SsOutbound {
+     where
+         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+     {
+-        Ok(Box::new(SsCryptoStream::new_client(
++        let mut stream = SsCryptoStream::new_client(
+             io,
+             self.cipher.clone(),
+             self.key.clone(),
+             self.first_payload(dst),
+-        )?))
++        )?;
++        stream.flush().await?;
++        Ok(Box::new(stream))
+     }
+ }
+ 
+@@ -381,6 +474,86 @@ impl Outbound for SsOutbound {
+ // 入站（自建服务端 + 自环测试）
+ // ---------------------------------------------------------------------------
+ 
++/// Exact, bounded cache: never evicts an unexpired salt to admit new traffic.
++/// SS2022 requires retaining salts for 60 seconds. Legacy uses the same window;
++/// it cannot provide the session-bound full replay guarantee of SS2022.
++#[derive(Default)]
++pub(crate) struct SaltReplay(std::collections::HashMap<Vec<u8>, std::time::Instant>);
++impl SaltReplay {
++    pub(crate) fn accept(&mut self, salt: &[u8]) -> bool {
++        let now = std::time::Instant::now();
++        self.0.retain(|_, t| now.duration_since(*t).as_secs() < 60);
++        if self.0.contains_key(salt) || self.0.len() >= 65536 {
++            return false;
++        }
++        self.0.insert(salt.to_vec(), now);
++        true
++    }
++}
++
++/// Canonical endpoint identity prevents IPv4-mapped aliases from obtaining a
++/// second quota slot or being reported as a different response peer.
++fn canonical_udp_addr(address: std::net::SocketAddr) -> std::net::SocketAddr {
++    match address {
++        std::net::SocketAddr::V6(v6) => v6
++            .ip()
++            .to_ipv4_mapped()
++            .map(|ip| std::net::SocketAddr::new(ip.into(), v6.port()))
++            .unwrap_or(address),
++        _ => address,
++    }
++}
++
++/// A SIP022 session owns one outgoing socket and therefore one source port,
++/// including when destinations alternate between IPv4 and IPv6. Explicitly turn
++/// off IPV6_V6ONLY rather than depending on host defaults. An IPv4-only host may
++/// still serve IPv4, but must never claim a mixed-family session is available.
++fn bind_ss_udp_socket(
++    first_destination: std::net::SocketAddr,
++) -> std::io::Result<(tokio::net::UdpSocket, bool)> {
++    let dual_stack = (|| {
++        let socket = socket2::Socket::new(
++            socket2::Domain::IPV6,
++            socket2::Type::DGRAM,
++            Some(socket2::Protocol::UDP),
++        )?;
++        socket.set_only_v6(false)?;
++        socket.set_nonblocking(true)?;
++        socket.bind(&"[::]:0".parse::<std::net::SocketAddr>().unwrap().into())?;
++        tokio::net::UdpSocket::from_std(socket.into())
++    })();
++    match dual_stack {
++        Ok(socket) => Ok((socket, true)),
++        Err(error) if first_destination.is_ipv6() => Err(error),
++        Err(error) => {
++            warn!("ss UDP dual-stack unavailable; serving IPv4 only: {error}");
++            let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
++            socket.set_nonblocking(true)?;
++            Ok((tokio::net::UdpSocket::from_std(socket)?, false))
++        }
++    }
++}
++
++fn udp_send_addr(
++    address: std::net::SocketAddr,
++    dual_stack: bool,
++) -> std::io::Result<std::net::SocketAddr> {
++    let address = canonical_udp_addr(address);
++    match address {
++        std::net::SocketAddr::V4(v4) if dual_stack => Ok(std::net::SocketAddr::new(
++            v4.ip().to_ipv6_mapped().into(),
++            v4.port(),
++        )),
++        std::net::SocketAddr::V6(_) if !dual_stack => Err(std::io::Error::new(
++            std::io::ErrorKind::Unsupported,
++            "IPv6 unavailable for this SS UDP session",
++        )),
++        _ => Ok(address),
++    }
++}
++
++const SS_UDP_MAX_TARGETS: usize = 64;
++
+ pub struct SsInbound {
+     bind: String,
+     port: u16,
+@@ -389,6 +562,7 @@ pub struct SsInbound {
+     key: Vec<u8>,
+     direct: Arc<DirectOutbound>,
+     shadow_tls: Option<crate::shadowtls::ShadowTlsDial>,
++    tcp_replay: std::sync::Mutex<SaltReplay>,
+ }
+ 
+ impl SsInbound {
+@@ -415,109 +589,327 @@ impl SsInbound {
+             key,
+             direct: Arc::new(DirectOutbound::new(Arc::new(Resolver::system()), false)),
+             shadow_tls,
++            tcp_replay: std::sync::Mutex::new(SaltReplay::default()),
+         })
+     }
+ 
+-    /// ss UDP 服务端：每包独立 salt；client→target 直连转发；回包重新加密
++    /// SIP022 routes by authenticated session ID, never source address. Legacy
++    /// remains source-address based. Managed response work survives ingress stop
++    /// for bounded drain and is awaited/canceled by the generation task scope.
+     async fn serve_udp(self: Arc<Self>, sock: tokio::net::UdpSocket) -> Result<()> {
+         use std::collections::HashMap;
++        use std::time::{Duration, Instant};
++        use vp_crypto::ss::ReplayWindow;
++        #[derive(Clone, Hash, Eq, PartialEq)]
++        enum NatKey {
++            Legacy(std::net::SocketAddr),
++            Session(u64),
++        }
++        struct State {
++            client: std::net::SocketAddr,
++            server_session: u64,
++            packet_id: u64,
++            window: ReplayWindow,
++            last_seen: Instant,
++            targets: HashMap<std::net::SocketAddr, Instant>,
++            retired: bool,
++        }
++        struct Entry {
++            socket: Arc<tokio::net::UdpSocket>,
++            dual_stack: bool,
++            state: std::sync::Mutex<State>,
++        }
++        struct IngressGuard(Arc<std::sync::atomic::AtomicBool>);
++        impl Drop for IngressGuard {
++            fn drop(&mut self) {
++                self.0.store(false, std::sync::atomic::Ordering::Release);
++            }
++        }
++        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
++        let _ingress = IngressGuard(running.clone());
+         let sock = Arc::new(sock);
+-        let mut buf = vec![0u8; 65535];
+-        let nat: Arc<std::sync::Mutex<HashMap<std::net::SocketAddr, Arc<tokio::net::UdpSocket>>>> =
+-            Arc::new(std::sync::Mutex::new(HashMap::new()));
++        let nat = Arc::new(std::sync::Mutex::new(HashMap::<NatKey, Arc<Entry>>::new()));
++        let mut responses = tokio::task::JoinSet::new();
++        let mut maintenance = tokio::time::interval(Duration::from_secs(30));
++        let mut salts = SaltReplay::default();
++        let mut buf = vec![0; 65535];
+         loop {
+-            let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+-                continue;
++            let (n, from) = tokio::select! {
++                r = sock.recv_from(&mut buf) => r?,
++                _ = responses.join_next(), if !responses.is_empty() => continue,
++                _ = maintenance.tick() => {
++                    // Only this owner expires sessions. Workers never discard an
++                    // active replay window after a receive error/expiry race.
++                    nat.lock().unwrap().retain(|_, entry| {
++                        let mut state = entry.state.lock().unwrap();
++                        if state.last_seen.elapsed() >= Duration::from_secs(300) {
++                            state.retired = true;
++                            false
++                        } else { true }
++                    });
++                    continue;
++                },
+             };
+-            let salt_len = self.cipher.salt_len();
+-            if n <= salt_len {
+-                continue;
+-            }
+-            let Ok(sub) = self.cipher.subkey(&self.key, &buf[..salt_len]) else {
++            let Ok(frame) = self.cipher.open_udp(&self.key, &buf[..n], false) else {
+                 continue;
+             };
+-            let Ok(mut codec) = AeadChunkCodec::new(&self.cipher, &sub) else {
++            let Ok((dst, used)) = decode_socks_addr(&frame.payload) else {
+                 continue;
+             };
+-            let Some(Ok((plain, _))) = codec.try_open_chunk(&buf[salt_len..n]) else {
+-                continue;
++            let nat_key = if self.cipher.is_2022 {
++                NatKey::Session(frame.session_id)
++            } else {
++                NatKey::Legacy(from)
+             };
+-            let Ok((dst, used)) = decode_socks_addr(&plain) else {
+-                continue;
++            let dst_addr = match &dst.host {
++                vp_common::Host::Ip(ip) => std::net::SocketAddr::new(*ip, dst.port),
++                vp_common::Host::Domain(domain) => {
++                    match tokio::time::timeout(
++                        Duration::from_secs(5),
++                        tokio::net::lookup_host((domain.as_str(), dst.port)),
++                    )
++                    .await
++                    {
++                        Ok(Ok(mut it)) => match it.next() {
++                            Some(addr) => addr,
++                            None => continue,
++                        },
++                        _ => continue,
++                    }
++                }
+             };
+-            let payload = plain[used..].to_vec();
+-
+-            // 客户端 → 目标 socket（每客户端一个，惰性创建；锁内不做 await）
+-            let existing = nat.lock().unwrap().get(&from).cloned();
+-            let (target, is_new) = match existing {
+-                Some(t) => (t, false),
++            let existing = nat.lock().unwrap().get(&nat_key).cloned();
++            let entry = match existing {
++                Some(e) => e,
+                 None => {
+-                    let t = Arc::new(tokio::net::UdpSocket::bind("0.0.0.0:0").await?);
+-                    let mut nat = nat.lock().unwrap();
+-                    match nat.get(&from) {
+-                        Some(prev) => (prev.clone(), false), // 并发竞争：他方先插入
+-                        None => {
+-                            nat.insert(from, t.clone());
+-                            (t, true)
+-                        }
++                    if nat.lock().unwrap().len() >= 4096 {
++                        continue;
+                     }
++                    let Ok((socket, dual_stack)) = bind_ss_udp_socket(dst_addr) else {
++                        continue;
++                    };
++                    let mut sid = [0; 8];
++                    vp_common::rand_bytes(&mut sid);
++                    let mut server_session = u64::from_be_bytes(sid);
++                    while server_session == frame.session_id {
++                        vp_common::rand_bytes(&mut sid);
++                        server_session = u64::from_be_bytes(sid);
++                    }
++                    let entry = Arc::new(Entry {
++                        socket: Arc::new(socket),
++                        dual_stack,
++                        state: std::sync::Mutex::new(State {
++                            client: from,
++                            server_session,
++                            packet_id: 0,
++                            window: ReplayWindow::default(),
++                            last_seen: Instant::now(),
++                            targets: HashMap::new(),
++                            retired: false,
++                        }),
++                    });
++                    nat.lock().unwrap().insert(nat_key.clone(), entry.clone());
++                    let target = entry.clone();
++                    let ingress_running = running.clone();
++                    let target_socket = entry.socket.clone();
++                    let listen = sock.clone();
++                    let cipher = self.cipher.clone();
++                    let key = self.key.clone();
++                    let client_session = if cipher.is_2022 {
++                        Some(frame.session_id)
++                    } else {
++                        None
++                    };
++                    // Actual response work is managed independently of ingress.
++                    // The local JoinSet owns only join-waiters: stopping ingress
++                    // must not abort replies already in flight during bounded drain.
++                    let worker = vp_core::task_scope::spawn(async move {
++                        let mut response = vec![0; 65535];
++                        loop {
++                            let received = tokio::time::timeout(
++                                Duration::from_secs(60),
++                                target_socket.recv_from(&mut response),
++                            )
++                            .await;
++                            let (n, source) = match received {
++                                Ok(Ok(v)) => v,
++                                Ok(Err(error))
++                                    if matches!(
++                                        error.kind(),
++                                        std::io::ErrorKind::Interrupted
++                                            | std::io::ErrorKind::ConnectionRefused
++                                            | std::io::ErrorKind::ConnectionReset
++                                    ) =>
++                                {
++                                    continue;
++                                }
++                                Ok(Err(error)) => {
++                                    warn!("ss UDP response socket failed: {error}");
++                                    target.state.lock().unwrap().retired = true;
++                                    break;
++                                }
++                                Err(_) => {
++                                    let state = target.state.lock().unwrap();
++                                    if state.retired
++                                        || (!ingress_running
++                                            .load(std::sync::atomic::Ordering::Acquire)
++                                            && state.last_seen.elapsed()
++                                                >= Duration::from_secs(300))
++                                    {
++                                        break;
++                                    }
++                                    continue;
++                                }
++                            };
++                            let source = canonical_udp_addr(source);
++                            let mut plain = Vec::new();
++                            encode_socks_addr(&DstAddr::ip(source.ip(), source.port()), &mut plain);
++                            plain.extend_from_slice(&response[..n]);
++                            let (sid, pid, client) =
++                                {
++                                    let mut state = target.state.lock().unwrap();
++                                    if state.retired {
++                                        break;
++                                    }
++                                    // UDP association policy is endpoint-restricted:
++                                    // only a destination requested by this authenticated
++                                    // session may provide a reply. Never encrypt unsolicited
++                                    // plaintext injected at the relay's ephemeral port.
++                                    if !state.targets.get(&source).is_some_and(|time| {
++                                        time.elapsed() < Duration::from_secs(300)
++                                    }) {
++                                        continue;
++                                    }
++                                    let pid = state.packet_id;
++                                    let Some(next) = pid.checked_add(1) else {
++                                        break;
++                                    };
++                                    state.packet_id = next;
++                                    (state.server_session, pid, state.client)
++                                };
++                            let Ok(packet) =
++                                cipher.seal_udp(&key, &plain, sid, pid, client_session)
++                            else {
++                                continue;
++                            };
++                            if packet.len() <= 65507 {
++                                let _ = listen.send_to(&packet, client).await;
++                            }
++                        }
++                    });
++                    vp_core::task_scope::spawn_in(&mut responses, async move {
++                        let _ = worker.await;
++                    });
++                    entry
+                 }
+             };
+-
+-            if is_new {
+-                let target = target.clone();
+-                let sock2 = sock.clone();
+-                let cipher = self.cipher.clone();
+-                let key = self.key.clone();
+-                let nat2 = nat.clone();
+-                let client = from;
+-                vp_core::task_scope::spawn(async move {
+-                    let mut rbuf = [0u8; 65535];
+-                    loop {
+-                        let recv = match tokio::time::timeout(
+-                            std::time::Duration::from_secs(300),
+-                            target.recv_from(&mut rbuf),
+-                        )
+-                        .await
+-                        {
+-                            Ok(r) => r,
+-                            Err(_) => break, // 空闲超时
+-                        };
+-                        let Ok((rn, rfrom)) = recv else { break };
+-                        // 回包：[salt][chunk(socks addr + payload)]
+-                        let mut plain = Vec::with_capacity(rn + 24);
+-                        encode_socks_addr(&DstAddr::ip(rfrom.ip(), rfrom.port()), &mut plain);
+-                        plain.extend_from_slice(&rbuf[..rn]);
+-                        let mut salt = vec![0u8; cipher.salt_len()];
+-                        vp_common::rand_bytes(&mut salt);
+-                        let Ok(sub) = cipher.subkey(&key, &salt) else {
+-                            continue;
+-                        };
+-                        let Ok(mut codec) = AeadChunkCodec::new(&cipher, &sub) else {
+-                            continue;
+-                        };
+-                        let chunk = codec.seal_chunk(&plain);
+-                        let mut dgram = salt;
+-                        dgram.extend_from_slice(&chunk);
+-                        let _ = sock2.send_to(&dgram, client).await;
++            let destination = canonical_udp_addr(dst_addr);
++            let Ok(send_address) = udp_send_addr(destination, entry.dual_stack) else {
++                continue;
++            };
++            {
++                let mut state = entry.state.lock().unwrap();
++                if state.retired {
++                    continue;
++                }
++                state
++                    .targets
++                    .retain(|_, time| time.elapsed() < Duration::from_secs(300));
++                if !state.targets.contains_key(&destination)
++                    && state.targets.len() >= SS_UDP_MAX_TARGETS
++                {
++                    continue;
++                }
++                if self.cipher.is_2022 {
++                    if !state.window.accept(frame.packet_id) {
++                        continue;
+                     }
+-                    nat2.lock().unwrap().remove(&client);
+-                });
++                } else if !salts.accept(&frame.salt) {
++                    continue;
++                }
++                // Update address only AFTER authentication and semantic/replay checks.
++                state.client = from;
++                state.last_seen = Instant::now();
++                state.targets.insert(destination, Instant::now());
+             }
++            let _ = entry
++                .socket
++                .send_to(&frame.payload[used..], send_address)
++                .await;
++        }
++    }
+ 
+-            let dst_addr: std::net::SocketAddr = match &dst.host {
+-                vp_common::Host::Ip(ip) => std::net::SocketAddr::new(*ip, dst.port),
+-                vp_common::Host::Domain(d) => {
+-                    match tokio::net::lookup_host((d.as_str(), dst.port)).await {
+-                        Ok(mut it) => it
+-                            .next()
+-                            .unwrap_or(std::net::SocketAddr::new([127, 0, 0, 1].into(), dst.port)),
+-                        Err(_) => continue,
+-                    }
++    async fn read_request<S>(
++        &self,
++        stream: &mut S,
++    ) -> Result<(Vec<u8>, AeadChunkCodec, BytesMut, DstAddr, Vec<u8>)>
++    where
++        S: AsyncRead + Unpin,
++    {
++        // SIP022's fixed header is deliberately read in one underlying read.
++        // Every handshake is bounded; no target connection exists before all
++        // authenticated fields, address, padding, timestamp and replay checks.
++        let (salt, dec, first, raw) = if self.cipher.is_2022 {
++            let mut initial = vec![0; self.cipher.salt_len() + 11 + 16];
++            let n = stream.read(&mut initial).await?;
++            if n != initial.len() {
++                return Err(Error::Proto("SS2022 truncated initial header"));
++            }
++            let salt = initial[..self.cipher.salt_len()].to_vec();
++            let sub = self.cipher.subkey(&self.key, &salt)?;
++            let mut dec = AeadChunkCodec::new(&self.cipher, &sub)?;
++            let fixed = dec.open_record(&initial[self.cipher.salt_len()..])?;
++            if fixed[0] != 0 {
++                return Err(Error::Proto("SS2022 invalid request type"));
++            }
++            vp_crypto::ss::validate_timestamp(u64::from_be_bytes(fixed[1..9].try_into().unwrap()))?;
++            let size = u16::from_be_bytes(fixed[9..11].try_into().unwrap()) as usize;
++            let mut variable = vec![0; size + 16];
++            stream.read_exact(&mut variable).await?;
++            let first = dec.open_record(&variable)?;
++            (salt, dec, first, BytesMut::new())
++        } else {
++            let mut salt = vec![0; self.cipher.salt_len()];
++            stream.read_exact(&mut salt).await?;
++            let sub = self.cipher.subkey(&self.key, &salt)?;
++            let mut dec = AeadChunkCodec::new(&self.cipher, &sub)?;
++            let mut raw = BytesMut::new();
++            let first = loop {
++                if let Some(result) = dec.try_open_chunk(&raw) {
++                    let (payload, used) = result?;
++                    raw.advance(used);
++                    break payload;
++                }
++                let mut buf = [0; 16 * 1024];
++                let n = stream.read(&mut buf).await?;
++                if n == 0 {
++                    return Err(Error::Proto("SS truncated initial chunk"));
+                 }
++                raw.extend_from_slice(&buf[..n]);
+             };
+-            let _ = target.send_to(&payload, dst_addr).await;
++            (salt, dec, first, raw)
++        };
++        let (dst, mut used) = decode_socks_addr(&first)?;
++        if self.cipher.is_2022 {
++            if first.len() < used + 2 {
++                return Err(Error::Proto("SS2022 missing padding length"));
++            }
++            let padding = u16::from_be_bytes(first[used..used + 2].try_into().unwrap()) as usize;
++            used += 2;
++            if padding > 900 || used + padding > first.len() {
++                return Err(Error::Proto("SS2022 padding outside header"));
++            }
++            used += padding;
++            if padding == 0 && used == first.len() {
++                return Err(Error::Proto(
++                    "SS2022 request requires padding or initial payload",
++                ));
++            }
++        }
++        if !self.tcp_replay.lock().unwrap().accept(&salt) {
++            return Err(Error::Proto("SS replayed salt or replay cache full"));
+         }
++        Ok((salt, dec, raw, dst, first[used..].to_vec()))
+     }
+ 
+     async fn serve<S>(
+@@ -529,55 +921,23 @@ impl SsInbound {
+     where
+         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+     {
+-        // 读客户端 salt
+-        let mut salt = vec![0u8; self.cipher.salt_len()];
+-        stream.read_exact(&mut salt).await?;
+-        let sub = self.cipher.subkey(&self.key, &salt)?;
+-        let mut dec = AeadChunkCodec::new(&self.cipher, &sub)?;
+-        // 读首个分块 → 目标地址（可能附带额外数据）
+-        let mut raw = BytesMut::new();
+-        let first = loop {
+-            raw.reserve(16 * 1024);
+-            let n = stream.read_buf(&mut raw).await?;
+-            if n == 0 {
+-                return Err(Error::Proto("ss 入站: 首包中断"));
+-            }
+-            match dec.try_open_chunk(&raw) {
+-                Some(Ok((payload, used))) => {
+-                    raw.advance(used);
+-                    break payload;
+-                }
+-                Some(Err(e)) => return Err(e),
+-                None => continue,
+-            }
+-        };
+-        let addr_buf: &[u8] = if self.cipher.is_2022 {
+-            if first.len() < 8 {
+-                return Err(Error::Proto("ss 入站: 2022 首块缺时间戳"));
+-            }
+-            let ts = u64::from_be_bytes(first[..8].try_into().unwrap());
+-            let now = std::time::SystemTime::now()
+-                .duration_since(std::time::UNIX_EPOCH)
+-                .map(|d| d.as_secs())
+-                .unwrap_or(0);
+-            if now.abs_diff(ts) > 60 {
+-                return Err(Error::Proto("ss 入站: 2022 时间戳超窗"));
+-            }
+-            &first[8..]
+-        } else {
+-            &first[..]
+-        };
+-        let (dst, used) = decode_socks_addr(addr_buf)?;
+-        if addr_buf.len() > used {
+-            raw.extend_from_slice(&addr_buf[used..]);
+-        }
+-
+-        // 目标直连（服务端模式不做策略路由）
++        let (salt, dec, raw, dst, early_data) = tokio::time::timeout(
++            std::time::Duration::from_secs(10),
++            self.read_request(&mut stream),
++        )
++        .await
++        .map_err(|_| Error::Proto("SS handshake timeout"))??;
+         let sess = Session::new_tcp(self.tag.clone(), Some(src), dst.clone());
+         let remote = self.direct.connect_stream(&sess, &dst).await?;
+-
+-        let client =
+-            SsCryptoStream::new_server(stream, self.cipher.clone(), self.key.clone(), dec, raw)?;
++        let client = SsCryptoStream::new_server(
++            stream,
++            self.cipher.clone(),
++            self.key.clone(),
++            dec,
++            raw,
++            salt,
++            &early_data,
++        )?;
+         let meta = vp_core::conn_table::ConnMeta {
+             id: sess.id,
+             inbound: self.tag.clone(),
+@@ -595,9 +955,7 @@ impl SsInbound {
+             meta: Some(meta),
+             stats: Some(ctx.stats.clone()),
+         };
+-        vp_core::task_scope::spawn(async move {
+-            let _ = relay(Box::new(client), remote, hook).await;
+-        });
++        relay(Box::new(client), remote, hook).await;
+         Ok(())
+     }
+ }
+@@ -670,17 +1028,25 @@ impl Inbound for SsInbound {
+             };
+ 
+             let this = self.clone();
+-            vp_core::task_scope::spawn_listener(self.tag().to_string(), async move {
++            vp_core::task_scope::spawn_listener(format!("{}:udp", self.tag), async move {
+                 if let Err(e) = this.serve_udp(udp).await {
+                     warn!("ss udp 入站结束: {e}");
+                 }
+             });
+             let this = self.clone();
+-            vp_core::task_scope::spawn_listener(self.tag().to_string(), async move {
++            vp_core::task_scope::spawn_listener(format!("{}:tcp", self.tag), async move {
+                 loop {
+                     match listener.accept().await {
+                         Ok((stream, src)) => {
+                             vp_transport::tune(&stream);
++                            if this.cipher.is_2022 {
++                                // SIP022 §3.1.4 strategy 1: consistently reset on
++                                // invalid/truncated handshakes, regardless of unread bytes.
++                                #[allow(deprecated)]
++                                if stream.set_linger(Some(std::time::Duration::ZERO)).is_err() {
++                                    continue;
++                                }
++                            }
+                             let this = this.clone();
+                             let ctx = ctx.clone();
+                             vp_core::task_scope::spawn(async move {
+@@ -737,7 +1103,7 @@ mod tests {
+         // echo 源站
+         let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let echo_addr = echo.local_addr().unwrap();
+-        vp_core::task_scope::spawn(async move {
++        tokio::spawn(async move {
+             use tokio::io::{AsyncReadExt, AsyncWriteExt};
+             let (mut s, _) = echo.accept().await.unwrap();
+             let mut b = [0u8; 1024];
+diff --git a/crates/vp-protocol/src/udp_out.rs b/crates/vp-protocol/src/udp_out.rs
+index 1ee1629..f2d3ec1 100644
+--- a/crates/vp-protocol/src/udp_out.rs
++++ b/crates/vp-protocol/src/udp_out.rs
+@@ -4,7 +4,6 @@ use std::sync::Arc;
+ 
+ use async_trait::async_trait;
+ use tokio::net::{TcpStream, UdpSocket};
+-use tokio::sync::Mutex;
+ 
+ use vp_common::addr::{decode_socks_addr, encode_socks_addr};
+ use vp_common::{DstAddr, Error, Result};
+@@ -159,7 +158,10 @@ pub struct SsUdpConn {
+     cipher: vp_crypto::ss::Cipher,
+     key: Vec<u8>,
+     server: std::net::SocketAddr,
+-    recv_state: Mutex<()>,
++    session_id: u64,
++    packet_id: std::sync::atomic::AtomicU64,
++    sessions: std::collections::HashMap<u64, (vp_crypto::ss::ReplayWindow, std::time::Instant)>,
++    salts: crate::ss::SaltReplay,
+ }
+ 
+ impl SsUdpConn {
+@@ -170,17 +172,26 @@ impl SsUdpConn {
+         key: Vec<u8>,
+     ) -> Result<Self> {
+         let server = tokio::net::lookup_host((server_host, server_port))
+-            .await
+-            .map_err(|e| Error::Addr(format!("解析 {server_host} 失败: {e}")))?
++            .await?
+             .next()
+-            .ok_or(Error::Addr("无地址".into()))?;
+-        let sock = UdpSocket::bind("0.0.0.0:0").await?;
+-        Ok(SsUdpConn {
++            .ok_or(Error::Addr("no SS UDP server address".into()))?;
++        let sock = UdpSocket::bind(if server.is_ipv6() {
++            "[::]:0"
++        } else {
++            "0.0.0.0:0"
++        })
++        .await?;
++        let mut session_id = [0; 8];
++        vp_common::rand_bytes(&mut session_id);
++        Ok(Self {
+             sock: Arc::new(sock),
+             cipher,
+             key,
+             server,
+-            recv_state: Mutex::new(()),
++            session_id: u64::from_be_bytes(session_id),
++            packet_id: std::sync::atomic::AtomicU64::new(0),
++            sessions: std::collections::HashMap::new(),
++            salts: crate::ss::SaltReplay::default(),
+         })
+     }
+ }
+@@ -188,63 +199,70 @@ impl SsUdpConn {
+ #[async_trait]
+ impl PacketConn for SsUdpConn {
+     async fn send(&self, pkt: &UdpPacket) -> Result<()> {
+-        // 明文：[socks addr][payload]，整体一个分块；独立 salt
+         let mut plain = Vec::with_capacity(pkt.data.len() + 24);
+-        encode_socks_addr(
+-            &DstAddr {
+-                host: vp_common::Host::Ip(pkt.dst.ip()),
+-                port: pkt.dst.port(),
+-            },
+-            &mut plain,
+-        );
++        encode_socks_addr(&DstAddr::ip(pkt.dst.ip(), pkt.dst.port()), &mut plain);
+         plain.extend_from_slice(&pkt.data);
+-
+-        let mut salt = vec![0u8; self.cipher.salt_len()];
+-        vp_common::rand_bytes(&mut salt);
+-        let sub = self.cipher.subkey(&self.key, &salt)?;
+-        let mut codec = vp_crypto::ss::AeadChunkCodec::new(&self.cipher, &sub)?;
+-        let chunk = codec.seal_chunk(&plain);
+-
+-        let mut dgram = salt;
+-        dgram.extend_from_slice(&chunk);
+-        self.sock.send_to(&dgram, self.server).await?;
++        let packet_id = self
++            .packet_id
++            .fetch_update(
++                std::sync::atomic::Ordering::Relaxed,
++                std::sync::atomic::Ordering::Relaxed,
++                |n| n.checked_add(1),
++            )
++            .map_err(|_| Error::Proto("SS2022 packet counter exhausted"))?;
++        let packet = self
++            .cipher
++            .seal_udp(&self.key, &plain, self.session_id, packet_id, None)?;
++        if packet.len() > 65507 {
++            return Err(Error::Proto("SS UDP packet exceeds datagram size"));
++        }
++        self.sock.send_to(&packet, self.server).await?;
+         Ok(())
+     }
+ 
+     async fn recv(&mut self) -> Result<UdpPacket> {
+-        let _guard = self.recv_state.lock().await;
+-        let mut buf = vec![0u8; 65535];
++        let mut buf = vec![0; 65535];
+         loop {
+-            let (n, _) = self.sock.recv_from(&mut buf).await?;
+-            let salt_len = self.cipher.salt_len();
+-            if n <= salt_len {
++            let (n, from) = self.sock.recv_from(&mut buf).await?;
++            if from != self.server {
+                 continue;
+             }
+-            let salt = buf[..salt_len].to_vec();
+-            let sub = match self.cipher.subkey(&self.key, &salt) {
+-                Ok(s) => s,
+-                Err(_) => continue,
+-            };
+-            let mut codec = match vp_crypto::ss::AeadChunkCodec::new(&self.cipher, &sub) {
+-                Ok(c) => c,
+-                Err(_) => continue,
++            let Ok(frame) = self.cipher.open_udp(&self.key, &buf[..n], true) else {
++                continue;
+             };
+-            let Some(Ok((plain, _))) = codec.try_open_chunk(&buf[salt_len..n]) else {
++            let Ok((src, used)) = decode_socks_addr(&frame.payload) else {
+                 continue;
+             };
+-            let Ok((src, used)) = decode_socks_addr(&plain) else {
++            let vp_common::Host::Ip(ip) = src.host else {
+                 continue;
+             };
++            if self.cipher.is_2022 {
++                if frame.client_session_id != Some(self.session_id)
++                    || frame.session_id == self.session_id
++                {
++                    continue;
++                }
++                let now = std::time::Instant::now();
++                self.sessions
++                    .retain(|_, (_, time)| now.duration_since(*time).as_secs() < 300);
++                if !self.sessions.contains_key(&frame.session_id) && self.sessions.len() >= 16 {
++                    continue;
++                }
++                let (window, seen) = self
++                    .sessions
++                    .entry(frame.session_id)
++                    .or_insert_with(|| (Default::default(), now));
++                if !window.accept(frame.packet_id) {
++                    continue;
++                }
++                *seen = now;
++            } else if !self.salts.accept(&frame.salt) {
++                continue;
++            }
+             return Ok(UdpPacket {
+-                src: std::net::SocketAddr::new(
+-                    match &src.host {
+-                        vp_common::Host::Ip(ip) => *ip,
+-                        vp_common::Host::Domain(_) => [0, 0, 0, 0].into(),
+-                    },
+-                    src.port,
+-                ),
++                src: std::net::SocketAddr::new(ip, src.port),
+                 dst: self.sock.local_addr()?,
+-                data: plain[used..].to_vec().into(),
++                data: frame.payload[used..].to_vec().into(),
+             });
+         }
+     }
+diff --git a/crates/vp-protocol/tests/SS_VERIFICATION.md b/crates/vp-protocol/tests/SS_VERIFICATION.md
+new file mode 100644
+index 0000000..90c8be8
+--- /dev/null
++++ b/crates/vp-protocol/tests/SS_VERIFICATION.md
+@@ -0,0 +1,94 @@
++# Shadowsocks standards repair / verification tranche
++
++Scope: four legacy AEAD methods and the three SIP022 methods. This tranche is
++protocol implementation plus same-implementation regression evidence, **not a
++release certification or independent full-program interop pass**.
++
++Primary sources checked on 2026-10-30:
++- https://shadowsocks.org/doc/aead.html
++- https://shadowsocks.org/doc/sip022.html
++- https://github.com/SagerNet/sing-shadowsocks/blob/65740e0f0e3e/shadowaead/protocol.go
++- https://github.com/SagerNet/sing-shadowsocks/blob/65740e0f0e3e/shadowaead_2022/protocol.go
++- https://github.com/SagerNet/sing-box/blob/v1.14.4/go.mod
++
++The product uses existing RustCrypto AES/GCM and XChaCha20Poly1305 primitives,
++HKDF-SHA1 and BLAKE3 derive-key mode; no custom cipher is introduced. XChaCha is
++no longer silently aliased to 12-byte-nonce ChaCha. Legacy UDP uses one zero-nonce
++AEAD record. SIP022 has standalone directional TCP headers, request-salt response
++association, 30-second timestamps, exact 60-second TCP salt replay retention,
++AES separate-header UDP / XChaCha UDP, session-ID routing and 1024-packet exact
++sliding replay windows. UDP state advances only after authentication, direction,
++time, address and client-session association validation. UDP sessions live 300
++seconds after valid incoming traffic; full caches fail closed rather than evict
++live replay state. TCP initial headers are bounded by a 10-second timeout.
++
++Stream fixes also cover authenticated early data, legacy 0x3fff / SIP022 0xffff
++chunk limits, transport half-close, authentication errors (not silent EOF), nonce
++exhaustion and backpressure without duplicate input. The shared relay pump must
++flush accepted buffered output: that fix is supplied by the P09 baseline and is
++not copied into this exclusive protocol patch. SS TCP/UDP listener tasks and
++connection work now use its task scope. UDP response work is separately tracked;
++listener-owned JoinSets await handles rather than aborting in-flight replies when
++ingress stops.
++
++## Executed locally, Rust 1.88.0, on P09 baseline
++
++Baseline `73d1bc8d5073168572c0306937da154c3a6e00c9`. The only standalone lock
++change is adding the existing locked `socket2` dependency edge to `vp-protocol`;
++no crate version or checksum changes. The one-line manifest edge is coordinated
++with the core integration owner.
++
++```
++cargo +1.88.0 test -p vp-crypto --lib --locked
++cargo +1.88.0 test -p vp-protocol --test ss_standard --test ss_managed --test ss_library_interop --locked
++cargo +1.88.0 test -p vp-protocol --test udp ss_udp_loopback --locked
++cargo +1.88.0 test -p vp-protocol --lib ss::tests::ss_ --locked
++cargo +1.88.0 test -p vp-protocol --lib snell::tests --locked
++```
++
++- Crypto: 24 passed; 2 existing captured-VMess-fixture tests ignored.
++- P09 core lifecycle/relay regression baseline: 18 passed.
++- `ss_standard`: ten passed. Includes seven-method TCP 180KB+half-close and UDP
++  sizes 0/128/4096; wrong-key/type/timestamp/padding/replay target absence; corrupted
++  UDP target absence; SS2022 session mobility; response association; invalid
++  association cannot poison the replay window; seven-byte duplex backpressure.
++- `ss_managed`: three passed. Established TCP finishes during drain (zero forced
++  tasks), partial handshakes cancel promptly, actual TCP/UDP ports rebind after
++  shutdown, connection tables empty, and IPv4/IPv6 UDP replies still arrive during
++  drain while new ingress is blocked. UDP has no EOF: idle associations are forcibly
++  canceled at the configured drain deadline, with zero tasks remaining and the
++  single outgoing dual-stack port released. This bounded forced cleanup is reported,
++  not mislabeled as a naturally drained UDP session.
++- Existing SS UDP regression: one passed. Existing SS TCP regressions: two passed.
++- Snell shared-codec regressions: six passed.
++- `ss_library_interop`: Rust harness compiles; **two tests intentionally ignored**.
++  Go module download, dependency integrity verification, build and execution are
++  pending the separately requested authorization. There is no generated go.sum
++  and no invented hash or successful reference result.
++
++## Remaining release gates / explicit limits
++
++1. The official sing-box 1.14.4 and 1.10.7 CLIs are blocked at network-manager
++   initialization by sandbox netlink restrictions, before listening. That is not
++   a cipher failure or pass. No network-policy bypass is attempted. The prepared
++   test-only official-library peer is a distinct evidence tier, never a production
++   replacement engine.
++2. Run both directions of the seven-cipher TCP/UDP matrix and wrong-key target
++   absence after authorized official Go setup; retain the exact resolved go.sum,
++   compiler/build identities and actual logs. Unsupported reference behavior is
++   a gap, never a pass.
++3. Mixed-family UDP is now implemented with one explicit dual-stack socket and
++   verified against live IPv4/IPv6 loopback targets for all seven methods, including
++   one shared source port and mapped-address canonicalization. On hosts without
++   dual-stack support IPv4 may fall back explicitly; IPv6 capability is not claimed.
++   The endpoint-restricted reply policy only returns datagrams from a requested
++   target, with 64 active target endpoints/session. Unsolicited sources and a 65th
++   target are dropped, without evicting established destinations/replay state.
++   Non-Linux/native-platform dual-stack behavior remains unverified.
++4. Legacy salt replay memory is bounded to 60 seconds and does not confer SIP022's
++   full session-bound replay guarantees. SIP023 multi-user identity headers are
++   not implemented; the ordinary single-PSK SIP022 construction is the scope here.
++5. Server SIP022 probe handling selects zero-linger reset behavior on accepted TCP
++   sockets. Platform-specific packet-level probe behavior and native OS lifecycle
++   acceptance remain unverified. Scoped listener/task cancellation and bounded
++   drain are locally verified against P09; preserve those wrappers on replay.
+diff --git a/crates/vp-protocol/tests/reference_ss/README.md b/crates/vp-protocol/tests/reference_ss/README.md
+new file mode 100644
+index 0000000..b2ffef5
+--- /dev/null
++++ b/crates/vp-protocol/tests/reference_ss/README.md
+@@ -0,0 +1,25 @@
++# Official Shadowsocks protocol-library peer (test-only)
++
++This adapter calls unmodified `sing-shadowsocks` pinned to the dependency revision
++of official sing-box **v1.14.4** (`65740e0f0e3e`) and its resolved `sing` revision.
++It does not reimplement Shadowsocks framing, authentication or cryptography.
++All listeners, dial targets and plaintext echo targets are constrained to loopback.
++The adapter deliberately does not instantiate sing-box NetworkManager, whose
++netlink initialization is blocked in this sandbox. Results are protocol-library
++interop, **not** a full sing-box executable integration pass.
++
++Credentials arrive via stdin and exist only for the child process lifetime.
++No installer, route, firewall, system-proxy, TUN or persistent-key operation exists.
++The Go module is a test dependency, never a production engine or runtime fallback.
++
++Build only after authorization for the official Go compiler and library fixture:
++
++```
++go mod tidy
++go mod verify
++go build -trimpath -o reference-ss .
++VP_SS_REFERENCE=/absolute/path/reference-ss cargo test --locked -p vp-protocol --test ss_library_interop -- --ignored --nocapture
++```
++
++Preserve actual `go.sum`, compiler version and binary/dependency hashes in evidence.
++The Rust matrix tests both directions, seven ciphers and TCP/UDP independently.
+diff --git a/crates/vp-protocol/tests/reference_ss/go.mod b/crates/vp-protocol/tests/reference_ss/go.mod
+new file mode 100644
+index 0000000..4ae6e51
+--- /dev/null
++++ b/crates/vp-protocol/tests/reference_ss/go.mod
+@@ -0,0 +1,8 @@
++module vp-product.test/reference-ss
++
++go 1.25.5
++
++require (
++ github.com/sagernet/sing-shadowsocks v0.2.9-0.20260929204512-65740e0f0e3e
++ github.com/sagernet/sing v0.9.7-0.20261023115459-5dc452e537bf
++)
+diff --git a/crates/vp-protocol/tests/reference_ss/main.go b/crates/vp-protocol/tests/reference_ss/main.go
+new file mode 100644
+index 0000000..8819a10
+--- /dev/null
++++ b/crates/vp-protocol/tests/reference_ss/main.go
+@@ -0,0 +1,113 @@
++// Test-only adapter: all Shadowsocks implementation code remains unmodified upstream.
++package main
++
++import (
++ "bytes"
++ "context"
++ "encoding/json"
++ "errors"
++ "fmt"
++ "io"
++ "net"
++ "os"
++ "strings"
++ "time"
++
++ SS "github.com/sagernet/sing-shadowsocks"
++ "github.com/sagernet/sing-shadowsocks/shadowaead"
++ SS22 "github.com/sagernet/sing-shadowsocks/shadowaead_2022"
++ "github.com/sagernet/sing/common/buf"
++ M "github.com/sagernet/sing/common/metadata"
++ N "github.com/sagernet/sing/common/network"
++)
++
++type input struct { Method, Password, Mode string; Port uint16; Negative bool }
++func deadline()time.Time{return time.Now().Add(5*time.Second)}
++func method(c input)(SS.Method,error){
++ if strings.HasPrefix(c.Method,"2022-"){return SS22.NewWithPassword(c.Method,c.Password,nil)}
++ return shadowaead.New(c.Method,nil,c.Password)
++}
++func runClient(c input)error{
++ if c.Port==0{return errors.New("missing loopback server port")}
++ m,err:=method(c);if err!=nil{return err}
++ target,err:=net.ListenTCP("tcp4",&net.TCPAddr{IP:net.IPv4(127,0,0,1)});if err!=nil{return err};defer target.Close()
++ udpTarget,err:=net.ListenUDP("udp4",&net.UDPAddr{IP:net.IPv4(127,0,0,1)});if err!=nil{return err};defer udpTarget.Close()
++ server:=fmt.Sprintf("127.0.0.1:%d",c.Port)
++ raw,err:=net.DialTimeout("tcp4",server,3*time.Second);if err!=nil{return err};defer raw.Close();raw.SetDeadline(deadline())
++ conn,err:=m.DialConn(raw,M.SocksaddrFromNet(target.Addr()));if err!=nil&&!c.Negative{return fmt.Errorf("TCP handshake: %w",err)}
++ if c.Negative {
++  if err==nil{defer conn.Close();conn.Write([]byte("must-not-arrive"))}
++  wire,e:=net.DialTimeout("udp4",server,3*time.Second);if e!=nil{return e};defer wire.Close()
++  packet:=m.DialPacketConn(wire);packet.SetDeadline(deadline());packet.WriteTo([]byte("must-not-arrive"),udpTarget.LocalAddr())
++  target.SetDeadline(time.Now().Add(200*time.Millisecond));if remote,e:=target.Accept();e==nil{remote.Close();return errors.New("invalid credentials reached TCP target")}
++  udpTarget.SetReadDeadline(time.Now().Add(200*time.Millisecond));if _,_,e:=udpTarget.ReadFrom(make([]byte,100));e==nil{return errors.New("invalid credentials reached UDP target")}
++  return json.NewEncoder(os.Stdout).Encode(map[string]any{"ok":true,"kind":"official-protocol-library","method":c.Method,"negative":true})
++ }
++ defer conn.Close()
++ go func(){remote,e:=target.AcceptTCP();if e==nil{defer remote.Close();remote.SetDeadline(deadline());io.Copy(remote,remote)}}()
++ body:=bytes.Repeat([]byte("independent-reference-tcp"),2000)
++ if _,err=conn.Write(body);err!=nil{return fmt.Errorf("TCP write: %w",err)}
++ got:=make([]byte,len(body));if _,err=io.ReadFull(conn,got);err!=nil{return fmt.Errorf("TCP read: %w",err)}
++ if !bytes.Equal(got,body){return errors.New("TCP payload mismatch")}
++ wire,err:=net.DialTimeout("udp4",server,3*time.Second);if err!=nil{return err};defer wire.Close()
++ packet:=m.DialPacketConn(wire);defer packet.Close();packet.SetDeadline(deadline())
++ previous:=""
++ for _,size:=range []int{1,128,4096}{
++  body=bytes.Repeat([]byte{0x53},size);udpTarget.SetDeadline(deadline())
++  if _,err=packet.WriteTo(body,udpTarget.LocalAddr());err!=nil{return fmt.Errorf("UDP write: %w",err)}
++  received:=make([]byte,65535);n,source,e:=udpTarget.ReadFrom(received);if e!=nil{return fmt.Errorf("UDP target: %w",e)}
++  if !bytes.Equal(body,received[:n]){return errors.New("UDP target payload mismatch")}
++  if previous!=""&&previous!=source.String(){return errors.New("UDP session outgoing source changed")};previous=source.String()
++  if _,e=udpTarget.WriteTo(received[:n],source);e!=nil{return e}
++  n,source,e=packet.ReadFrom(received);if e!=nil{return fmt.Errorf("UDP reply: %w",e)}
++  if !bytes.Equal(body,received[:n])||source.String()!=udpTarget.LocalAddr().String(){return errors.New("UDP reply payload/address mismatch")}
++ }
++ return json.NewEncoder(os.Stdout).Encode(map[string]any{"ok":true,"kind":"official-protocol-library","method":c.Method,"tcp":true,"udp_sizes":[]int{1,128,4096},"udp_source_stable":true})
++}
++
++type handler struct{}
++func(handler)NewError(_ context.Context,e error){fmt.Fprintln(os.Stderr,"reference handler:",e)}
++func(handler)NewConnection(_ context.Context,conn net.Conn,metadata M.Metadata)error{
++ defer conn.Close()
++ if !metadata.Destination.Addr.IsLoopback(){return errors.New("non-loopback destination refused")}
++ target,err:=net.DialTimeout("tcp",metadata.Destination.String(),3*time.Second);if err!=nil{return err};defer target.Close()
++ conn.SetDeadline(deadline());target.SetDeadline(deadline())
++ done:=make(chan struct{});go func(){io.Copy(target,conn);if tcp,ok:=target.(*net.TCPConn);ok{tcp.CloseWrite()};close(done)}()
++ _,err=io.Copy(conn,target);conn.Close();<-done;return err
++}
++func(handler)NewPacketConnection(_ context.Context,conn N.PacketConn,_ M.Metadata)error{
++ defer conn.Close()
++ target,err:=net.ListenUDP("udp4",&net.UDPAddr{IP:net.IPv4(127,0,0,1)});if err!=nil{return err};defer target.Close()
++ for {
++  incoming:=buf.NewPacket();destination,e:=conn.ReadPacket(incoming);if e!=nil{incoming.Release();return e}
++  if !destination.Addr.IsLoopback(){incoming.Release();return errors.New("non-loopback UDP target refused")}
++  target.SetDeadline(deadline());_,e=target.WriteToUDP(incoming.Bytes(),destination.UDPAddr());incoming.Release();if e!=nil{return e}
++  response:=buf.NewSize(65535);response.Resize(1024,0)
++  n,source,e:=target.ReadFromUDP(response.FreeBytes());if e!=nil{response.Release();return e};response.Truncate(n)
++  if e=conn.WritePacket(response,M.SocksaddrFromNet(source));e!=nil{return e}
++ }
++}
++type wirePacket struct{*net.UDPConn}
++func(w wirePacket)ReadPacket(b *buf.Buffer)(M.Socksaddr,error){_,from,e:=b.ReadPacketFrom(w.UDPConn);if e!=nil{return M.Socksaddr{},e};return M.SocksaddrFromNet(from),nil}
++func(w wirePacket)WritePacket(b *buf.Buffer,destination M.Socksaddr)error{
++ defer b.Release();if !destination.Addr.IsLoopback(){return errors.New("non-loopback UDP recipient refused")}
++ _,err:=w.WriteToUDP(b.Bytes(),destination.UDPAddr());return err
++}
++func runServer(c input)error{
++ tcp,err:=net.ListenTCP("tcp4",&net.TCPAddr{IP:net.IPv4(127,0,0,1)});if err!=nil{return err};defer tcp.Close()
++ udp,err:=net.ListenUDP("udp4",&net.UDPAddr{IP:net.IPv4(127,0,0,1),Port:tcp.Addr().(*net.TCPAddr).Port});if err!=nil{return err};defer udp.Close()
++ var service SS.Service
++ if strings.HasPrefix(c.Method,"2022-"){service,err=SS22.NewServiceWithPassword(c.Method,c.Password,300,handler{},nil)}else{service,err=shadowaead.NewService(c.Method,nil,c.Password,300,handler{})};if err!=nil{return err}
++ ctx,cancel:=context.WithTimeout(context.Background(),20*time.Second);defer cancel()
++ go func(){for{conn,e:=tcp.Accept();if e!=nil{return};go func(){conn.SetDeadline(deadline());if e:=service.NewConnection(ctx,conn,M.Metadata{Source:M.SocksaddrFromNet(conn.RemoteAddr())});e!=nil{conn.Close()}}()}}()
++ go func(){for{packet:=buf.NewPacket();_,from,e:=packet.ReadPacketFrom(udp);if e!=nil{packet.Release();return};if e=service.NewPacket(ctx,wirePacket{udp},packet,M.Metadata{Source:M.SocksaddrFromNet(from)});e!=nil{packet.Release()}}}()
++ if err=json.NewEncoder(os.Stdout).Encode(map[string]any{"ready":tcp.Addr().(*net.TCPAddr).Port,"kind":"official-protocol-library"});err!=nil{return err}
++ // Parent keeps stdin open during tests; closing it terminates this isolated peer.
++ done:=make(chan struct{});go func(){io.Copy(io.Discard,os.Stdin);close(done)}()
++ select{case <-done:return nil;case <-ctx.Done():return ctx.Err()}
++}
++func main(){
++ var c input;if err:=json.NewDecoder(io.LimitReader(os.Stdin,16384)).Decode(&c);err!=nil{fmt.Fprintln(os.Stderr,err);os.Exit(1)}
++ var err error;switch c.Mode{case "client":err=runClient(c);case "server":err=runServer(c);default:err=errors.New("invalid fixture mode")}
++ if err!=nil{fmt.Fprintln(os.Stderr,"reference-ss:",err);os.Exit(1)}
++}
+diff --git a/crates/vp-protocol/tests/ss_library_interop.rs b/crates/vp-protocol/tests/ss_library_interop.rs
+new file mode 100644
+index 0000000..e60dba3
+--- /dev/null
++++ b/crates/vp-protocol/tests/ss_library_interop.rs
+@@ -0,0 +1,298 @@
++//! Independent official protocol-library tests, explicitly NOT sing-box CLI tests.
++//! Run only after building/authorizing tests/reference_ss and setting VP_SS_REFERENCE.
++use base64::Engine;
++use std::{
++    io::{BufRead, Read, Write},
++    process::{Child, Command, Output},
++    sync::Arc,
++    time::Duration,
++};
++use tokio::{
++    io::{AsyncReadExt, AsyncWriteExt},
++    net::{TcpListener, UdpSocket},
++    time::timeout,
++};
++use vp_common::DstAddr;
++use vp_core::{Inbound, InboundCtx, Outbound, Session, UdpPacket};
++const METHODS: [&str; 7] = [
++    "aes-128-gcm",
++    "aes-256-gcm",
++    "chacha20-ietf-poly1305",
++    "xchacha20-ietf-poly1305",
++    "2022-blake3-aes-128-gcm",
++    "2022-blake3-aes-256-gcm",
++    "2022-blake3-chacha20-poly1305",
++];
++struct NoopRouter;
++#[async_trait::async_trait]
++impl vp_core::Router for NoopRouter {
++    async fn pick(&self, _: &Session) -> vp_core::Resolution {
++        unreachable!()
++    }
++}
++fn password(method: &str) -> String {
++    let cipher = vp_crypto::ss::Cipher::parse(method).unwrap();
++    let mut bytes = vec![0; cipher.key_len()];
++    vp_common::rand_bytes(&mut bytes);
++    base64::engine::general_purpose::STANDARD.encode(bytes)
++}
++fn context() -> InboundCtx {
++    InboundCtx {
++        router: Arc::new(NoopRouter),
++        stats: Arc::default(),
++        conns: Arc::new(vp_core::ConnTable::new()),
++    }
++}
++struct Peer(Child);
++impl std::ops::Deref for Peer {
++    type Target = Child;
++    fn deref(&self) -> &Child {
++        &self.0
++    }
++}
++impl std::ops::DerefMut for Peer {
++    fn deref_mut(&mut self) -> &mut Child {
++        &mut self.0
++    }
++}
++impl Drop for Peer {
++    fn drop(&mut self) {
++        let _ = self.0.kill();
++        let _ = self.0.wait();
++    }
++}
++async fn finish(mut child: Peer) -> Output {
++    let status = timeout(Duration::from_secs(15), async {
++        loop {
++            if let Some(status) = child.try_wait().unwrap() {
++                break status;
++            }
++            tokio::time::sleep(Duration::from_millis(20)).await;
++        }
++    })
++    .await
++    .expect("reference child timeout");
++    let mut stdout = Vec::new();
++    let mut stderr = Vec::new();
++    if let Some(mut stream) = child.stdout.take() {
++        stream.read_to_end(&mut stdout).unwrap();
++    }
++    if let Some(mut stream) = child.stderr.take() {
++        stream.read_to_end(&mut stderr).unwrap();
++    }
++    Output {
++        status,
++        stdout,
++        stderr,
++    }
++}
++async fn peer(config: serde_json::Value) -> Peer {
++    let binary = std::env::var_os("VP_SS_REFERENCE")
++        .expect("build authorized checksum-verified official SS library harness first");
++    let mut child = Peer(
++        Command::new(binary)
++            .stdin(std::process::Stdio::piped())
++            .stdout(std::process::Stdio::piped())
++            .stderr(std::process::Stdio::piped())
++            .spawn()
++            .unwrap(),
++    );
++    let mut bytes = serde_json::to_vec(&config).unwrap();
++    bytes.push(b'\n');
++    child.stdin.as_mut().unwrap().write_all(&bytes).unwrap();
++    child
++}
++fn outbound(method: &str, password: &str, port: u16) -> vp_protocol::ss::SsOutbound {
++    vp_protocol::ss::SsOutbound::new(&vp_config::SsCfg {
++        server: "127.0.0.1".into(),
++        port,
++        cipher: method.into(),
++        password: password.into(),
++        udp: true,
++        plugin: None,
++        plugin_opts: None,
++    })
++    .unwrap()
++}
++
++#[tokio::test]
++#[ignore = "requires authorized official Go protocol-library peer; not a CLI pass"]
++async fn official_client_to_vp_server_all_seven_methods_tcp_udp_and_wrong_key() {
++    for method in METHODS {
++        let key = password(method);
++        let server = Arc::new(
++            vp_protocol::ss::SsInbound::new("127.0.0.1", 0, "ss-reference", method, &key).unwrap(),
++        );
++        let port = server.start(context()).await.unwrap();
++        for negative in [false, true] {
++            let credential = if negative {
++                password(method)
++            } else {
++                key.clone()
++            };
++            let mut child=peer(serde_json::json!({"method":method,"password":credential,"mode":"client","port":port,"negative":negative})).await;
++            child.stdin.take();
++            let output = finish(child).await;
++            assert!(
++                output.status.success(),
++                "{method} negative={negative}: {}",
++                String::from_utf8_lossy(&output.stderr)
++            );
++            let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
++            assert_eq!(result["ok"], true);
++            assert_eq!(result["kind"], "official-protocol-library");
++            eprintln!(
++                "PASS official SS client -> vp server {method} negative={negative}: {}",
++                String::from_utf8_lossy(&output.stdout).trim()
++            );
++        }
++    }
++}
++
++#[tokio::test]
++#[ignore = "requires authorized official Go protocol-library peer; not a CLI pass"]
++async fn vp_client_to_official_server_all_seven_methods_tcp_udp_and_wrong_key() {
++    for method in METHODS {
++        let key = password(method);
++        let mut child =
++            peer(serde_json::json!({"method":method,"password":key,"mode":"server"})).await;
++        let stdout = child.stdout.take().unwrap();
++        let line = timeout(
++            Duration::from_secs(5),
++            tokio::task::spawn_blocking(move || {
++                let mut line = String::new();
++                std::io::BufReader::new(stdout)
++                    .read_line(&mut line)
++                    .unwrap();
++                line
++            }),
++        )
++        .await
++        .expect("reference server readiness timeout")
++        .unwrap();
++        if line.is_empty() {
++            let output = finish(child).await;
++            panic!(
++                "reference startup: {}",
++                String::from_utf8_lossy(&output.stderr)
++            );
++        }
++        let ready: serde_json::Value = serde_json::from_str(&line).unwrap();
++        assert_eq!(ready["kind"], "official-protocol-library");
++        let port = ready["ready"].as_u64().unwrap() as u16;
++        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let addr = echo.local_addr().unwrap();
++        let echo_task = tokio::spawn(async move {
++            let (mut stream, _) = echo.accept().await.unwrap();
++            let mut buf = [0; 8192];
++            loop {
++                let n = stream.read(&mut buf).await.unwrap();
++                if n == 0 {
++                    break;
++                };
++                stream.write_all(&buf[..n]).await.unwrap();
++            }
++        });
++        let out = outbound(method, &key, port);
++        let dst = DstAddr::ip(addr.ip(), addr.port());
++        let mut stream = out
++            .connect_stream(&Session::new_tcp("test".into(), None, dst.clone()), &dst)
++            .await
++            .unwrap();
++        let body = vec![0x39; 48000];
++        timeout(Duration::from_secs(5), async {
++            stream.write_all(&body).await.unwrap();
++            stream.flush().await.unwrap();
++            let mut got = vec![0; body.len()];
++            stream.read_exact(&mut got).await.unwrap();
++            assert_eq!(got, body);
++        })
++        .await
++        .unwrap_or_else(|_| panic!("{method} TCP timeout"));
++        stream.shutdown().await.unwrap();
++        drop(stream);
++        echo_task.abort();
++        let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
++        let addr = target.local_addr().unwrap();
++        let dst = DstAddr::ip(addr.ip(), addr.port());
++        let mut packet = out
++            .connect_packet(&Session::new_tcp("test".into(), None, dst.clone()), &dst)
++            .await
++            .unwrap();
++        let mut original = None;
++        for size in [1, 128, 4096] {
++            timeout(Duration::from_secs(5), async {
++                let body = vec![0x56; size];
++                packet
++                    .send(&UdpPacket {
++                        src: addr,
++                        dst: addr,
++                        data: body.clone().into(),
++                    })
++                    .await
++                    .unwrap();
++                let mut buf = [0; 8192];
++                let (n, from) = target.recv_from(&mut buf).await.unwrap();
++                assert_eq!(&buf[..n], &body);
++                if let Some(previous) = original {
++                    assert_eq!(from, previous)
++                } else {
++                    original = Some(from)
++                };
++                target.send_to(&buf[..n], from).await.unwrap();
++                let response = packet.recv().await.unwrap();
++                assert_eq!(response.src, addr);
++                assert_eq!(&response.data[..], &body);
++            })
++            .await
++            .unwrap_or_else(|_| panic!("{method} UDP timeout"));
++        }
++        // Wrong-key target absence, independently observed on plaintext sockets.
++        let badout = outbound(method, &password(method), port);
++        let forbidden = TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let badaddr = forbidden.local_addr().unwrap();
++        let baddst = DstAddr::ip(badaddr.ip(), badaddr.port());
++        if let Ok(mut bad) = badout
++            .connect_stream(
++                &Session::new_tcp("test".into(), None, baddst.clone()),
++                &baddst,
++            )
++            .await
++        {
++            let _ = bad.write_all(b"must-not-arrive").await;
++            let _ = bad.flush().await;
++        }
++        assert!(
++            timeout(Duration::from_millis(100), forbidden.accept())
++                .await
++                .is_err()
++        );
++        let badpacket = badout
++            .connect_packet(&Session::new_tcp("test".into(), None, dst.clone()), &dst)
++            .await
++            .unwrap();
++        badpacket
++            .send(&UdpPacket {
++                src: addr,
++                dst: addr,
++                data: b"must-not-arrive"[..].into(),
++            })
++            .await
++            .unwrap();
++        assert!(
++            timeout(Duration::from_millis(100), target.recv_from(&mut [0; 100]))
++                .await
++                .is_err()
++        );
++        child.stdin.take();
++        let output = finish(child).await;
++        assert!(
++            output.status.success(),
++            "{}",
++            String::from_utf8_lossy(&output.stderr)
++        );
++        eprintln!(
++            "PASS vp SS client -> official server {method}: TCP 48000 bytes, UDP [1,128,4096], stable source, wrong-key target absence"
++        );
++    }
++}
+diff --git a/crates/vp-protocol/tests/ss_managed.rs b/crates/vp-protocol/tests/ss_managed.rs
+new file mode 100644
+index 0000000..bb5cfcc
+--- /dev/null
++++ b/crates/vp-protocol/tests/ss_managed.rs
+@@ -0,0 +1,224 @@
++//! Managed SS lifecycle acceptance. Actual sockets and target-side observations;
++//! no mock readiness, detached relay, or process shutdown is used for cleanup.
++use base64::Engine;
++use std::{sync::Arc, time::Duration};
++use tokio::{
++    io::{AsyncReadExt, AsyncWriteExt},
++    net::{TcpListener, TcpStream, UdpSocket},
++    time::timeout,
++};
++use vp_common::DstAddr;
++use vp_core::{
++    Inbound, InboundCtx, Outbound, Session, UdpPacket,
++    task_scope::{Phase, TaskScope},
++};
++struct NoopRouter;
++#[async_trait::async_trait]
++impl vp_core::Router for NoopRouter {
++    async fn pick(&self, _: &Session) -> vp_core::Resolution {
++        unreachable!()
++    }
++}
++fn context() -> InboundCtx {
++    InboundCtx {
++        router: Arc::new(NoopRouter),
++        stats: Arc::default(),
++        conns: Arc::new(vp_core::ConnTable::new()),
++    }
++}
++async fn server(method: &str) -> (Arc<TaskScope>, InboundCtx, u16, vp_protocol::ss::SsOutbound) {
++    let cipher = vp_crypto::ss::Cipher::parse(method).unwrap();
++    let mut bytes = vec![0; cipher.key_len()];
++    vp_common::rand_bytes(&mut bytes);
++    let password = base64::engine::general_purpose::STANDARD.encode(bytes);
++    let scope = TaskScope::new();
++    let ctx = context();
++    let inbound = Arc::new(
++        vp_protocol::ss::SsInbound::new("127.0.0.1", 0, "managed-ss", method, &password).unwrap(),
++    );
++    let port = scope.run(inbound.start(ctx.clone())).await.unwrap();
++    assert_eq!(scope.snapshot().listeners.len(), 2);
++    let outbound = vp_protocol::ss::SsOutbound::new(&vp_config::SsCfg {
++        server: "127.0.0.1".into(),
++        port,
++        cipher: method.into(),
++        password,
++        udp: true,
++        plugin: None,
++        plugin_opts: None,
++    })
++    .unwrap();
++    (scope, ctx, port, outbound)
++}
++async fn draining(scope: &TaskScope) {
++    timeout(Duration::from_secs(1), async {
++        while scope.snapshot().phase == Phase::Running {
++            tokio::task::yield_now().await
++        }
++    })
++    .await
++    .unwrap();
++    tokio::time::sleep(Duration::from_millis(20)).await;
++}
++async fn ports_released(port: u16) {
++    let _tcp = TcpListener::bind(("127.0.0.1", port))
++        .await
++        .expect("SS TCP listening socket must be destructed before shutdown completion");
++    let _udp = UdpSocket::bind(("127.0.0.1", port))
++        .await
++        .expect("SS UDP listening socket must be destructed before shutdown completion");
++}
++
++#[tokio::test]
++async fn established_tcp_finishes_during_managed_drain_and_cleans_connection_table() {
++    for method in ["aes-128-gcm", "2022-blake3-aes-128-gcm"] {
++        let (scope, ctx, port, out) = server(method).await;
++        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let address = target.local_addr().unwrap();
++        let dst = DstAddr::ip(address.ip(), address.port());
++        let mut client = out
++            .connect_stream(&Session::new_tcp("test".into(), None, dst.clone()), &dst)
++            .await
++            .unwrap();
++        client.write_all(b"request").await.unwrap();
++        client.flush().await.unwrap();
++        let (mut remote, _) = timeout(Duration::from_secs(2), target.accept())
++            .await
++            .unwrap()
++            .unwrap();
++        let mut request = [0; 7];
++        remote.read_exact(&mut request).await.unwrap();
++        assert_eq!(&request, b"request");
++        let closing_scope = scope.clone();
++        let closing = tokio::spawn(async move {
++            closing_scope
++                .shutdown(Duration::from_secs(2), Duration::from_secs(1))
++                .await
++        });
++        draining(&scope).await;
++        assert!(
++            TcpStream::connect(("127.0.0.1", port)).await.is_err(),
++            "new TCP ingress must stop before established work drains"
++        );
++        remote.write_all(b"reply-after-ingress-stop").await.unwrap();
++        remote.shutdown().await.unwrap();
++        let mut response = [0; 24];
++        timeout(Duration::from_secs(1), client.read_exact(&mut response))
++            .await
++            .unwrap()
++            .unwrap();
++        assert_eq!(&response, b"reply-after-ingress-stop");
++        client.shutdown().await.unwrap();
++        drop(client);
++        drop(remote);
++        let report = closing.await.unwrap();
++        assert!(
++            report.drained,
++            "{method}: established TCP must finish without abort"
++        );
++        assert_eq!(report.forced_tasks, 0);
++        assert_eq!(report.remaining_tasks, 0);
++        assert_eq!(report.panics, 0);
++        assert!(ctx.conns.is_empty());
++        assert_eq!(scope.snapshot().task_count(), 0);
++        ports_released(port).await;
++    }
++}
++
++#[tokio::test]
++async fn udp_reply_survives_ingress_stop_then_bounded_cancel_releases_both_families() {
++    for ipv6 in [false, true] {
++        let (scope, ctx, port, out) = server("2022-blake3-aes-128-gcm").await;
++        let target = UdpSocket::bind(if ipv6 { "[::1]:0" } else { "127.0.0.1:0" })
++            .await
++            .expect("IPv6 unavailable is a blocked acceptance, not a pass");
++        let address = target.local_addr().unwrap();
++        let dst = DstAddr::ip(address.ip(), address.port());
++        let mut client = out
++            .connect_packet(&Session::new_udp("test".into(), None, dst.clone()), &dst)
++            .await
++            .unwrap();
++        client
++            .send(&UdpPacket {
++                src: address,
++                dst: address,
++                data: b"request"[..].into(),
++            })
++            .await
++            .unwrap();
++        let mut request = [0; 100];
++        let (_, relay) = timeout(Duration::from_secs(2), target.recv_from(&mut request))
++            .await
++            .unwrap()
++            .unwrap();
++        let closing_scope = scope.clone();
++        let closing = tokio::spawn(async move {
++            closing_scope
++                .shutdown(Duration::from_millis(300), Duration::from_secs(1))
++                .await
++        });
++        draining(&scope).await;
++        // UDP has no EOF: established response work remains live during the
++        // configured drain window, then the scope forcibly cancels idle state.
++        target.send_to(b"reply-during-drain", relay).await.unwrap();
++        let reply = timeout(Duration::from_millis(150), client.recv())
++            .await
++            .unwrap()
++            .unwrap();
++        assert_eq!(&reply.data[..], b"reply-during-drain");
++        assert_eq!(reply.src, address);
++        client
++            .send(&UdpPacket {
++                src: address,
++                dst: address,
++                data: b"new-ingress-must-stop"[..].into(),
++            })
++            .await
++            .unwrap();
++        assert!(
++            timeout(Duration::from_millis(80), target.recv_from(&mut request))
++                .await
++                .is_err()
++        );
++        let report = closing.await.unwrap();
++        assert!(!report.drained);
++        assert!(report.forced_tasks >= 1);
++        assert_eq!(report.remaining_tasks, 0);
++        assert_eq!(report.panics, 0);
++        assert!(ctx.conns.is_empty());
++        assert_eq!(scope.snapshot().task_count(), 0);
++        ports_released(port).await;
++        let _outgoing = UdpSocket::bind(("::", relay.port()))
++            .await
++            .expect("single dual-stack outgoing session socket must be released");
++    }
++}
++
++#[tokio::test]
++async fn managed_stop_cancels_partial_handshake_and_all_owned_destructors() {
++    for _ in 0..5 {
++        let (scope, ctx, port, _) = server("2022-blake3-aes-128-gcm").await;
++        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
++        // No bytes: the parser is waiting within its ten-second deadline.
++        timeout(Duration::from_secs(1), async {
++            while scope.snapshot().work == 0 {
++                tokio::task::yield_now().await
++            }
++        })
++        .await
++        .unwrap();
++        let report = scope.shutdown(Duration::ZERO, Duration::from_secs(1)).await;
++        assert_eq!(report.remaining_tasks, 0);
++        assert_eq!(report.panics, 0);
++        assert!(ctx.conns.is_empty());
++        assert_eq!(scope.snapshot().task_count(), 0);
++        match timeout(Duration::from_secs(1), client.read(&mut [0; 1]))
++            .await
++            .unwrap()
++        {
++            Ok(n) => assert_eq!(n, 0),
++            Err(_) => {}
++        }
++        ports_released(port).await;
++    }
++}
+diff --git a/crates/vp-protocol/tests/ss_standard.rs b/crates/vp-protocol/tests/ss_standard.rs
+new file mode 100644
+index 0000000..533c171
+--- /dev/null
++++ b/crates/vp-protocol/tests/ss_standard.rs
+@@ -0,0 +1,650 @@
++//! Focused Shadowsocks regression tests. These are local, same-implementation
++//! conformance/regression tests, NOT independent-reference interoperability.
++use base64::Engine;
++use std::{net::SocketAddr, sync::Arc, time::Duration};
++use tokio::{
++    io::{AsyncReadExt, AsyncWriteExt},
++    net::{TcpListener, TcpStream, UdpSocket},
++    time::timeout,
++};
++use vp_common::{DstAddr, Stats};
++use vp_core::{Inbound, InboundCtx, Outbound, PacketConn, Session, UdpPacket};
++use vp_crypto::ss::{AeadChunkCodec, Cipher};
++use vp_protocol::ss::{SsInbound, SsOutbound};
++
++const METHODS: [&str; 7] = [
++    "aes-128-gcm",
++    "aes-256-gcm",
++    "chacha20-ietf-poly1305",
++    "xchacha20-ietf-poly1305",
++    "2022-blake3-aes-128-gcm",
++    "2022-blake3-aes-256-gcm",
++    "2022-blake3-chacha20-poly1305",
++];
++struct NoopRouter;
++#[async_trait::async_trait]
++impl vp_core::Router for NoopRouter {
++    async fn pick(&self, _: &Session) -> vp_core::Resolution {
++        unreachable!("SS server uses direct outbound")
++    }
++}
++fn ctx() -> InboundCtx {
++    InboundCtx {
++        router: Arc::new(NoopRouter),
++        stats: Arc::new(Stats::default()),
++        conns: Arc::new(vp_core::ConnTable::new()),
++    }
++}
++fn credentials(method: &str) -> (Cipher, String, Vec<u8>) {
++    let cipher = Cipher::parse(method).unwrap();
++    let mut secret = vec![0; cipher.key_len()];
++    vp_common::rand_bytes(&mut secret);
++    let password = base64::engine::general_purpose::STANDARD.encode(&secret);
++    let key = cipher.derive_key(&password).unwrap();
++    (cipher, password, key)
++}
++async fn inbound(method: &str, password: &str) -> u16 {
++    Arc::new(SsInbound::new("127.0.0.1", 0, "ss-test", method, password).unwrap())
++        .start(ctx())
++        .await
++        .unwrap()
++}
++fn outbound(method: &str, password: &str, port: u16) -> SsOutbound {
++    SsOutbound::new(&vp_config::SsCfg {
++        server: "127.0.0.1".into(),
++        port,
++        cipher: method.into(),
++        password: password.into(),
++        udp: true,
++        plugin: None,
++        plugin_opts: None,
++    })
++    .unwrap()
++}
++
++#[tokio::test]
++async fn seven_methods_tcp_large_payload_and_half_close() {
++    for method in METHODS {
++        timeout(Duration::from_secs(5), async {
++            let (_, password, _) = credentials(method);
++            let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
++            let addr = echo.local_addr().unwrap();
++            let echo_task = tokio::spawn(async move {
++                let (mut socket, _) = echo.accept().await.unwrap();
++                let mut data = Vec::new();
++                socket.read_to_end(&mut data).await.unwrap();
++                socket.write_all(&data).await.unwrap();
++                socket.shutdown().await.unwrap();
++            });
++            let port = inbound(method, &password).await;
++            let out = outbound(method, &password, port);
++            let dst = DstAddr::ip(addr.ip(), addr.port());
++            let mut stream = out
++                .connect_stream(&Session::new_tcp("test".into(), None, dst.clone()), &dst)
++                .await
++                .unwrap();
++            let payload: Vec<_> = (0..180_000).map(|i| (i % 251) as u8).collect();
++            stream.write_all(&payload).await.unwrap();
++            stream.shutdown().await.unwrap();
++            let mut result = Vec::new();
++            stream.read_to_end(&mut result).await.unwrap();
++            assert_eq!(result, payload, "{method}");
++            echo_task.await.unwrap();
++        })
++        .await
++        .unwrap_or_else(|_| panic!("{method} timeout"));
++    }
++}
++
++#[tokio::test]
++async fn seven_methods_udp_roundtrip_and_tamper_rejection() {
++    for method in METHODS {
++        timeout(Duration::from_secs(5), async {
++            let (cipher, password, key) = credentials(method);
++            let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
++            let addr = target.local_addr().unwrap();
++            let port = inbound(method, &password).await;
++            let mut client = vp_protocol::udp_out::SsUdpConn::bind(
++                "127.0.0.1",
++                port,
++                cipher.clone(),
++                key.clone(),
++            )
++            .await
++            .unwrap();
++            for size in [0, 128, 4096] {
++                let data = vec![0x5a; size];
++                client
++                    .send(&UdpPacket {
++                        src: "127.0.0.1:1".parse().unwrap(),
++                        dst: addr,
++                        data: data.clone().into(),
++                    })
++                    .await
++                    .unwrap();
++                let mut buffer = vec![0; 8192];
++                let (n, from) = target.recv_from(&mut buffer).await.unwrap();
++                assert_eq!(&buffer[..n], &data);
++                target.send_to(&buffer[..n], from).await.unwrap();
++                let result = client.recv().await.unwrap();
++                assert_eq!(result.src, addr);
++                assert_eq!(&result.data[..], &data);
++            }
++            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
++            let mut plain = Vec::new();
++            vp_common::addr::encode_socks_addr(&DstAddr::ip(addr.ip(), addr.port()), &mut plain);
++            plain.extend_from_slice(b"must-not-arrive");
++            let mut packet = cipher.seal_udp(&key, &plain, 55, 0, None).unwrap();
++            *packet.last_mut().unwrap() ^= 1;
++            socket.send_to(&packet, ("127.0.0.1", port)).await.unwrap();
++            assert!(
++                timeout(Duration::from_millis(80), target.recv_from(&mut [0; 100]))
++                    .await
++                    .is_err(),
++                "{method} forwarded tampered packet"
++            );
++        })
++        .await
++        .unwrap_or_else(|_| panic!("{method} timeout"));
++    }
++}
++
++#[tokio::test]
++async fn ss2022_udp_replay_and_mobility() {
++    for method in &METHODS[4..] {
++        let (cipher, password, key) = credentials(method);
++        let port = inbound(method, &password).await;
++        let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
++        let addr = target.local_addr().unwrap();
++        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
++        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
++        let mut plain = Vec::new();
++        vp_common::addr::encode_socks_addr(&DstAddr::ip(addr.ip(), addr.port()), &mut plain);
++        plain.extend_from_slice(b"mobility");
++        let request = cipher.seal_udp(&key, &plain, 1234, 0, None).unwrap();
++        a.send_to(&request, ("127.0.0.1", port)).await.unwrap();
++        let (_, initial_source) = timeout(Duration::from_secs(2), target.recv_from(&mut [0; 128]))
++            .await
++            .unwrap()
++            .unwrap();
++        // Duplicates from a different address are still replays, not new sessions.
++        b.send_to(&request, ("127.0.0.1", port)).await.unwrap();
++        assert!(
++            timeout(Duration::from_millis(80), target.recv_from(&mut [0; 128]))
++                .await
++                .is_err()
++        );
++        let second = cipher.seal_udp(&key, &plain, 1234, 1, None).unwrap();
++        b.send_to(&second, ("127.0.0.1", port)).await.unwrap();
++        let (_, next_source) = timeout(Duration::from_secs(2), target.recv_from(&mut [0; 128]))
++            .await
++            .unwrap()
++            .unwrap();
++        assert_eq!(
++            initial_source, next_source,
++            "session must retain outgoing socket across client address changes"
++        );
++        target.send_to(b"reply", next_source).await.unwrap();
++        let mut buf = [0; 512];
++        let (n, _) = timeout(Duration::from_secs(2), b.recv_from(&mut buf))
++            .await
++            .unwrap()
++            .unwrap();
++        let response = cipher.open_udp(&key, &buf[..n], true).unwrap();
++        assert_eq!(response.client_session_id, Some(1234));
++        assert_ne!(response.session_id, 1234);
++        assert!(
++            timeout(Duration::from_millis(80), a.recv_from(&mut buf))
++                .await
++                .is_err()
++        );
++    }
++}
++
++fn request(
++    cipher: &Cipher,
++    key: &[u8],
++    salt: &[u8],
++    addr: SocketAddr,
++    timestamp: u64,
++    kind: u8,
++    padding: usize,
++    early: &[u8],
++) -> Vec<u8> {
++    let mut variable = Vec::new();
++    vp_common::addr::encode_socks_addr(&DstAddr::ip(addr.ip(), addr.port()), &mut variable);
++    variable.extend_from_slice(&(padding as u16).to_be_bytes());
++    variable.resize(variable.len() + padding, 0x11);
++    variable.extend_from_slice(early);
++    let mut header = vec![kind];
++    header.extend_from_slice(&timestamp.to_be_bytes());
++    header.extend_from_slice(&(variable.len() as u16).to_be_bytes());
++    let sub = cipher.subkey(key, salt).unwrap();
++    let mut codec = AeadChunkCodec::new(cipher, &sub).unwrap();
++    let mut wire = salt.to_vec();
++    wire.extend_from_slice(&codec.seal_record(&header));
++    wire.extend_from_slice(&codec.seal_record(&variable));
++    wire
++}
++
++#[tokio::test]
++async fn ss2022_tcp_replay_wrong_key_type_timestamp_padding_and_early_data() {
++    for method in &METHODS[4..] {
++        let (cipher, password, key) = credentials(method);
++        let port = inbound(method, &password).await;
++        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let addr = target.local_addr().unwrap();
++        let mut salt = vec![0; cipher.salt_len()];
++        vp_common::rand_bytes(&mut salt);
++        let good = request(
++            &cipher,
++            &key,
++            &salt,
++            addr,
++            vp_crypto::ss::unix_seconds(),
++            0,
++            0,
++            b"early-data",
++        );
++        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
++        client.write_all(&good).await.unwrap();
++        let (mut remote, _) = timeout(Duration::from_secs(2), target.accept())
++            .await
++            .unwrap()
++            .unwrap();
++        let mut early = [0; 10];
++        timeout(Duration::from_secs(2), remote.read_exact(&mut early))
++            .await
++            .unwrap()
++            .unwrap();
++        assert_eq!(
++            &early, b"early-data",
++            "authenticated early plaintext must not be passed back into the ciphertext decoder"
++        );
++        drop(remote);
++        drop(client);
++        let mut wrong_key = key.clone();
++        wrong_key[0] ^= 1;
++        let mut new_salt = salt.clone();
++        new_salt[0] ^= 1;
++        for packet in [
++            good,
++            request(
++                &cipher,
++                &wrong_key,
++                &new_salt,
++                addr,
++                vp_crypto::ss::unix_seconds(),
++                0,
++                1,
++                b"",
++            ),
++            request(
++                &cipher,
++                &key,
++                &new_salt,
++                addr,
++                vp_crypto::ss::unix_seconds() - 31,
++                0,
++                1,
++                b"",
++            ),
++            request(
++                &cipher,
++                &key,
++                &new_salt,
++                addr,
++                vp_crypto::ss::unix_seconds(),
++                1,
++                1,
++                b"",
++            ),
++            request(
++                &cipher,
++                &key,
++                &new_salt,
++                addr,
++                vp_crypto::ss::unix_seconds(),
++                0,
++                0,
++                b"",
++            ),
++            vec![0; 1],
++        ] {
++            let mut bad = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
++            let _ = bad.write_all(&packet).await;
++            assert!(
++                timeout(Duration::from_millis(80), target.accept())
++                    .await
++                    .is_err(),
++                "{method} forwarded invalid request"
++            );
++        }
++    }
++}
++
++#[tokio::test]
++async fn ss2022_client_rejects_misassociated_tcp_response() {
++    for method in &METHODS[4..] {
++        let (cipher, password, key) = credentials(method);
++        let fake = TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let port = fake.local_addr().unwrap().port();
++        let peer = tokio::spawn(async move {
++            let (mut stream, _) = fake.accept().await.unwrap();
++            let mut request_salt = vec![0; cipher.salt_len()];
++            stream.read_exact(&mut request_salt).await.unwrap();
++            request_salt[0] ^= 1;
++            let own_salt = vec![0x77; cipher.salt_len()];
++            let mut enc =
++                AeadChunkCodec::new(&cipher, &cipher.subkey(&key, &own_salt).unwrap()).unwrap();
++            let mut fixed = vec![1];
++            fixed.extend_from_slice(&vp_crypto::ss::unix_seconds().to_be_bytes());
++            fixed.extend_from_slice(&request_salt);
++            fixed.extend_from_slice(&4u16.to_be_bytes());
++            let mut response = own_salt;
++            response.extend_from_slice(&enc.seal_record(&fixed));
++            response.extend_from_slice(&enc.seal_record(b"evil"));
++            stream.write_all(&response).await.unwrap();
++            // Stay alive until the client validates, avoiding an unread-data RST.
++            tokio::time::sleep(Duration::from_millis(100)).await;
++        });
++        let out = outbound(method, &password, port);
++        let dst = DstAddr::ip("127.0.0.1".parse().unwrap(), 80);
++        let mut stream = out
++            .connect_stream(&Session::new_tcp("test".into(), None, dst.clone()), &dst)
++            .await
++            .unwrap();
++        let error = timeout(Duration::from_secs(2), stream.read_exact(&mut [0; 4]))
++            .await
++            .unwrap()
++            .unwrap_err();
++        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
++        peer.await.unwrap();
++    }
++}
++
++#[tokio::test]
++async fn ss2022_udp_invalid_association_does_not_poison_replay_window() {
++    for method in &METHODS[4..] {
++        let (cipher, _, key) = credentials(method);
++        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
++        let mut client = vp_protocol::udp_out::SsUdpConn::bind(
++            "127.0.0.1",
++            peer.local_addr().unwrap().port(),
++            cipher.clone(),
++            key.clone(),
++        )
++        .await
++        .unwrap();
++        let target: SocketAddr = "127.0.0.1:12345".parse().unwrap();
++        client
++            .send(&UdpPacket {
++                src: target,
++                dst: target,
++                data: b"request"[..].into(),
++            })
++            .await
++            .unwrap();
++        let mut buffer = [0; 1024];
++        let (n, from) = peer.recv_from(&mut buffer).await.unwrap();
++        let request = cipher.open_udp(&key, &buffer[..n], false).unwrap();
++        let mut payload = Vec::new();
++        vp_common::addr::encode_socks_addr(&DstAddr::ip(target.ip(), target.port()), &mut payload);
++        payload.extend_from_slice(b"good");
++        let server_id = request.session_id.wrapping_add(1);
++        let bad = cipher
++            .seal_udp(&key, &payload, server_id, 42, Some(request.session_id ^ 1))
++            .unwrap();
++        peer.send_to(&bad, from).await.unwrap();
++        let good = cipher
++            .seal_udp(&key, &payload, server_id, 42, Some(request.session_id))
++            .unwrap();
++        peer.send_to(&good, from).await.unwrap();
++        let response = timeout(Duration::from_secs(2), client.recv())
++            .await
++            .unwrap()
++            .unwrap();
++        assert_eq!(&response.data[..], b"good");
++    }
++}
++
++#[tokio::test]
++async fn encrypted_stream_handles_backpressure_without_duplicate_plaintext() {
++    for method in METHODS {
++        let (cipher, _, key) = credentials(method);
++        let (writer, mut wire) = tokio::io::duplex(7);
++        let decode_cipher = cipher.clone();
++        let decode_key = key.clone();
++        let consumer = tokio::spawn(async move {
++            let mut salt = vec![0; decode_cipher.salt_len()];
++            wire.read_exact(&mut salt).await.unwrap();
++            let mut dec = AeadChunkCodec::new(
++                &decode_cipher,
++                &decode_cipher.subkey(&decode_key, &salt).unwrap(),
++            )
++            .unwrap();
++            let mut raw = Vec::new();
++            wire.read_to_end(&mut raw).await.unwrap();
++            let mut offset = 0;
++            if decode_cipher.is_2022 {
++                let header = dec.open_record(&raw[..27]).unwrap();
++                let size = u16::from_be_bytes(header[9..11].try_into().unwrap()) as usize;
++                dec.open_record(&raw[27..27 + size + 16]).unwrap();
++                offset = 27 + size + 16;
++            } else {
++                let (_, used) = dec.try_open_chunk(&raw).unwrap().unwrap();
++                offset += used;
++            }
++            let mut plain = Vec::new();
++            while offset < raw.len() {
++                let (body, used) = dec.try_open_chunk(&raw[offset..]).unwrap().unwrap();
++                plain.extend_from_slice(&body);
++                offset += used;
++            }
++            plain
++        });
++        let mut address = Vec::new();
++        vp_common::addr::encode_socks_addr(
++            &DstAddr::ip("127.0.0.1".parse().unwrap(), 1234),
++            &mut address,
++        );
++        let mut stream =
++            vp_protocol::ss::SsCryptoStream::new_client(writer, cipher, key, address).unwrap();
++        let data = vec![0x43; 35_000];
++        timeout(Duration::from_secs(2), async {
++            stream.write_all(&data).await.unwrap();
++            stream.shutdown().await.unwrap();
++        })
++        .await
++        .unwrap();
++        assert_eq!(consumer.await.unwrap(), data, "{method}");
++    }
++}
++
++async fn ipv6_loopback() -> UdpSocket {
++    UdpSocket::bind("[::1]:0").await.unwrap_or_else(|error| {
++        panic!(
++            "IPv6 loopback is unavailable; mixed-family acceptance is BLOCKED, not passed: {error}"
++        )
++    })
++}
++
++#[tokio::test]
++async fn seven_methods_single_udp_session_mixes_ipv4_ipv6_with_one_source_port() {
++    for method in METHODS {
++        timeout(Duration::from_secs(5), async {
++            let (cipher, password, key) = credentials(method);
++            let port = inbound(method, &password).await;
++            let ipv4 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
++            let ipv6 = ipv6_loopback().await;
++            let mut client = vp_protocol::udp_out::SsUdpConn::bind("127.0.0.1", port, cipher, key)
++                .await
++                .unwrap();
++            let mut source_port = None;
++            for (index, target) in [&ipv4, &ipv6, &ipv4, &ipv6].into_iter().enumerate() {
++                let dst = target.local_addr().unwrap();
++                let data = vec![0x30 + index as u8; 200 + index * 1024];
++                client
++                    .send(&UdpPacket {
++                        src: dst,
++                        dst,
++                        data: data.clone().into(),
++                    })
++                    .await
++                    .unwrap();
++                let mut buffer = [0; 8192];
++                let (n, from) = target.recv_from(&mut buffer).await.unwrap();
++                assert_eq!(&buffer[..n], &data);
++                assert_eq!(from.is_ipv4(), dst.is_ipv4());
++                if let Some(previous) = source_port {
++                    assert_eq!(
++                        from.port(),
++                        previous,
++                        "{method}: one session must retain one outgoing source port across families"
++                    );
++                } else {
++                    source_port = Some(from.port());
++                }
++                target.send_to(&buffer[..n], from).await.unwrap();
++                let response = client.recv().await.unwrap();
++                assert_eq!(
++                    response.src, dst,
++                    "{method}: IPv4-mapped response addresses must be canonicalized"
++                );
++                assert_eq!(&response.data[..], &data);
++            }
++            // An explicitly mapped address denotes the same IPv4 endpoint.
++            let v4 = match ipv4.local_addr().unwrap() {
++                SocketAddr::V4(v4) => v4,
++                _ => unreachable!(),
++            };
++            let mapped = SocketAddr::new(v4.ip().to_ipv6_mapped().into(), v4.port());
++            client
++                .send(&UdpPacket {
++                    src: mapped,
++                    dst: mapped,
++                    data: b"mapped"[..].into(),
++                })
++                .await
++                .unwrap();
++            let mut buffer = [0; 1024];
++            let (n, from) = ipv4.recv_from(&mut buffer).await.unwrap();
++            assert_eq!(Some(from.port()), source_port);
++            ipv4.send_to(&buffer[..n], from).await.unwrap();
++            assert_eq!(client.recv().await.unwrap().src, ipv4.local_addr().unwrap());
++        })
++        .await
++        .unwrap_or_else(|_| panic!("{method}: mixed-family timeout"));
++    }
++}
++
++#[tokio::test]
++async fn ss2022_mixed_family_replies_reject_unsolicited_plaintext_sources() {
++    for method in &METHODS[4..] {
++        let (cipher, password, key) = credentials(method);
++        let port = inbound(method, &password).await;
++        let target4 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
++        let target6 = ipv6_loopback().await;
++        let attacker4 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
++        let attacker6 = ipv6_loopback().await;
++        let mut client = vp_protocol::udp_out::SsUdpConn::bind("127.0.0.1", port, cipher, key)
++            .await
++            .unwrap();
++        for (target, attacker) in [(&target4, &attacker4), (&target6, &attacker6)] {
++            let dst = target.local_addr().unwrap();
++            client
++                .send(&UdpPacket {
++                    src: dst,
++                    dst,
++                    data: b"authorized"[..].into(),
++                })
++                .await
++                .unwrap();
++            let mut buffer = [0; 1024];
++            let (_, relay) = timeout(Duration::from_secs(2), target.recv_from(&mut buffer))
++                .await
++                .unwrap()
++                .unwrap();
++            attacker.send_to(b"unsolicited", relay).await.unwrap();
++            assert!(
++                timeout(Duration::from_millis(80), client.recv())
++                    .await
++                    .is_err(),
++                "{method}: authenticated association must not encrypt unsolicited plaintext source"
++            );
++            target.send_to(b"authorized-reply", relay).await.unwrap();
++            let response = timeout(Duration::from_secs(2), client.recv())
++                .await
++                .unwrap()
++                .unwrap();
++            assert_eq!(response.src, dst);
++            assert_eq!(&response.data[..], b"authorized-reply");
++        }
++    }
++}
++
++#[tokio::test]
++async fn ss2022_mixed_family_target_quota_preserves_established_destinations() {
++    let method = "2022-blake3-aes-128-gcm";
++    let (cipher, password, key) = credentials(method);
++    let port = inbound(method, &password).await;
++    let client = vp_protocol::udp_out::SsUdpConn::bind("127.0.0.1", port, cipher, key)
++        .await
++        .unwrap();
++    let mut targets = Vec::new();
++    let mut source_port = None;
++    for index in 0..65 {
++        let target = if index % 2 == 0 {
++            UdpSocket::bind("127.0.0.1:0").await.unwrap()
++        } else {
++            ipv6_loopback().await
++        };
++        let dst = target.local_addr().unwrap();
++        client
++            .send(&UdpPacket {
++                src: dst,
++                dst,
++                data: b"quota"[..].into(),
++            })
++            .await
++            .unwrap();
++        if index < 64 {
++            let (_, source) = timeout(Duration::from_secs(2), target.recv_from(&mut [0; 100]))
++                .await
++                .unwrap()
++                .unwrap();
++            if let Some(previous) = source_port {
++                assert_eq!(source.port(), previous)
++            } else {
++                source_port = Some(source.port())
++            }
++        } else {
++            assert!(
++                timeout(Duration::from_millis(80), target.recv_from(&mut [0; 100]))
++                    .await
++                    .is_err(),
++                "65th distinct target must fail closed instead of evicting an established destination"
++            );
++        }
++        targets.push(target);
++    }
++    // Capacity failure does not discard the authenticated session, replay state,
++    // stable source port, or existing target authorization.
++    let target = &targets[1];
++    let dst = target.local_addr().unwrap();
++    client
++        .send(&UdpPacket {
++            src: dst,
++            dst,
++            data: b"existing-still-works"[..].into(),
++        })
++        .await
++        .unwrap();
++    let mut data = [0; 100];
++    let (n, source) = timeout(Duration::from_secs(2), target.recv_from(&mut data))
++        .await
++        .unwrap()
++        .unwrap();
++    assert_eq!(&data[..n], b"existing-still-works");
++    assert_eq!(Some(source.port()), source_port);
++}

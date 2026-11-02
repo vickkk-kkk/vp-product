@@ -1,0 +1,7 @@
+ss://aes-128-gcm:fixture-password-not-real@proxy.example.invalid:8388#Synthetic%20SS
+socks5://fixture-user:fixture-password-not-real@[2001:db8::1]:1080#Synthetic%20SOCKS
+vmess://00000000-0000-4000-8000-000000000001@proxy.example.invalid:443?security=tls&type=ws&host=front.example.invalid&path=%2Fws%3Fed%3D0&sni=proxy.example.invalid&fp=chrome#Synthetic%20VMess
+vless://00000000-0000-4000-8000-000000000001@proxy.example.invalid:443?security=reality&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=abcd&fp=chrome&flow=xtls-rprx-vision#Synthetic%20VLESS
+trojan://fixture-password-not-real@proxy.example.invalid:443?sni=proxy.example.invalid#Synthetic%20Trojan
+hy2://fixture-password-not-real@proxy.example.invalid?sni=proxy.example.invalid&obfs=salamander&obfs-password=fixture-obfs-not-real#Synthetic%20HY2
+anytls://fixture-password-not-real@[2001:db8::1]?sni=proxy.example.invalid#Synthetic%20AnyTLS

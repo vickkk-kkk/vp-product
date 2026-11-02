@@ -1,0 +1,92 @@
+From 4907383f1e8bfd7ee45e47dafca3480ee4772452 Mon Sep 17 00:00:00 2001
+From: VP implementation <vp-local@example.invalid>
+Date: Fri, 30 Oct 2026 12:17:02 +0900
+Subject: [PATCH] Fix TLSInnerPlaintext padding without corrupting trailing
+ payload zeros
+
+---
+ crates/vp-transport/src/utls.rs | 60 +++++++++++++++++++++++++++++----
+ 1 file changed, 54 insertions(+), 6 deletions(-)
+
+diff --git a/crates/vp-transport/src/utls.rs b/crates/vp-transport/src/utls.rs
+index 95d3b28..4c7f9db 100644
+--- a/crates/vp-transport/src/utls.rs
++++ b/crates/vp-transport/src/utls.rs
+@@ -427,13 +427,19 @@ impl Direction {
+         if plain.is_empty() {
+             return Err(Error::Proto("utls: 空记录"));
+         }
+-        // 末字节为 inner content type，其前全零为 padding
+-        let inner = plain[plain.len() - 1];
+-        let mut end = plain.len() - 1;
+-        while end > 0 && plain[end - 1] == 0 {
+-            end -= 1;
++        // RFC 8446 §§5.2, 5.4: content || type || zero-padding.
++        // Scan AFTER decryption from the end for the last nonzero octet.
++        // Zeros before that octet belong to the application/handshake payload
++        // and must not be stripped (e.g. H2 SETTINGS and close_notify [1, 0]).
++        let type_pos = plain
++            .iter()
++            .rposition(|byte| *byte != 0)
++            .ok_or(Error::Proto("utls: 全零内部明文缺少内容类型"))?;
++        let inner = plain[type_pos];
++        if !matches!(inner, REC_APPDATA | REC_HANDSHAKE | REC_ALERT) {
++            return Err(Error::Proto("utls: 非法内部内容类型"));
+         }
+-        Ok((inner, plain[..end].to_vec()))
++        Ok((inner, plain[..type_pos].to_vec()))
+     }
+ 
+     /// 密钥更新（KeyUpdate）：traffic upd
+@@ -1449,6 +1455,48 @@ mod tests {
+     use super::*;
+     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+ 
++    fn open_inner_plaintext_fixture(bytes: &[u8]) -> Result<(u8, Vec<u8>)> {
++        let suite = suite_def(SUITE_AES128).unwrap();
++        let mut secret = [0; 32];
++        vp_common::rand_bytes(&mut secret);
++        let mut tx = Direction::new(suite, &secret).unwrap();
++        let mut rx = Direction::new(suite, &secret).unwrap();
++        let length = bytes.len() + 16;
++        let header = [REC_APPDATA, 3, 3, (length >> 8) as u8, length as u8];
++        let mut ciphertext = BytesMut::from(bytes);
++        tx.seal(&header, &mut ciphertext).unwrap();
++        rx.open(&header, &ciphertext)
++    }
++
++    #[test]
++    fn tls_inner_plaintext_preserves_trailing_content_zeros() {
++        for padding in [0, 1, 31] {
++            let mut inner = vec![7, 0, 0, REC_APPDATA];
++            inner.resize(inner.len() + padding, 0);
++            assert_eq!(
++                open_inner_plaintext_fixture(&inner).unwrap(),
++                (REC_APPDATA, vec![7, 0, 0])
++            );
++            let mut alert = vec![1, 0, REC_ALERT];
++            alert.resize(alert.len() + padding, 0);
++            assert_eq!(
++                open_inner_plaintext_fixture(&alert).unwrap(),
++                (REC_ALERT, vec![1, 0])
++            );
++        }
++    }
++
++    #[test]
++    fn tls_inner_plaintext_rejects_missing_or_invalid_type() {
++        for invalid in [&[][..], &[0][..], &[0; 64][..], &[1, 2, 3, 0, 0][..]] {
++            assert!(open_inner_plaintext_fixture(invalid).is_err());
++        }
++        assert_eq!(
++            open_inner_plaintext_fixture(&[REC_APPDATA, 0]).unwrap(),
++            (REC_APPDATA, vec![])
++        );
++    }
++
+     fn init_log() {
+         let _ = tracing_subscriber::fmt()
+             .with_max_level(tracing::Level::TRACE)
+-- 
+2.52.0
+

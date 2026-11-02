@@ -1,0 +1,714 @@
+diff --git a/crates/vp-core/src/host_network.rs b/crates/vp-core/src/host_network.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..49b09f2277440d1ff53a34a0f4a26c04c86d2718
+--- /dev/null
++++ b/crates/vp-core/src/host_network.rs
+@@ -0,0 +1,183 @@
++//! Per-generation host socket authority. No process-wide network state.
++//! Mobile callers must install a host on TaskScope. Android fails closed if a
++//! task loses its scope. Protection runs after socket creation, before connect
++//! or any first send; RAII closes a rejected socket.
++use std::{io, net::SocketAddr, sync::Arc};
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum Protocol {
++    Tcp,
++    Udp,
++}
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum Purpose {
++    Proxy,
++    Dns,
++    Bootstrap,
++    Subscription,
++    ConnectivityCheck,
++}
++pub trait HostNetwork: Send + Sync {
++    fn before_connect(
++        &self,
++        socket: u64,
++        protocol: Protocol,
++        destination: SocketAddr,
++        purpose: Purpose,
++    ) -> io::Result<()>;
++    /// Explicit IP-only bootstrap resolvers; never OS getaddrinfo on mobile.
++    fn dns_servers(&self) -> Vec<SocketAddr>;
++}
++pub fn current() -> Option<Arc<dyn HostNetwork>> {
++    crate::task_scope::current_scope().and_then(|s| s.host_network())
++}
++pub fn requires_protection() -> bool {
++    cfg!(target_os = "android") || current().is_some()
++}
++#[cfg(unix)]
++fn native<T: std::os::fd::AsRawFd>(socket: &T) -> u64 {
++    socket.as_raw_fd() as u64
++}
++#[cfg(windows)]
++fn native<T: std::os::windows::io::AsRawSocket>(socket: &T) -> u64 {
++    socket.as_raw_socket() as u64
++}
++fn before(
++    socket: u64,
++    protocol: Protocol,
++    destination: SocketAddr,
++    purpose: Purpose,
++) -> io::Result<()> {
++    if let Some(host) = current() {
++        host.before_connect(socket, protocol, destination, purpose)
++    } else if cfg!(target_os = "android") {
++        Err(io::Error::new(
++            io::ErrorKind::PermissionDenied,
++            "Android host socket authority is missing",
++        ))
++    } else {
++        Ok(())
++    }
++}
++pub async fn connect_tcp(
++    destination: SocketAddr,
++    purpose: Purpose,
++) -> io::Result<tokio::net::TcpStream> {
++    let socket = if destination.is_ipv4() {
++        tokio::net::TcpSocket::new_v4()?
++    } else {
++        tokio::net::TcpSocket::new_v6()?
++    };
++    before(native(&socket), Protocol::Tcp, destination, purpose)?;
++    socket.connect(destination).await
++}
++pub fn udp_socket(destination: SocketAddr, purpose: Purpose) -> io::Result<std::net::UdpSocket> {
++    let bind = if destination.is_ipv4() {
++        "0.0.0.0:0"
++    } else {
++        "[::]:0"
++    };
++    let socket = std::net::UdpSocket::bind(bind)?;
++    before(native(&socket), Protocol::Udp, destination, purpose)?;
++    socket.set_nonblocking(true)?;
++    Ok(socket)
++}
++pub fn bind_udp(destination: SocketAddr, purpose: Purpose) -> io::Result<tokio::net::UdpSocket> {
++    tokio::net::UdpSocket::from_std(udp_socket(destination, purpose)?)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::task_scope::{DestinationPolicy, TaskScope};
++    use std::sync::atomic::{AtomicUsize, Ordering};
++    struct Host {
++        calls: AtomicUsize,
++        deny: bool,
++    }
++    impl HostNetwork for Host {
++        fn before_connect(&self, _: u64, _: Protocol, _: SocketAddr, _: Purpose) -> io::Result<()> {
++            self.calls.fetch_add(1, Ordering::SeqCst);
++            if self.deny {
++                Err(io::Error::new(io::ErrorKind::PermissionDenied, "test deny"))
++            } else {
++                Ok(())
++            }
++        }
++        fn dns_servers(&self) -> Vec<SocketAddr> {
++            vec![]
++        }
++    }
++    #[tokio::test]
++    async fn tcp_protection_precedes_connect_and_denial_prevents_peer_accept() {
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let addr = listener.local_addr().unwrap();
++        let host = Arc::new(Host {
++            calls: AtomicUsize::new(0),
++            deny: true,
++        });
++        let scope =
++            TaskScope::with_host_network(DestinationPolicy::Unrestricted, Some(host.clone()));
++        scope
++            .run(async {
++                assert_eq!(
++                    connect_tcp(addr, Purpose::Proxy).await.unwrap_err().kind(),
++                    io::ErrorKind::PermissionDenied
++                );
++                assert!(
++                    tokio::time::timeout(std::time::Duration::from_millis(30), listener.accept())
++                        .await
++                        .is_err()
++                );
++            })
++            .await;
++        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
++    }
++    #[tokio::test]
++    async fn inherited_task_protects_tcp_and_udp_exactly_once() {
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let addr = listener.local_addr().unwrap();
++        let host = Arc::new(Host {
++            calls: AtomicUsize::new(0),
++            deny: false,
++        });
++        let scope =
++            TaskScope::with_host_network(DestinationPolicy::Unrestricted, Some(host.clone()));
++        scope
++            .run(async {
++                let tcp =
++                    crate::task_scope::spawn(
++                        async move { connect_tcp(addr, Purpose::Proxy).await },
++                    )
++                    .await
++                    .unwrap()
++                    .unwrap();
++                drop(tcp);
++                drop(bind_udp(addr, Purpose::Dns).unwrap());
++            })
++            .await;
++        assert_eq!(host.calls.load(Ordering::SeqCst), 2);
++        assert_eq!(
++            scope
++                .shutdown(std::time::Duration::ZERO, std::time::Duration::from_secs(1))
++                .await
++                .remaining_tasks,
++            0
++        );
++    }
++    #[tokio::test]
++    async fn udp_denied_before_socket_return() {
++        let host = Arc::new(Host {
++            calls: AtomicUsize::new(0),
++            deny: true,
++        });
++        let scope =
++            TaskScope::with_host_network(DestinationPolicy::Unrestricted, Some(host.clone()));
++        scope
++            .run(async {
++                assert!(bind_udp("127.0.0.1:9".parse().unwrap(), Purpose::Dns).is_err());
++            })
++            .await;
++        assert_eq!(host.calls.load(Ordering::SeqCst), 1);
++    }
++}
+diff --git a/crates/vp-core/src/lib.rs b/crates/vp-core/src/lib.rs
+index ab328fbc9e76cb92c7618bbe7ee259f9184d7a3a..6c7637c54ce7c692a86c95f5ef59ab95fa5217b0 100644
+--- a/crates/vp-core/src/lib.rs
++++ b/crates/vp-core/src/lib.rs
+@@ -5,6 +5,7 @@
+ 
+ pub mod conn_table;
+ pub mod inbound;
++pub mod host_network;
+ pub mod outbound;
+ pub mod router;
+ pub mod session;
+diff --git a/crates/vp-core/src/task_scope.rs b/crates/vp-core/src/task_scope.rs
+index aaa76daf6156014a1dbe6c3f01db143e44cebfa2..95ef791929e430ec75f8aa7b158f2292a4dd9dd4 100644
+--- a/crates/vp-core/src/task_scope.rs
++++ b/crates/vp-core/src/task_scope.rs
+@@ -91,6 +91,7 @@ pub fn check_destination(dst: &vp_common::DstAddr) -> vp_common::Result<()> {
+ }
+ 
+ pub struct TaskScope {
++    host_network: Option<Arc<dyn crate::host_network::HostNetwork>>,
+     destination_policy: DestinationPolicy,
+     state: Mutex<State>,
+     changed: Notify,
+@@ -100,7 +101,14 @@ impl TaskScope {
+         Self::with_destination_policy(DestinationPolicy::Unrestricted)
+     }
+     pub fn with_destination_policy(destination_policy: DestinationPolicy) -> Arc<Self> {
++        Self::with_host_network(destination_policy, None)
++    }
++    pub fn with_host_network(
++        destination_policy: DestinationPolicy,
++        host_network: Option<Arc<dyn crate::host_network::HostNetwork>>,
++    ) -> Arc<Self> {
+         Arc::new(Self {
++            host_network,
+             destination_policy,
+             state: Mutex::new(State {
+                 phase: Phase::Running,
+@@ -113,6 +121,9 @@ impl TaskScope {
+             changed: Notify::new(),
+         })
+     }
++    pub fn host_network(&self) -> Option<Arc<dyn crate::host_network::HostNetwork>> {
++        self.host_network.clone()
++    }
+     fn lock(&self) -> MutexGuard<'_, State> {
+         self.state.lock().unwrap_or_else(|error| error.into_inner())
+     }
+diff --git a/crates/vp-dns/src/lib.rs b/crates/vp-dns/src/lib.rs
+index c7e88f0c00780d1caa091341df8b0fc1b65caa1d..4971bd7e7af0b3dfa517aa62561e5a7d7a2c6858 100644
+--- a/crates/vp-dns/src/lib.rs
++++ b/crates/vp-dns/src/lib.rs
+@@ -12,7 +12,8 @@ use std::net::{IpAddr, SocketAddr};
+ use std::sync::{Arc, Mutex};
+ use std::time::{Duration, Instant};
+ 
+-use tokio::net::{TcpStream, UdpSocket};
++#[cfg(test)]
++use tokio::net::UdpSocket;
+ use tokio::time::timeout;
+ use vp_common::{Error, Host, Result};
+ 
+@@ -352,7 +353,9 @@ impl Resolver {
+         for (idx, server) in servers.iter().enumerate() {
+             let server = server.clone();
+             let domain = domain.to_string();
+-            set.spawn(async move { (idx, query_server(&server, &domain, qtype).await) });
++            vp_core::task_scope::spawn_in(&mut set, async move {
++                (idx, query_server(&server, &domain, qtype).await)
++            });
+         }
+ 
+         let mut merged: Vec<(usize, Vec<IpAddr>)> = Vec::new();
+@@ -384,6 +387,11 @@ impl Resolver {
+     }
+ 
+     async fn system_lookup(&self, domain: &str) -> Result<Arc<Vec<IpAddr>>> {
++        if vp_core::host_network::requires_protection() {
++            return Err(Error::Unsupported(
++                "unprotected system DNS is disabled".into(),
++            ));
++        }
+         let d = domain.to_string();
+         let addrs = tokio::task::spawn_blocking(move || {
+             use std::net::ToSocketAddrs;
+@@ -623,7 +631,8 @@ async fn query_udp(addr: SocketAddr, domain: &str, qtype: QType) -> Result<wire:
+     } else {
+         "[::]:0".parse().unwrap()
+     };
+-    let sock = UdpSocket::bind(bind).await?;
++    let _ = bind;
++    let sock = vp_core::host_network::bind_udp(addr, vp_core::host_network::Purpose::Dns)?;
+     sock.connect(addr).await?;
+     let id = query_id();
+     let q = wire::build_query(id, domain, qtype);
+@@ -635,7 +644,11 @@ async fn query_udp(addr: SocketAddr, domain: &str, qtype: QType) -> Result<wire:
+ 
+ async fn query_tcp(addr: SocketAddr, domain: &str, qtype: QType) -> Result<wire::Message> {
+     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+-    let mut stream = with_timeout(TcpStream::connect(addr)).await?;
++    let mut stream = with_timeout(vp_core::host_network::connect_tcp(
++        addr,
++        vp_core::host_network::Purpose::Dns,
++    ))
++    .await?;
+     let id = query_id();
+     let q = wire::build_query(id, domain, qtype);
+     let mut framed = Vec::with_capacity(q.len() + 2);
+@@ -661,7 +674,7 @@ async fn query_tls(
+ 
+     let connector = webpki_connector(false);
+     let sni = server_name(sni_host, addr.ip())?;
+-    let tcp = tokio::net::TcpStream::connect(addr).await?;
++    let tcp = vp_core::host_network::connect_tcp(addr, vp_core::host_network::Purpose::Dns).await?;
+     let mut tls = connector.connect(sni, tcp).await?;
+ 
+     let id = query_id();
+@@ -786,6 +799,11 @@ async fn query_doh(server: &ServerAddr, domain: &str, qtype: QType) -> Result<wi
+     let addr: SocketAddr = match server.addr {
+         Some(a) => a,
+         None => {
++            if vp_core::host_network::requires_protection() {
++                return Err(Error::Unsupported(
++                    "DoH bootstrap requires an explicit IP address".into(),
++                ));
++            }
+             let d = server.host.clone();
+             let port = server.port;
+             let mut addrs = tokio::task::spawn_blocking(move || {
+@@ -802,7 +820,11 @@ async fn query_doh(server: &ServerAddr, domain: &str, qtype: QType) -> Result<wi
+     // 2) TLS
+     let connector = webpki_connector(server.skip_verify);
+     let sni = server_name(&server.host, addr.ip())?;
+-    let tcp = with_timeout(tokio::net::TcpStream::connect(addr)).await?;
++    let tcp = with_timeout(vp_core::host_network::connect_tcp(
++        addr,
++        vp_core::host_network::Purpose::Dns,
++    ))
++    .await?;
+     let mut tls = with_timeout(connector.connect(sni, tcp)).await?;
+ 
+     // 3) HTTP/1.1 POST（application/dns-message）
+@@ -1271,3 +1293,40 @@ mod tests {
+         assert_eq!(ips[0].to_string(), "1.1.1.1");
+     }
+ }
++
++/// Protected node/bootstrap lookup. Numeric addresses bypass DNS. OS DNS is never
++/// used by a protected generation; resolver list comes from its host context.
++pub async fn lookup_host(host: &str, port: u16) -> std::io::Result<std::vec::IntoIter<SocketAddr>> {
++    if let Ok(ip) = host.parse::<IpAddr>() {
++        return Ok(vec![SocketAddr::new(ip, port)].into_iter());
++    }
++    if vp_core::host_network::requires_protection() {
++        let host_network = vp_core::host_network::current().ok_or_else(|| {
++            std::io::Error::new(
++                std::io::ErrorKind::PermissionDenied,
++                "missing host resolver",
++            )
++        })?;
++        let servers = host_network.dns_servers();
++        if servers.is_empty() {
++            return Err(std::io::Error::new(
++                std::io::ErrorKind::PermissionDenied,
++                "missing explicit DNS servers",
++            ));
++        }
++        let resolver = Resolver::new(servers.iter().map(ToString::to_string).collect());
++        let ips = resolver
++            .resolve_domain(host, false)
++            .await
++            .map_err(|_| std::io::Error::other("protected DNS failed"))?;
++        return Ok(ips
++            .iter()
++            .map(|ip| SocketAddr::new(*ip, port))
++            .collect::<Vec<_>>()
++            .into_iter());
++    }
++    Ok(tokio::net::lookup_host((host, port))
++        .await?
++        .collect::<Vec<_>>()
++        .into_iter())
++}
+diff --git a/crates/vp-protocol/src/basic_out.rs b/crates/vp-protocol/src/basic_out.rs
+index 43c4bad09f252a75bef2b021184adb93c5e6c734..17d42c1f4f719c9094f33d474cb93e94981a0092 100644
+--- a/crates/vp-protocol/src/basic_out.rs
++++ b/crates/vp-protocol/src/basic_out.rs
+@@ -53,7 +53,7 @@ impl Socks5Outbound {
+         let has_auth = self.username.is_some();
+         // greeting
+         if has_auth {
+-            io.write_all(&[0x05, 0x02, 0x00, 0x02]).await?;
++            io.write_all(&[0x05, 0x01, 0x02]).await?;
+         } else {
+             io.write_all(&[0x05, 0x01, 0x00]).await?;
+         }
+@@ -78,7 +78,7 @@ impl Socks5Outbound {
+             if r[1] != 0x00 {
+                 return Err(Error::Proto("socks5 出站: 认证失败"));
+             }
+-        } else if b[1] != 0x00 {
++        } else if b[1] != 0x00 || has_auth {
+             return Err(Error::Proto("socks5 出站: 不支持的认证方式"));
+         }
+         // CONNECT
+diff --git a/crates/vp-protocol/src/direct.rs b/crates/vp-protocol/src/direct.rs
+index d859f9346a95921937c6a5be7400cab817036c85..1a82710a3e606ffd543e7e6dd04df5ab5a2513da 100644
+--- a/crates/vp-protocol/src/direct.rs
++++ b/crates/vp-protocol/src/direct.rs
+@@ -84,7 +84,7 @@ impl Outbound for DirectOutbound {
+         } else {
+             "0.0.0.0:0".parse().unwrap()
+         };
+-        let sock = tokio::net::UdpSocket::bind(bind).await?;
++        let _ = bind;
+         let target = match &dst.host {
+             Host::Ip(ip) => std::net::SocketAddr::new(*ip, dst.port),
+             Host::Domain(d) => {
+@@ -92,6 +92,7 @@ impl Outbound for DirectOutbound {
+                 std::net::SocketAddr::new(ips[0], dst.port)
+             }
+         };
++        let sock = vp_core::host_network::bind_udp(target, vp_core::host_network::Purpose::Proxy)?;
+         sock.connect(target).await?;
+         Ok(Box::new(DirectPacket { sock, target }))
+     }
+diff --git a/crates/vp-protocol/src/hysteria2.rs b/crates/vp-protocol/src/hysteria2.rs
+index 06f05dec6a68b792d35e46bae5e7000aae1d27a2..833bf125840e2a6b0d50256a1c6fa22d73e2a440 100644
+--- a/crates/vp-protocol/src/hysteria2.rs
++++ b/crates/vp-protocol/src/hysteria2.rs
+@@ -310,12 +310,17 @@ impl Hysteria2Outbound {
+     }
+ 
+     async fn connect_quic(&self) -> Result<(quinn::Connection, quinn::Endpoint)> {
+-        let addr: SocketAddr = tokio::net::lookup_host((self.server.as_str(), self.port))
++        let addr: SocketAddr = vp_dns::lookup_host(self.server.as_str(), self.port)
+             .await
+             .map_err(|e| Error::Addr(format!("解析 {}: {e}", self.server)))?
+             .next()
+             .ok_or(Error::Addr("无地址".into()))?;
+-        let mut ep = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
++        let mut ep = quinn::Endpoint::new(
++            quinn::EndpointConfig::default(),
++            None,
++            vp_core::host_network::udp_socket(addr, vp_core::host_network::Purpose::Proxy)?,
++            Arc::new(quinn::TokioRuntime),
++        )?;
+         ep.set_default_client_config(self.client_config.clone());
+         let conn = ep
+             .connect(addr, self.sni.as_deref().unwrap_or(&self.server))
+diff --git a/crates/vp-protocol/src/tuic.rs b/crates/vp-protocol/src/tuic.rs
+index a6b5227371f2182e908d047a3d61fec2728d226e..836b336168609c1f1f3ff3a79cb8b1aa641451fa 100644
+--- a/crates/vp-protocol/src/tuic.rs
++++ b/crates/vp-protocol/src/tuic.rs
+@@ -191,12 +191,17 @@ impl TuicOutbound {
+ 
+     /// QUIC 连接 + Authenticate
+     async fn dial(&self) -> Result<quinn::Connection> {
+-        let addr: SocketAddr = tokio::net::lookup_host((self.server.as_str(), self.port))
++        let addr: SocketAddr = vp_dns::lookup_host(self.server.as_str(), self.port)
+             .await
+             .map_err(|e| Error::Addr(format!("解析 {}: {e}", self.server)))?
+             .next()
+             .ok_or(Error::Addr("无地址".into()))?;
+-        let mut ep = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
++        let mut ep = quinn::Endpoint::new(
++            quinn::EndpointConfig::default(),
++            None,
++            vp_core::host_network::udp_socket(addr, vp_core::host_network::Purpose::Proxy)?,
++            Arc::new(quinn::TokioRuntime),
++        )?;
+         ep.set_default_client_config(self.client_config.clone());
+         let conn = ep
+             .connect(addr, self.sni.as_deref().unwrap_or(&self.server))
+diff --git a/crates/vp-protocol/src/udp_out.rs b/crates/vp-protocol/src/udp_out.rs
+index f2d3ec1c95f5e9bcebf0f73b996aa5f8a17c4f71..27901dc95b4bbb14d36322f35e568dbdd9fa029d 100644
+--- a/crates/vp-protocol/src/udp_out.rs
++++ b/crates/vp-protocol/src/udp_out.rs
+@@ -32,7 +32,7 @@ pub async fn socks5_udp_connect(
+     // 握手（同 TCP 流程，目标为 0.0.0.0:0）
+     let has_auth = username.is_some();
+     if has_auth {
+-        ctrl.write_all(&[0x05, 0x02, 0x00, 0x02]).await?;
++        ctrl.write_all(&[0x05, 0x01, 0x02]).await?;
+     } else {
+         ctrl.write_all(&[0x05, 0x01, 0x00]).await?;
+     }
+@@ -52,7 +52,7 @@ pub async fn socks5_udp_connect(
+         if r[1] != 0x00 {
+             return Err(Error::Proto("socks5 udp: 认证失败"));
+         }
+-    } else if b[1] != 0x00 {
++    } else if b[1] != 0x00 || has_auth {
+         return Err(Error::Proto("socks5 udp: 认证方式不支持"));
+     }
+     // UDP ASSOCIATE 0.0.0.0:0
+@@ -88,15 +88,12 @@ pub async fn socks5_udp_connect(
+     }
+     let bind: std::net::SocketAddr = match &bound.host {
+         vp_common::Host::Ip(ip) => std::net::SocketAddr::new(*ip, bound.port),
+-        vp_common::Host::Domain(d) => {
+-            // 域名：解析（回环场景直接使用）
+-            match d.parse() {
+-                Ok(ip) => std::net::SocketAddr::new(ip, bound.port),
+-                Err(_) => std::net::SocketAddr::new([127, 0, 0, 1].into(), bound.port),
+-            }
+-        }
++        vp_common::Host::Domain(d) => vp_dns::lookup_host(d, bound.port)
++            .await?
++            .next()
++            .ok_or(Error::Addr("SOCKS relay has no address".into()))?,
+     };
+-    let relay = UdpSocket::bind("0.0.0.0:0").await?;
++    let relay = vp_core::host_network::bind_udp(bind, vp_core::host_network::Purpose::Proxy)?;
+     relay.connect(bind).await?;
+     Ok(Socks5PacketConn {
+         _ctrl: ctrl,
+@@ -171,16 +168,11 @@ impl SsUdpConn {
+         cipher: vp_crypto::ss::Cipher,
+         key: Vec<u8>,
+     ) -> Result<Self> {
+-        let server = tokio::net::lookup_host((server_host, server_port))
++        let server = vp_dns::lookup_host(server_host, server_port)
+             .await?
+             .next()
+             .ok_or(Error::Addr("no SS UDP server address".into()))?;
+-        let sock = UdpSocket::bind(if server.is_ipv6() {
+-            "[::]:0"
+-        } else {
+-            "0.0.0.0:0"
+-        })
+-        .await?;
++        let sock = vp_core::host_network::bind_udp(server, vp_core::host_network::Purpose::Proxy)?;
+         let mut session_id = [0; 8];
+         vp_common::rand_bytes(&mut session_id);
+         Ok(Self {
+diff --git a/crates/vp-transport/src/lib.rs b/crates/vp-transport/src/lib.rs
+index 35050e41f5a118f1089b97f176b1945cd14a265a..7358787f7bf818a7dd8b103d62647bd127082c78 100644
+--- a/crates/vp-transport/src/lib.rs
++++ b/crates/vp-transport/src/lib.rs
+@@ -340,7 +340,7 @@ pub async fn dial_tcp_multi(
+     use std::net::SocketAddr;
+     let mut addrs: Vec<SocketAddr> = Vec::new();
+     // 1) 内置 DNS（多上游并发 + 缓存 + 污染过滤）：节点域名优先走它
+-    if let Some((resolver, ipv6)) = global_node_resolver() {
++    if let Some((resolver, ipv6)) = global_node_resolver().filter(|_| !vp_core::host_network::requires_protection()) {
+         match resolver.resolve_domain(host, ipv6).await {
+             Ok(ips) => {
+                 addrs.extend(ips.iter().map(|ip| SocketAddr::new(*ip, port)));
+@@ -351,7 +351,7 @@ pub async fn dial_tcp_multi(
+         }
+     }
+     // 2) 系统解析并入并集：内置 DNS 若整轮被污染，系统答案里可能仍有活地址
+-    match tokio::net::lookup_host((host, port)).await {
++    match vp_dns::lookup_host(host, port).await {
+         Ok(it) => addrs.extend(it),
+         Err(e) if addrs.is_empty() => {
+             return Err(vp_common::Error::Dns(format!("解析 {host} 失败: {e}")));
+@@ -363,7 +363,7 @@ pub async fn dial_tcp_multi(
+         return Err(vp_common::Error::Dns(format!("解析 {host} 未得到任何地址")));
+     }
+     if addrs.len() == 1 {
+-        let tcp = tokio::time::timeout(budget, tokio::net::TcpStream::connect(addrs[0]))
++        let tcp = tokio::time::timeout(budget, vp_core::host_network::connect_tcp(addrs[0], vp_core::host_network::Purpose::Proxy))
+             .await
+             .map_err(|_| {
+                 vp_common::Error::Io(std::io::Error::new(
+@@ -393,11 +393,11 @@ pub async fn dial_addrs_multi(
+     for (idx, addr) in addrs.iter().enumerate() {
+         let addr = *addr;
+         let delay = STAGGER * (idx as u32).min(4);
+-        tasks.spawn(async move {
++        vp_core::task_scope::spawn_in(&mut tasks, async move {
+             if !delay.is_zero() {
+                 tokio::time::sleep(delay).await;
+             }
+-            let res = tokio::net::TcpStream::connect(addr).await;
++            let res = vp_core::host_network::connect_tcp(addr, vp_core::host_network::Purpose::Proxy).await;
+             (addr, res)
+         });
+     }
+diff --git a/crates/vp-transport/src/quic.rs b/crates/vp-transport/src/quic.rs
+index 5d4784e1216e290d85ea203022a296bf4e15160a..1ec646a91fe8db0c85fda0956d3ba900b40a6fc6 100644
+--- a/crates/vp-transport/src/quic.rs
++++ b/crates/vp-transport/src/quic.rs
+@@ -100,7 +100,7 @@ pub async fn quic_connect(
+     skip_verify: bool,
+     cfg: &QuicConfig,
+ ) -> Result<QuicStream> {
+-    let mut ep = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
++    let mut ep = quinn::Endpoint::new(quinn::EndpointConfig::default(), None, vp_core::host_network::udp_socket(addr, vp_core::host_network::Purpose::Proxy)?, std::sync::Arc::new(quinn::TokioRuntime))
+         .map_err(|e| Error::Io(std::io::Error::other(format!("quic endpoint: {e}"))))?;
+     ep.set_default_client_config(client_config(skip_verify, &cfg.alpn));
+     let conn = ep
+diff --git a/crates/vp-tun/src/lib.rs b/crates/vp-tun/src/lib.rs
+index 4e4c2b716b9a2b118d87f28161138bcb4754b556..1be314e7ee126c745638ea82b24cc094343f412c 100644
+--- a/crates/vp-tun/src/lib.rs
++++ b/crates/vp-tun/src/lib.rs
+@@ -169,7 +169,26 @@ async fn run(cfg: TunConfig, tag: Arc<str>, ctx: InboundCtx) -> Result<()> {
+     run_with_device(cfg, tag, ctx, pool, resolver, dev).await
+ }
+ 
+-async fn run_with_device<D>(
++/// Start an externally owned packet device with real upstream DNS answers. This
++/// avoids losing a fake-IP domain in protocols whose packet API carries only IPs.
++pub async fn run_with_device_no_fake_ip<D>(
++    cfg: TunConfig,
++    tag: Arc<str>,
++    ctx: InboundCtx,
++    resolver: Arc<Resolver>,
++    dev: D,
++) -> Result<()>
++where
++    D: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
++{
++    let pool = Arc::new(
++        FakeIpPool::new(&cfg.fake_ip_range)
++            .ok_or_else(|| Error::Config("invalid fake IP pool".into()))?,
++    );
++    run_packet_device(cfg, tag, ctx, pool, resolver, dev, false).await
++}
++
++pub async fn run_with_device<D>(
+     cfg: TunConfig,
+     tag: Arc<str>,
+     ctx: InboundCtx,
+@@ -177,6 +196,21 @@ async fn run_with_device<D>(
+     resolver: Arc<Resolver>,
+     dev: D,
+ ) -> Result<()>
++where
++    D: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
++{
++    run_packet_device(cfg, tag, ctx, pool, resolver, dev, true).await
++}
++
++async fn run_packet_device<D>(
++    cfg: TunConfig,
++    tag: Arc<str>,
++    ctx: InboundCtx,
++    pool: Arc<FakeIpPool>,
++    resolver: Arc<Resolver>,
++    dev: D,
++    fake_ip: bool,
++) -> Result<()>
+ where
+     D: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+ {
+@@ -191,9 +225,7 @@ where
+         let stream = match stack.accept().await {
+             Ok(s) => s,
+             Err(e) => {
+-                warn!("ipstack accept 失败: {e}");
+-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+-                continue;
++                return Err(Error::Io(e.into()));
+             }
+         };
+         let ctx = ctx.clone();
+@@ -220,7 +252,7 @@ where
+                     let dst_ip = udp.peer_addr().ip();
+                     let dst_port = udp.peer_addr().port();
+                     if dns_hijack && dst_port == 53 {
+-                        handle_dns(udp, pool, resolver).await;
++                        handle_dns(udp, pool, resolver, fake_ip).await;
+                         return;
+                     }
+                     let fake_domain = pool.reverse(dst_ip);
+@@ -341,6 +373,7 @@ async fn dispatch_udp(
+                         if conn.send(&pkt).await.is_err() {
+                             break;
+                         }
++                        ctx.stats.add_up(n as u64);
+                     }
+                 }
+             }
+@@ -351,6 +384,7 @@ async fn dispatch_udp(
+                         if udp.write_all(&pkt.data).await.is_err() {
+                             break;
+                         }
++                        ctx.stats.add_down(pkt.data.len() as u64);
+                     }
+                     Err(_) => break,
+                 }
+@@ -365,15 +399,20 @@ async fn handle_dns(
+     mut udp: ipstack::IpStackUdpStream,
+     pool: Arc<FakeIpPool>,
+     resolver: Arc<Resolver>,
++    fake_ip: bool,
+ ) {
+     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+-    let mut buf = vec![0u8; 1500];
++    let mut buf = vec![0u8; 65535];
+     loop {
+         let n = match udp.read(&mut buf).await {
+             Ok(n) if n > 0 => n,
+             _ => break,
+         };
+-        let resp = build_dns_reply(&buf[..n], &pool, &resolver).await;
++        let resp = if fake_ip {
++            build_dns_reply(&buf[..n], &pool, &resolver).await
++        } else {
++            forward_dns(&buf[..n], &resolver).await
++        };
+         if udp.write_all(&resp).await.is_err() {
+             break;
+         }
+@@ -404,10 +443,14 @@ async fn build_dns_reply(
+             }
+         }
+     }
++    forward_dns(query, resolver).await
++}
++
++async fn forward_dns(query: &[u8], resolver: &Arc<Resolver>) -> Vec<u8> {
+     if let Some(up) = resolver.first_udp_server() {
+-        if let Ok(fwd) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
++        if let Ok(fwd) = vp_core::host_network::bind_udp(up, vp_core::host_network::Purpose::Dns) {
+             if fwd.connect(up).await.is_ok() && fwd.send(query).await.is_ok() {
+-                let mut buf = vec![0u8; 1500];
++                let mut buf = vec![0u8; 65535];
+                 if let Ok(Ok(n)) =
+                     tokio::time::timeout(std::time::Duration::from_secs(3), fwd.recv(&mut buf))
+                         .await

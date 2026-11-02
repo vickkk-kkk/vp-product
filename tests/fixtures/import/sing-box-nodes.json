@@ -1,0 +1,8 @@
+{
+  "outbounds": [
+    {"type":"shadowsocks","tag":"Synthetic SS","server":"proxy.example.invalid","server_port":8388,"method":"aes-128-gcm","password":"fixture-password-not-real"},
+    {"type":"tuic","tag":"Synthetic TUIC","server":"2001:db8::1","server_port":443,"uuid":"00000000-0000-4000-8000-000000000001","password":"fixture-password-not-real","congestion_control":"bbr","udp_relay_mode":"native","tls":{"enabled":true,"server_name":"proxy.example.invalid","alpn":["h3"]}},
+    {"type":"hysteria2","tag":"Synthetic HY2","server":"proxy.example.invalid","server_port":443,"password":"fixture-password-not-real","obfs":{"type":"salamander","password":"fixture-obfs-not-real"},"tls":{"enabled":true,"server_name":"proxy.example.invalid"}},
+    {"type":"anytls","tag":"Synthetic AnyTLS","server":"proxy.example.invalid","server_port":443,"password":"fixture-password-not-real","tls":{"enabled":true,"server_name":"proxy.example.invalid"}}
+  ]
+}

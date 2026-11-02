@@ -1,0 +1,14 @@
+name: vp_api_client
+description: VP product api client boundary.
+version: 0.1.0
+publish_to: none
+environment:
+  sdk: ">=3.10.0 <4.0.0"
+  flutter: ">=3.38.0"
+dependencies:
+  http: 1.6.0
+  vp_contracts:
+    path: ../vp_contracts
+dev_dependencies:
+  flutter_test:
+    sdk: flutter

@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "instanceId": "fixture-process",
+  "generation": 1,
+  "sequence": 8,
+  "operationId": null,
+  "revision": null,
+  "payload": {
+    "kind": "resync_required",
+    "lastRetainedSequence": 5
+  }
+}

@@ -1,0 +1,81 @@
+[package]
+name = "vp-product-core-adapter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Fail-closed VP runtime boundary and pinned core source identity"
+
+[dependencies]
+vp-product-domain.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+mobile-ffi = ["dep:vp-core", "dep:vp-config", "dep:vp-common", "dep:vp-dns", "dep:vp-protocol", "dep:vp-tun", "dep:tokio", "dep:sha2", "dep:libc", "dep:async-trait"]
+default = []
+managed-runtime = ["dep:rustix", "dep:vp-app", "dep:vp-core", "dep:vp-config", "dep:vp-common", "dep:tokio", "dep:sha2"]
+
+[dependencies.vp-app]
+path = "../../integration/vp_core/crates/vp-app"
+optional = true
+
+[dependencies.vp-core]
+path = "../../integration/vp_core/crates/vp-core"
+optional = true
+
+[dependencies.vp-config]
+path = "../../integration/vp_core/crates/vp-config"
+optional = true
+
+[dependencies.vp-common]
+path = "../../integration/vp_core/crates/vp-common"
+optional = true
+
+[dependencies.tokio]
+version = "=1.54.1"
+features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"]
+optional = true
+
+[dependencies.sha2]
+version = "=0.10.8"
+optional = true
+
+[dependencies.zeroize]
+workspace = true
+
+[[bin]]
+name = "vp-core-managed-worker"
+path = "src/bin/managed_worker.rs"
+required-features = ["managed-runtime"]
+
+[dependencies.vp-dns]
+path = "../../integration/vp_core/crates/vp-dns"
+optional = true
+[dependencies.vp-protocol]
+path = "../../integration/vp_core/crates/vp-protocol"
+optional = true
+[dependencies.vp-tun]
+path = "../../integration/vp_core/crates/vp-tun"
+optional = true
+[dependencies.libc]
+version = "=0.2.191"
+optional = true
+[dependencies.async-trait]
+version = "=0.1.92"
+optional = true
+
+[dependencies.rustix]
+version = "=1.1.6"
+features = ["fs"]
+optional = true

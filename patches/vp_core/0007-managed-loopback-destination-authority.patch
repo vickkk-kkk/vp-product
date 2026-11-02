@@ -1,0 +1,274 @@
+diff --git a/crates/vp-app/src/managed.rs b/crates/vp-app/src/managed.rs
+index bc3e92a805e2af12edf5e54a4f645e19f2634bc1..4d4fc48d47184fea8bfd6d9325d433fb4ff3daa3 100644
+--- a/crates/vp-app/src/managed.rs
++++ b/crates/vp-app/src/managed.rs
+@@ -30,9 +30,28 @@ impl ManagedApp {
+         base_dir: &Path,
+         startup_timeout: Duration,
+         cleanup_timeout: Duration,
++    ) -> Result<Self> {
++        Self::start_with_policy(
++            text,
++            format,
++            base_dir,
++            startup_timeout,
++            cleanup_timeout,
++            vp_core::task_scope::DestinationPolicy::Unrestricted,
++        )
++        .await
++    }
++    pub async fn start_with_policy(
++        text: &str,
++        format: vp_config::Format,
++        base_dir: &Path,
++        startup_timeout: Duration,
++        cleanup_timeout: Duration,
++        policy: vp_core::task_scope::DestinationPolicy,
+     ) -> Result<Self> {
+         Self::start_operation(
+             App::start(text, format, base_dir, true),
++            policy,
+             startup_timeout,
+             cleanup_timeout,
+         )
+@@ -40,10 +59,11 @@ impl ManagedApp {
+     }
+     async fn start_operation<F: std::future::Future<Output = Result<Arc<App>>>>(
+         operation: F,
++        policy: vp_core::task_scope::DestinationPolicy,
+         startup_timeout: Duration,
+         cleanup_timeout: Duration,
+     ) -> Result<Self> {
+-        let scope = TaskScope::new();
++        let scope = TaskScope::with_destination_policy(policy);
+         let mut guard = StartupGuard {
+             scope: scope.clone(),
+             armed: true,
+@@ -216,8 +236,13 @@ mod tests {
+                 std::future::pending::<()>().await;
+                 Ok(app)
+             };
+-            ManagedApp::start_operation(operation, Duration::from_secs(30), Duration::from_secs(1))
+-                .await
++            ManagedApp::start_operation(
++                operation,
++                vp_core::task_scope::DestinationPolicy::Unrestricted,
++                Duration::from_secs(30),
++                Duration::from_secs(1),
++            )
++            .await
+         });
+         let port = observed.await.unwrap();
+         start.abort();
+diff --git a/crates/vp-core/src/task_scope.rs b/crates/vp-core/src/task_scope.rs
+index ca07a65627af6ca60b60b08e9fbf485fc47f9d7c..aaa76daf6156014a1dbe6c3f01db143e44cebfa2 100644
+--- a/crates/vp-core/src/task_scope.rs
++++ b/crates/vp-core/src/task_scope.rs
+@@ -66,13 +66,42 @@ pub struct ShutdownReport {
+     pub panics: u64,
+ }
+ 
++/// Explicit managed-host forwarding authority. Domain names are denied in
++/// loopback-only mode before DNS; resolving localhost is not an authority check.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum DestinationPolicy {
++    Unrestricted,
++    LoopbackIpOnly,
++}
++
++pub fn destination_policy() -> DestinationPolicy {
++    CURRENT
++        .try_with(|scope| scope.destination_policy)
++        .unwrap_or(DestinationPolicy::Unrestricted)
++}
++pub fn check_destination(dst: &vp_common::DstAddr) -> vp_common::Result<()> {
++    if destination_policy() == DestinationPolicy::LoopbackIpOnly
++        && !matches!(&dst.host, vp_common::Host::Ip(ip) if ip.is_loopback())
++    {
++        return Err(vp_common::Error::Unsupported(
++            "managed host permits loopback IP destinations only".into(),
++        ));
++    }
++    Ok(())
++}
++
+ pub struct TaskScope {
++    destination_policy: DestinationPolicy,
+     state: Mutex<State>,
+     changed: Notify,
+ }
+ impl TaskScope {
+     pub fn new() -> Arc<Self> {
++        Self::with_destination_policy(DestinationPolicy::Unrestricted)
++    }
++    pub fn with_destination_policy(destination_policy: DestinationPolicy) -> Arc<Self> {
+         Arc::new(Self {
++            destination_policy,
+             state: Mutex::new(State {
+                 phase: Phase::Running,
+                 next: 0,
+@@ -475,3 +504,46 @@ mod tests {
+         scope.draining().await;
+     }
+ }
++
++#[cfg(test)]
++mod destination_tests {
++    use super::*;
++    use vp_common::{DstAddr, Host};
++    #[tokio::test]
++    async fn loopback_policy_is_inherited_and_rejects_names_before_dns() {
++        let scope = TaskScope::with_destination_policy(DestinationPolicy::LoopbackIpOnly);
++        scope
++            .run(async {
++                for host in [
++                    Host::Ip("127.0.0.1".parse().unwrap()),
++                    Host::Ip("::1".parse().unwrap()),
++                ] {
++                    assert!(check_destination(&DstAddr { host, port: 80 }).is_ok());
++                }
++                for host in [
++                    Host::Ip("192.0.2.1".parse().unwrap()),
++                    Host::Domain("localhost".into()),
++                    Host::Domain("example.invalid".into()),
++                ] {
++                    let dst = DstAddr { host, port: 80 };
++                    assert!(check_destination(&dst).is_err());
++                    assert!(
++                        spawn(async move { check_destination(&dst) })
++                            .await
++                            .unwrap()
++                            .is_err()
++                    );
++                }
++            })
++            .await;
++        assert!(
++            check_destination(&DstAddr {
++                host: Host::Domain("example.invalid".into()),
++                port: 80
++            })
++            .is_ok()
++        );
++        let stopped = scope.shutdown(Duration::ZERO, Duration::from_secs(1)).await;
++        assert_eq!(stopped.remaining_tasks, 0);
++    }
++}
+diff --git a/crates/vp-protocol/src/direct.rs b/crates/vp-protocol/src/direct.rs
+index dfb785f9d334feea851682ec964f10bdd0231cbf..d859f9346a95921937c6a5be7400cab817036c85 100644
+--- a/crates/vp-protocol/src/direct.rs
++++ b/crates/vp-protocol/src/direct.rs
+@@ -19,6 +19,7 @@ impl DirectOutbound {
+     }
+ 
+     pub async fn resolve(&self, dst: &DstAddr) -> Result<Vec<std::net::SocketAddr>> {
++        vp_core::task_scope::check_destination(dst)?;
+         match &dst.host {
+             Host::Ip(ip) => Ok(vec![std::net::SocketAddr::new(*ip, dst.port)]),
+             Host::Domain(domain) => {
+@@ -77,6 +78,7 @@ impl Outbound for DirectOutbound {
+     }
+ 
+     async fn connect_packet(&self, _sess: &Session, dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
++        vp_core::task_scope::check_destination(dst)?;
+         let bind: std::net::SocketAddr = if dst.host.is_ip() && dst.host.to_string().contains(':') {
+             "[::]:0".parse().unwrap()
+         } else {
+diff --git a/crates/vp-protocol/src/hysteria2.rs b/crates/vp-protocol/src/hysteria2.rs
+index fe66cc2c770494d017851cec7f160b27d1056c71..f13809f2dda06ebf36f56968c05b0e06fcf11b56 100644
+--- a/crates/vp-protocol/src/hysteria2.rs
++++ b/crates/vp-protocol/src/hysteria2.rs
+@@ -892,6 +892,7 @@ impl Hysteria2Inbound {
+                     if !authenticated || failed { continue; }
+                     let Some(fragment) = parse_udp_message(&dg) else { continue };
+                     let Some(pkt) = fragments.push(fragment) else { continue };
++                    if vp_core::task_scope::check_destination(&pkt.dst).is_err() { continue; }
+                     let target = match &pkt.dst.host {
+                         vp_common::Host::Ip(ip) => SocketAddr::new(*ip, pkt.dst.port),
+                         vp_common::Host::Domain(host) => {
+diff --git a/crates/vp-protocol/src/inbound/dispatch.rs b/crates/vp-protocol/src/inbound/dispatch.rs
+index 52f98aa5f06e538757b7727076dea60b2517c040..bfec008e751740a914d3ed5cae9582edc2860cbc 100644
+--- a/crates/vp-protocol/src/inbound/dispatch.rs
++++ b/crates/vp-protocol/src/inbound/dispatch.rs
+@@ -28,6 +28,9 @@ pub async fn dispatch_stream(
+     mut client: Box<dyn ProxyStream>,
+     reply: ClientReply<'_>,
+ ) {
++    if vp_core::task_scope::check_destination(&sess.dst).is_err() {
++        return;
++    }
+     // UDP over TCP（UoT）：魔法地址目标交由 UoT 中继处理
+     if crate::uot::is_magic(&sess.dst) {
+         let _ = crate::uot::serve_client(ctx, sess, client).await;
+@@ -58,6 +61,9 @@ pub async fn dispatch_stream(
+         }
+     }
+ 
++    if vp_core::task_scope::check_destination(&sess.dst).is_err() {
++        return;
++    }
+     let res = ctx.router.pick(&sess).await;
+     let outbound = res.outbound.clone();
+     tracing::debug!(
+diff --git a/crates/vp-protocol/src/inbound/socks5_in.rs b/crates/vp-protocol/src/inbound/socks5_in.rs
+index 35667d524cbd647d72dcf8670f3ce6c256abf36b..d59e9d34347a9fcf81fb3ef251c73822000a6fa4 100644
+--- a/crates/vp-protocol/src/inbound/socks5_in.rs
++++ b/crates/vp-protocol/src/inbound/socks5_in.rs
+@@ -106,7 +106,18 @@ where
+         }
+         0x03 => {
+             // UDP ASSOCIATE：申请中继 socket，回复绑定地址，转入 UDP 泵
+-            let relay = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
++            let bind_ip: std::net::IpAddr = if vp_core::task_scope::destination_policy()
++                == vp_core::task_scope::DestinationPolicy::LoopbackIpOnly
++            {
++                if src.is_ipv6() {
++                    std::net::Ipv6Addr::LOCALHOST.into()
++                } else {
++                    std::net::Ipv4Addr::LOCALHOST.into()
++                }
++            } else {
++                std::net::Ipv4Addr::UNSPECIFIED.into()
++            };
++            let relay = match tokio::net::UdpSocket::bind((bind_ip, 0)).await {
+                 Ok(s) => s,
+                 Err(_) => {
+                     stream
+diff --git a/crates/vp-protocol/src/inbound/udp_nat.rs b/crates/vp-protocol/src/inbound/udp_nat.rs
+index 6f6a407965b7cd308f3bcd57021cf7de49d0f0de..809ca320f6f8ae2d16180fc94ad25ad235f5345c 100644
+--- a/crates/vp-protocol/src/inbound/udp_nat.rs
++++ b/crates/vp-protocol/src/inbound/udp_nat.rs
+@@ -69,6 +69,7 @@ impl UdpNat {
+             },
+             port: pkt.dst.port(),
+         };
++        vp_core::task_scope::check_destination(&dst)?;
+         let mut map = self.sessions.lock().await;
+         let tx = match map.get(&dst) {
+             Some(tx) => tx.clone(),
+diff --git a/crates/vp-protocol/src/ss.rs b/crates/vp-protocol/src/ss.rs
+index 4e457e0a9344da75bffb4c533135199a51da7015..893add322c4f70c0b7b5434e5f9d093ed81c6b74 100644
+--- a/crates/vp-protocol/src/ss.rs
++++ b/crates/vp-protocol/src/ss.rs
+@@ -656,6 +656,9 @@ impl SsInbound {
+             let Ok((dst, used)) = decode_socks_addr(&frame.payload) else {
+                 continue;
+             };
++            if vp_core::task_scope::check_destination(&dst).is_err() {
++                continue;
++            }
+             let nat_key = if self.cipher.is_2022 {
+                 NatKey::Session(frame.session_id)
+             } else {
+diff --git a/crates/vp-protocol/src/tuic.rs b/crates/vp-protocol/src/tuic.rs
+index 9cca3f71c44d64e6874eb9acd8dc34c34e62fc2b..d030f55baadd4365ea704234cf71520af392321c 100644
+--- a/crates/vp-protocol/src/tuic.rs
++++ b/crates/vp-protocol/src/tuic.rs
+@@ -461,6 +461,7 @@ fn quic_error(e: impl std::fmt::Display) -> Error {
+ }
+ 
+ async fn resolve_udp(dst: &DstAddr) -> Result<SocketAddr> {
++    vp_core::task_scope::check_destination(dst)?;
+     match &dst.host {
+         Host::Ip(ip) => Ok(SocketAddr::new(*ip, dst.port)),
+         Host::Domain(host) => tokio::time::timeout(

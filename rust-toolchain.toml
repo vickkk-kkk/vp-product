@@ -1,0 +1,5 @@
+# Installed official baseline. Pinned upstream lock requires Rust >=1.88 (ICU/time).
+[toolchain]
+channel = "1.88.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

@@ -2,7 +2,7 @@
 
 ## 先确认代码状态
 
-此工程已有真实 `.gitmodules` 与 `client` gitlink。首个基础版本不含服务端、Web 和安装源码；下列命令只用于克隆与核对代码，不是构建或安装。
+此工程已有真实 `.gitmodules` 与 `client` gitlink。本版本同时包含服务端、Web 和安装源码；下列命令只用于克隆与核对代码，不是构建或安装。
 
 需要 Git 和私有主仓的读取权限。首次获取：
 
@@ -34,7 +34,13 @@ git status --short
 | Web 管理端 | 锁定的 Flutter/Dart SDK、依赖锁及 Web 所需共享包 | 不引入旧客户端和原生 VPN 插件依赖 |
 | 安装工具 | Python 3、受支持 Linux 环境；真实构建产物与可信摘要 | 不自动下载、签名、部署或修改主机网络 |
 
-服务端等源码完成发布前审查并在新目录验证前，本文不发布未经验证的 `cargo build`、`flutter build` 或安装脚本命令。核对任务见 [源码归集清单](source-integration.md)。原目录的构建记录只能作为迁移基线。
+本版本的静态检查不包含完整构建。本文不发布未经验证的 `cargo build`、`flutter build` 或安装脚本命令。剩余任务见 [源码归集清单](source-integration.md)。原目录的构建记录只能作为迁移基线。
+
+### 服务端核心必须先重建
+
+新 clone 不包含 `integration/vp_core/`。先阅读 [核心重建工具说明](../tools/core/README.md)，准备独立、干净且精确匹配 `core-lock.json` 的上游 checkout，再执行工具的 verify / prepare / check 流程。工具会向该专用上游仓库写入确定性 Git 对象并登记工作树；不要使用无关开发 checkout。
+
+这一流程不是编译，也不等于协议测试。当前归集目录仅通过了工具的 20 个合成 Git 测试，尚未完成真实核心重放。即使不开启可选运行时 feature，Cargo 解析也可能要求这些 path 依赖存在。保留已提交锁文件和工具链，不用浮动更新绕过缺失依赖。
 
 ## 日常修改
 

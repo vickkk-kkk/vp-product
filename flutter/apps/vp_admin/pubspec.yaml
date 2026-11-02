@@ -1,0 +1,27 @@
+name: vp_admin
+description: VP server administration application.
+version: 0.1.0+1
+publish_to: none
+environment:
+  sdk: ">=3.10.0 <4.0.0"
+  flutter: ">=3.38.0"
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_riverpod: 3.3.2
+  go_router: 17.5.0
+  vp_contracts:
+    path: ../../packages/vp_contracts
+  vp_design_system:
+    path: ../../packages/vp_design_system
+  vp_features:
+    path: ../../packages/vp_features
+  vp_runtime_platform:
+    path: ../../packages/vp_runtime_platform
+  vp_api_client:
+    path: ../../packages/vp_api_client
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+flutter:
+  uses-material-design: true

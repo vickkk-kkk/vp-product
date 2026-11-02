@@ -1,0 +1,79 @@
+From 2f89852489e410eda610c8c9d7b7d74275c88129 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Fri, 30 Oct 2026 13:01:21 +0900
+Subject: [PATCH] fix(core): reject UDP chains rather than bypass configured
+ dialer
+
+---
+ crates/vp-core/src/outbound.rs | 46 +++++++++++++++++++++++++++++++---
+ 1 file changed, 43 insertions(+), 3 deletions(-)
+
+diff --git a/crates/vp-core/src/outbound.rs b/crates/vp-core/src/outbound.rs
+index bea7b52..20faa39 100644
+--- a/crates/vp-core/src/outbound.rs
++++ b/crates/vp-core/src/outbound.rs
+@@ -102,11 +102,16 @@ impl Outbound for ChainedOutbound {
+     }
+ 
+     fn support_udp(&self) -> bool {
+-        self.inner.support_udp()
++        // PacketConn has no packet-over-stream composition API. Delegating to
++        // inner would silently bypass the configured dialer/proxy chain.
++        false
+     }
+ 
+-    async fn connect_packet(&self, sess: &Session, dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
+-        self.inner.connect_packet(sess, dst).await
++    async fn connect_packet(&self, _sess: &Session, _dst: &DstAddr) -> Result<Box<dyn PacketConn>> {
++        Err(Error::Unsupported(
++            "UDP over a configured proxy chain is not implemented; refusing to bypass the dialer"
++                .into(),
++        ))
+     }
+ 
+     fn remote_addr(&self) -> Option<(String, u16)> {
+@@ -180,6 +185,41 @@ mod tests {
+         }
+     }
+ 
++    #[tokio::test]
++    async fn chained_udp_is_rejected_without_invoking_inner_or_dialer() {
++        struct MustNotDial;
++        #[async_trait]
++        impl Outbound for MustNotDial {
++            fn name(&self) -> &str {
++                "must-not-dial"
++            }
++            fn support_udp(&self) -> bool {
++                true
++            }
++            async fn connect_stream(
++                &self,
++                _: &Session,
++                _: &DstAddr,
++            ) -> Result<Box<dyn ProxyStream>> {
++                panic!("unsupported chained UDP must not create a stream");
++            }
++            async fn connect_packet(
++                &self,
++                _: &Session,
++                _: &DstAddr,
++            ) -> Result<Box<dyn PacketConn>> {
++                panic!("unsupported chained UDP must not bypass the dialer");
++            }
++        }
++        let chained = ChainedOutbound::new(Arc::new(MustNotDial), Arc::new(MustNotDial));
++        let sess = Session::new_udp("test".into(), None, DstAddr::new("127.0.0.1", 9));
++        assert!(!chained.support_udp());
++        assert!(matches!(
++            chained.connect_packet(&sess, &sess.dst).await,
++            Err(Error::Unsupported(_))
++        ));
++    }
++
+     #[tokio::test]
+     async fn test_chained_outbound_e2e() {
+         let dialer = Arc::new(TestDialer);
+-- 
+2.52.0
+

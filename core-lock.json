@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "upstream": {
+    "repository_url": "https://github.com/mateo-ki/vp_core.git",
+    "commit": "a1abce2b515b199fe1120061b54654c60f4dd59c",
+    "tree": "8cf7f0a98cd2f86e76cef3aa62f3b106a90f7c06"
+  },
+  "patchset": {
+    "sha256": "4cc124b5aa049df777eebfcb91d4fd746c8dcbe117cfb17d5fba57466ab9059d",
+    "patches": [
+      {
+        "id": "P01-fail-closed-listener-startup",
+        "path": "patches/vp_core/0001-fail-closed-listener-startup.patch",
+        "sha256": "dc17b624124842e7351caf41f1ebb9a373eb08dca7d15321234f7787b3e475f8"
+      },
+      {
+        "id": "P09-managed-async-lifecycle",
+        "path": "patches/vp_core/0002-managed-async-lifecycle.patch",
+        "sha256": "2a5c9f691f132b3a20c121251cc8f21fd3d7f4ba28d3b37200d24b4945d7f406"
+      },
+      {
+        "id": "P10-quic-authentication-and-lifecycle",
+        "path": "patches/vp_core/0003-quic-authentication-and-lifecycle.patch",
+        "sha256": "4b64c46d44115dfbe87a523a3cd8899cdd2c01e9c860ff7067bf0de70e2395e1"
+      },
+      {
+        "id": "P04-shadowsocks-standards-and-session-lifecycle",
+        "path": "patches/vp_core/0004-shadowsocks-wire-and-managed-sessions.patch",
+        "sha256": "34b3858a7ba1e99fbcb4ae4bafcd7f638a803cbfad1e15a5e705eb8b5a978116"
+      },
+      {
+        "id": "P05-reality-boundary-and-vision-rejection",
+        "path": "patches/vp_core/0005-reality-boundary-and-vision-fail-closed.patch",
+        "sha256": "946299bbf174caca4c32acfb0fca644cf8c2de97fa006b04032b82aa693dfbab"
+      },
+      {
+        "id": "P02-server-stream-transports",
+        "path": "patches/vp_core/0006-server-stream-transports.patch",
+        "sha256": "351c5666ee7a8d3a2dc02371985157a043b4d0f30a61b4dfc1fe26d0d52d39d1"
+      },
+      {
+        "id": "P09-managed-destination-authority",
+        "path": "patches/vp_core/0007-managed-loopback-destination-authority.patch",
+        "sha256": "05f536c6fe2de10a7f774b6f940e030dd4361de23bf43559e2880608d243d1b5"
+      },
+      {
+        "id": "P10-quic-reference-library-explicit-trust",
+        "path": "patches/vp_core/0008-quic-reference-library-and-explicit-trust.patch",
+        "sha256": "cfd942cfa6bf2573aa2c594edefd9f5d9c32776a49a1e8d0b3a4575379b988c2"
+      },
+      {
+        "id": "P05-utls-inner-plaintext-correction",
+        "path": "patches/vp_core/0009-utls-inner-plaintext-padding.patch",
+        "sha256": "341ad98afa8d68d9e336355bd84f6279d86ceef6620daad64b781719c7e5a5f3"
+      },
+      {
+        "id": "P05-experimental-authenticated-reality-boundary",
+        "path": "patches/vp_core/0010-experimental-authenticated-reality-server.patch",
+        "sha256": "b19d33bcfacbaa5191527d48434d295915872a89403ad81ad4af40ef5f1428c6"
+      },
+      {
+        "id": "P04-shadowsocks-independent-library-peer",
+        "path": "patches/vp_core/0011-shadowsocks-independent-library-peer.patch",
+        "sha256": "61d36606c2bbf01cb88b53fb4a0ef2c19404d340e4b2818c6c1fb4c3d24d39c6"
+      },
+      {
+        "id": "P11-mobile-host-network-and-tun-ownership",
+        "path": "patches/vp_core/0012-mobile-host-network-and-tun-ownership.patch",
+        "sha256": "566094e57ac2d344b45c402707eefd54d52106e1e396e553e6a016eec208cdc5"
+      },
+      {
+        "id": "P09-reject-chained-udp-route-bypass",
+        "path": "patches/vp_core/0013-reject-unsupported-chained-udp.patch",
+        "sha256": "ca16fd57f8ae5a03126d3e211a572ae97aaebf5da71537f2fea95e28cd816bd0"
+      },
+      {
+        "id": "P04-stream-framing-and-partial-io-corrections",
+        "path": "patches/vp_core/0014-stream-framing-and-partial-io-corrections.patch",
+        "sha256": "c4f797c8129e8f7cb2e90a2115dda56ab02018162a3ae6904a1572938dad776a"
+      },
+      {
+        "id": "P04-bounded-stream-protocol-udp",
+        "path": "patches/vp_core/0015-stream-protocol-udp-and-independent-peer.patch",
+        "sha256": "df9292ca3f4828a30caa8116e764f8d8dee17c719baabf9d2af4aec0b9617dd2"
+      },
+      {
+        "id": "P11-protect-tuic-reply-domain-dns",
+        "path": "patches/vp_core/0016-protect-tuic-reply-domain-dns.patch",
+        "sha256": "323e0b730118cb1c22ccf9a9539438b15504fe17f2e372cb29f1d0bfc4a9d95e"
+      },
+      {
+        "id": "P11-proxy-user-dns-endpoint-bootstrap",
+        "path": "patches/vp_core/0017-proxy-user-dns-and-endpoint-bootstrap.patch",
+        "sha256": "0419ba7b2400782c04590433a8495705b63e03faecb54ae521f6e63b037de23f"
+      },
+      {
+        "id": "P09-router-selected-server-egress",
+        "path": "patches/vp_core/0018-router-selected-server-egress.patch",
+        "sha256": "251c6a8a8be00dc5aa207aa779b3fb086cd79140aae28e81099dee1f0c096a64"
+      },
+      {
+        "id": "P01-uuid-byte-parsing-error-redaction",
+        "path": "patches/vp_core/0019-uuid-byte-parsing-and-error-redaction.patch",
+        "sha256": "9a9e810561c50975c52be3a3fd8b973a28d110a2703ea55bbecbc83b2a7ea5e2"
+      },
+      {
+        "id": "P09-authenticated-shadowsocks-uot-routing",
+        "path": "patches/vp_core/0020-authenticated-shadowsocks-uot-routing.patch",
+        "sha256": "87a853e6b661d3fac6d6ab1df996fcb2f23c06a2c3d1490f2abbee118877846b"
+      }
+    ]
+  },
+  "integration": {
+    "path": "integration/vp_core",
+    "patched_tree": "eb339f2c485e10a6a9e32a8c1e39d8337b2b35fe",
+    "commit": "e96584fb8c7a38aa2c24beb89dcf969e70c24c93"
+  },
+  "adapter": {
+    "package": "vp-product-core-adapter",
+    "version": "0.1.0-dev.1"
+  },
+  "verification": {
+    "git_replay": "passed",
+    "rust_execution": "not-run",
+    "interop": "not-run",
+    "platform": "not-run",
+    "release_eligible": false
+  }
+}

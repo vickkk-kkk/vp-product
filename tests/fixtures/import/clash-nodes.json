@@ -1,0 +1,8 @@
+{
+  "proxies": [
+    {"name":"Synthetic SS","type":"ss","server":"proxy.example.invalid","port":8388,"cipher":"aes-256-gcm","password":"fixture-password-not-real","udp":true},
+    {"name":"Synthetic SOCKS","type":"socks5","server":"2001:db8::1","port":1080,"username":"fixture-user","password":"fixture-password-not-real","udp":true}
+  ],
+  "proxy-groups": [{"name":"Not imported","type":"select","proxies":["Synthetic SS"]}],
+  "rules": ["MATCH,Not imported"]
+}

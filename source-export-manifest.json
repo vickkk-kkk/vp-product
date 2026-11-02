@@ -1,0 +1,2351 @@
+{
+  "schema_version": 1,
+  "source_commit": "e267153e7a9c3443a32158c00a1d86ecc1f7fb78",
+  "source_selection": "reviewed baseline; not TLS R7 candidate",
+  "files": [
+    {
+      "path": "Cargo.lock",
+      "source_git_blob": "fe07090fafb8e5635f0f95bffa123dd430b3a241",
+      "sha256": "0accafbb7a9a841b4e3e4ab501ae4f015655002328cabff8bd4a6202323b6fc2",
+      "bytes": 90331,
+      "mode": "100644"
+    },
+    {
+      "path": "Cargo.toml",
+      "source_git_blob": "2e11479eb65fb5efef62d62cc6d4d905a837d266",
+      "sha256": "2d19d6ed704394931040007c93f86a98a201054436faf106ae0b4ac1c8df27ef",
+      "bytes": 1424,
+      "mode": "100644"
+    },
+    {
+      "path": "contracts/abi/vp_adapter.h",
+      "source_git_blob": "a854ccf469be2d453bb8e131171cd31acfd2f6b2",
+      "sha256": "ce85c69522a0f8ca99b2fa355501840fa05e8d2e34a8dedcfc7ea0cb0ec9d88c",
+      "bytes": 10120,
+      "mode": "100644"
+    },
+    {
+      "path": "contracts/abi/vp_codec.h",
+      "source_git_blob": "c49a5c3e7d2b4fb60da2c75725d0ece7311a1b69",
+      "sha256": "61cc4939933b4a274fc6520aaa59de19a4b0a8b0a79484a770e206a41aff2370",
+      "bytes": 1665,
+      "mode": "100644"
+    },
+    {
+      "path": "contracts/capabilities/presets.json",
+      "source_git_blob": "0ba512e666e27e2ef908910e82374ddf142174ff",
+      "sha256": "5cd64b26f377fe6717bb47d8d0cc8a2d9b99009a9e7a617d9df4b6e6297ccb93",
+      "bytes": 7184,
+      "mode": "100644"
+    },
+    {
+      "path": "contracts/events/v1.schema.json",
+      "source_git_blob": "73621b8a8c2f0ff9b21d529b8f41aeca586344ef",
+      "sha256": "0efb1228cca47064d013695db80a06d59e45a43610b89a1085ab7c81ab46ea96",
+      "bytes": 218,
+      "mode": "100644"
+    },
+    {
+      "path": "contracts/fixtures/config-empty.json",
+      "source_git_blob": "1ca81911c377ad4a8fdfea285ecd41c612202fba",
+      "sha256": "7b11c4281e708c968bde086f24235fd4bd191e4aa12de499c0529c3354f2ebc1",
+      "bytes": 110,
+      "mode": "100644"
+    },
+    {
+      "path": "contracts/fixtures/event-resync.json",
+      "source_git_blob": "9fd8af02ecd0758c40921f6b1cecee39ae6877c0",
+      "sha256": "3385b8d83b44cfe7fa64b69e3ac5b096e55d336302b4de2722466e140e501673",
+      "bytes": 219,
+      "mode": "100644"
+    },
+    {
+      "path": "contracts/fixtures/node-inline-secret.rejected.json",
+      "source_git_blob": "d40c7c6d3acbbcf66c4d6d23e4b6b0636cda766e",
+      "sha256": "2e502b32737321a7952eb9a598947377c68a3b123e30c3177f1fc73e2089a677",
+      "bytes": 633,
+      "mode": "100644"
+    },
+    {
+      "path": "contracts/fixtures/node-vless-reality.json",
+      "source_git_blob": "61487b10bf5afd16525e7fcf47f217f6efc2db4c",
+      "sha256": "8f534cbd4ac3daeffc3e437dbd69dae92213addb59fd9ead94aef26ae8f0a32e",
+      "bytes": 598,
+      "mode": "100644"
+    },
+    {
+      "path": "contracts/fixtures/runtime-idle.json",
+      "source_git_blob": "a07d66f2cfe2a41608475f109f343cc737a8397c",
+      "sha256": "c248edaa03cacdffa04faeb1c5bc427a65c80c780a96ffee3147aa62cea58550",
+      "bytes": 1465,
+      "mode": "100644"
+    },
+    {
+      "path": "contracts/openapi/v1.yaml",
+      "source_git_blob": "e31821bc3df9bc2c4953dda8e980506352e1b318",
+      "sha256": "a94ab0ea04103b9c3063bbfb41da50662778c699272d7a9e1160ca4a9554cf9f",
+      "bytes": 237743,
+      "mode": "100644"
+    },
+    {
+      "path": "contracts/schema/v1.refinements.json",
+      "source_git_blob": "8d08c2774f461b745c306a40f5ba05eb05d13e24",
+      "sha256": "7f9558f6ffb0d3ec39a838c96394bee6ad56ec7381f0b5e7eab58415e6e8c4b4",
+      "bytes": 61258,
+      "mode": "100644"
+    },
+    {
+      "path": "contracts/schema/v1.schema.json",
+      "source_git_blob": "e5f3b67447a1c252d1788fc5df3d643c823454b1",
+      "sha256": "c652521e776c9fb26331826572dd3f75a0367fae1d779c273e3ce6fcac704727",
+      "bytes": 144452,
+      "mode": "100644"
+    },
+    {
+      "path": "core-lock.json",
+      "source_git_blob": "7a6b1612df8c799a28db38219dc50d7438c4a36f",
+      "sha256": "0cb955829bcf1365288c9739d20f627aa8ce55e02cd8a6af1b7fcccc005d54c7",
+      "bytes": 5556,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-api/Cargo.toml",
+      "source_git_blob": "48ab5b1004e4d56b999fcbd8051f9217671d692f",
+      "sha256": "4ee89735fb7158895a8ee08edc3b46b6e80a3796dc8caeadfaafdec17f3b1dee",
+      "bytes": 803,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-api/src/auth.rs",
+      "source_git_blob": "c74a0dd8bbfa7dcfb1e6ad0a206d65e5a8562343",
+      "sha256": "4bade28ade3ad140d47a0c27f4366259b962ffd5c535d6c10cc62fecefaf6437",
+      "bytes": 10074,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-api/src/error.rs",
+      "source_git_blob": "79f5013d3a30ee8191598f1124dac65dcc1ee248",
+      "sha256": "fadd3ffdfeed33c0c00415dbb5368e6f37791693a8870715c3f2315c61317868",
+      "bytes": 5048,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-api/src/http.rs",
+      "source_git_blob": "9097f85d0a11464e9004b84813a161b2350c0ff9",
+      "sha256": "c645d58b1a585baad58c66d9ad229e38de4c88aee7765a936af8ff58cbce7a00",
+      "bytes": 31757,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-api/src/lib.rs",
+      "source_git_blob": "5ab0b066d343e00246295c7506233085ed965297",
+      "sha256": "798e294aae2a004324035de4a85eb022e1abdb3e04ee59ad28ad8488adf34f74",
+      "bytes": 485,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-api/src/secret_http.rs",
+      "source_git_blob": "293ddfece8b81cd7896e2567b004613d1ef8bf19",
+      "sha256": "2483b430d38fca7c43af5bb6fa675ab8958ed0a1dcf30ab50efb33a47f8661b5",
+      "bytes": 14826,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-api/src/worker.rs",
+      "source_git_blob": "a5ea6897f50db6008b1a4904bc3b1dd54aafc0e5",
+      "sha256": "d832d33ee746bb50c41e5666716b778a90d290544bde1da04b37f9ad9c011bc6",
+      "bytes": 4095,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-api/tests/publication_security.rs",
+      "source_git_blob": "a68ce861074421cb51fc2ffc2c9d6d83a39e3a4b",
+      "sha256": "811c40099edaf6771356f78cba58bcb097bcfb0088d6c3d3dff73e01b7f79a5e",
+      "bytes": 9031,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-api/tests/security_and_drafts.rs",
+      "source_git_blob": "b1888cff63b05680b3e4efb02354c0ecac2e7338",
+      "sha256": "f3d8b816acb26c70061ceb28e2b7983194f1ee06277d04944275d73c8277dcea",
+      "bytes": 21844,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-codec-ffi/Cargo.toml",
+      "source_git_blob": "4962ea74ba1115c854bfe30f5bbec8e959ac9a51",
+      "sha256": "62d4cfe547887b6d22310f600da15be4d677394d29e03767021b4122d5b9fd48",
+      "bytes": 733,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-codec-ffi/src/codec.rs",
+      "source_git_blob": "54fe2d13321c75d2a1546044afa1ba8bcad90325",
+      "sha256": "7764a00bf8ab9b7dff37088d39ed89a2268928395470cf3e8bf37991f7121148",
+      "bytes": 29305,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-codec-ffi/src/ffi.rs",
+      "source_git_blob": "0cd57e7d38d334849c4adaf61f86acac15e291f0",
+      "sha256": "78abc630ff906a0a68a9c4f6f3a01b699835f344760a614507fb77f790d653e0",
+      "bytes": 9280,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-codec-ffi/src/lib.rs",
+      "source_git_blob": "6b1f99856d283990e4e5c051378656fc1db47df3",
+      "sha256": "3c08bf84f69231d764e7b7e1bb040f8021b7cbae79e834dd54d7e02605c61b55",
+      "bytes": 287,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-codec-ffi/tests/abi.c",
+      "source_git_blob": "7b31fa01e7f3e957d83f98408c5e4c359d52f2fa",
+      "sha256": "ba6bc5d8a4dd3cd8493c956b793be44c876d2b6276592c23604401d2fe53a403",
+      "bytes": 1721,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-codec-ffi/tests/abi.rs",
+      "source_git_blob": "9c4289132559a5dc218456f4899f79f603171d88",
+      "sha256": "a36ce6ac552d8863ab7f014c5838d01165f77aba95893164068edd742ca4b447",
+      "bytes": 5143,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-codec-ffi/tests/run-c-harness.sh",
+      "source_git_blob": "3db87ed4a28db5259559081f83ec13b244444f3b",
+      "sha256": "c74c4d2106c43ad31ad4360d723df9490b2d005a7de99a034b7d3ae1fbabc99a",
+      "bytes": 420,
+      "mode": "100755"
+    },
+    {
+      "path": "crates/vp-codec-ffi/tools/build-android.sh",
+      "source_git_blob": "67d72a8773f5d87f6475bff0c009ee84c4284bef",
+      "sha256": "2b47393bd38185dc65d9fe4c4d41f91f6d778b7cdfa37cd7d94217bf58d88939",
+      "bytes": 1388,
+      "mode": "100755"
+    },
+    {
+      "path": "crates/vp-compiler/Cargo.toml",
+      "source_git_blob": "423e0f42a24d38d5df2e9fbac1192af9f272afc5",
+      "sha256": "1c0455ccf7acaa6d30de4d8b4c21a9436d70ed24747a57e7e53c075d5aa43e1d",
+      "bytes": 272,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-compiler/src/lib.rs",
+      "source_git_blob": "767622e357bc66b298b03cb2daf336043206dd3c",
+      "sha256": "6778fff997e590b4aedc5047fbb2444fd79d2debe63324052c155843b33b03ce",
+      "bytes": 10114,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-compiler/tests/exact.rs",
+      "source_git_blob": "d766e9e2a1f5998308056515a989bd82a304b9eb",
+      "sha256": "cdb837d0badcaadec444ac349fb6d3a1f72238170d6f2f4b20f0377978a47298",
+      "bytes": 7826,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/Cargo.toml",
+      "source_git_blob": "d0ab59a25941836af160457bba7e5f289cfa6b18",
+      "sha256": "d2319f6b8b55c425a3ccee6122590ff26b66bd8e643d3707765ed41b6a8229d4",
+      "bytes": 1108,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/examples/check_publication_uri_list.rs",
+      "source_git_blob": "e6a626299348683dfd6c102813da022b73ce022d",
+      "sha256": "7ed9553251ffea6429751605633c024d9c6a162576da48234904e6ea05d24b57",
+      "bytes": 1186,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/src/credentials.rs",
+      "source_git_blob": "28fdb824365848fcba9263d8c0049041e4ad3081",
+      "sha256": "aaab7a632239d7b2ec4491eb2f2190fddb147440cd75d6728cb4645b9d0af0f6",
+      "bytes": 16710,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/src/drafts.rs",
+      "source_git_blob": "ec4f58840076f3edb424f4ed3c070fcb24400e5a",
+      "sha256": "d2f2fcc9e07f06011c82b6f950d3a37483ddfe24b8a270b2d4fab2270ba2e293",
+      "bytes": 25474,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/src/genesis.rs",
+      "source_git_blob": "dd2c096541a466a3f2dadf7e797e745efacea4c5",
+      "sha256": "9cacc2ef2d5567944a32ea52d40607d0d8c01ac76650266a54dbe1cac25ae164",
+      "bytes": 6816,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/src/lib.rs",
+      "source_git_blob": "120a1a48132a14e0875aad0cae3bc828d2adf2ed",
+      "sha256": "aad0d6134de3a63fb331a73976a59da8d4287d0866d66d1638647e0d6bfe7cf3",
+      "bytes": 1163,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/src/managed_secret_tests.rs",
+      "source_git_blob": "7b99dd294f90e99685f001a8370ac6a3c1a07014",
+      "sha256": "7111b73f39f9a3730282eb6316a9e785107686708aee1e6f08e2f73558dcdf8e",
+      "bytes": 59715,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/src/managed_secrets.rs",
+      "source_git_blob": "447af1457e6660aefeb07876d92460c217c7aede",
+      "sha256": "5fc31a68a8e0aae3f7f968eb8c11eb7d2ef33a75b397bcced0a2d34f6ba81348",
+      "bytes": 11633,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/src/model.rs",
+      "source_git_blob": "f1e569c124932efde3408126e1c2464472441980",
+      "sha256": "9f171d41390ff6e351d281c0d0fff4d34910fa89c21426cd978e68e95fe96399",
+      "bytes": 19085,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/src/ports.rs",
+      "source_git_blob": "262ad6363159a0655e70398ba46dd321f84b268b",
+      "sha256": "e18311524ef722afdabdb72572c67c36e12a68c3d826831e7e361809ab9da86a",
+      "bytes": 7948,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/src/publications.rs",
+      "source_git_blob": "8ecb65c2b269079f547fbf5de4784af609f85c4b",
+      "sha256": "886873a7c1225cb0c628e03d5757dbfd406530956e930411fa5963e08db5f7e7",
+      "bytes": 22362,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/src/service.rs",
+      "source_git_blob": "c513d719d781455235ef8ea18f9a462ad1450f52",
+      "sha256": "535aded22d39be80933bdb0a6e47de895b83100ffb47d593c109a9eb49611394",
+      "bytes": 35165,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/src/tests.rs",
+      "source_git_blob": "59023b660a4b1fec7d55f7860c1785ecf39a6521",
+      "sha256": "220a08fbbf5fc1aebecdfaddf52959a6bb57c37476df2f3eb82415995a6305d7",
+      "bytes": 36959,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/src/tls_registry.rs",
+      "source_git_blob": "45b4c9edfba941bd679d550395c54db257dec160",
+      "sha256": "f315f40f55aaefcf85dce0883bf4c45fc85e2f7f502e8fca5481ef480a20c384",
+      "bytes": 43137,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/src/tls_registry/material_tests.rs",
+      "source_git_blob": "f42dbcbdf4b983861717581b23f3dc041f1d0781",
+      "sha256": "6e3eed033266bff5a9e55b1dab60393d07846f3489cb6bd0f319ebcef9586eeb",
+      "bytes": 17448,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/src/tls_registry/materials.rs",
+      "source_git_blob": "8232c8e0d8c513f9eb7b988492dd823d6e3804e2",
+      "sha256": "5ac06b352f0e9fdb8cd867f8e6a9686078b09707169679b1c6601fd49d8b0610",
+      "bytes": 14124,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/src/tls_registry/pair.rs",
+      "source_git_blob": "c1961a5461442ca90ea423ec702ab4ab6f336c0b",
+      "sha256": "55ee2cfd83acadf87bbfc2a7c4545b4b27fe84970d770f9975a157431ba69dea",
+      "bytes": 4190,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/src/tls_registry/pair_tests.rs",
+      "source_git_blob": "c579cefe7aa2d6b843db60948283e095332ce887",
+      "sha256": "1a68942c4b73dca038ed0f75b157b0a7b57e89cd058310fec6866cc0c02aead7",
+      "bytes": 6194,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/src/tls_registry/service.rs",
+      "source_git_blob": "1b7851f630be08040b7746861ca5ef9835faf75e",
+      "sha256": "31f5da01b65a7e6d564eb52d7671aedc3eb4be46fad811e8f75e4b5509f73a3a",
+      "bytes": 19350,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/src/tls_registry/service_tests.rs",
+      "source_git_blob": "1285e60c85339f517015b8a7bed7e49e47e073e0",
+      "sha256": "414c4e8373262ba46c49f001e6962c4c9635d1c2637f98434c4ec1580e5e59f1",
+      "bytes": 22904,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/src/tls_registry/validation.rs",
+      "source_git_blob": "3b4f9661703fa034a79a288269acf029e7aaad1b",
+      "sha256": "147d63ab1a7e7f606c47978b3526ac8b35ac57c5e1e396895bb8ed2e3f4892c7",
+      "bytes": 4445,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/src/tls_registry/validity.rs",
+      "source_git_blob": "a45cb0f200c2378e9c6bea56c027103f9facec63",
+      "sha256": "376635d7d9f4822da20bbdcb875ea55731126dcadd66c623fc57dd85390f2d4d",
+      "bytes": 5047,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/src/tls_registry/validity_tests.rs",
+      "source_git_blob": "8a3d3b878cac6d414add3793fbaca94c50ef8e20",
+      "sha256": "65d18afa003ad29c8bdb459385e25fe20e423552c8a3cea0c63093704c15645b",
+      "bytes": 9843,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/src/tls_test_pem.rs",
+      "source_git_blob": "1ba5a43518aac510538d0b04a400ac30c9b5df2b",
+      "sha256": "e36d47dc72c88ad2a9f22e2548022433901cea486bfefef121dd60b1588fee28",
+      "bytes": 875,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/tests/fixtures/ring-public-rsa/LICENSE",
+      "source_git_blob": "2dac4d9d3f09e40afe434bcf24734a821fe5a70a",
+      "sha256": "b3d734001a94efff3579978d953391aa7115f877657d25eb54037a43875d078a",
+      "bytes": 499,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/tests/fixtures/ring-public-rsa/LICENSE-BoringSSL",
+      "source_git_blob": "a0f82a1f8ea9c0a5fd2707d7c9939778ba756b3e",
+      "sha256": "005fc765ddc5115da796cca915baa9557abae13ff35e0a47c47affc56f6c414d",
+      "bytes": 14870,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/tests/fixtures/ring-public-rsa/LICENSE-other-bits",
+      "source_git_blob": "bccf030aec4e49f96dfeb3a2cf5086df7420fcb3",
+      "sha256": "f025ccfb7dfb6bdfedc75ca0f67acc69e6fb4998143d834f7c2f38a29989680f",
+      "bytes": 731,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-control/tests/fixtures/ring-public-rsa/README.md",
+      "source_git_blob": "d0e58d9852e4fd3616d846495f9b251c8e7ad83c",
+      "sha256": "0ef45c3569016aed5205ccd2bf686ff763e00694bae48f99b11f074ea0b58a79",
+      "bytes": 729,
+      "mode": "100644",
+      "source_sha256": "f8b7939e11775cb3f4face3e851e1db07fd45d2957d156801b34d99a80325dc9",
+      "adaptation": "Document independently checked crates.io archive provenance rather than unavailable upstream tag links."
+    },
+    {
+      "path": "crates/vp-control/tests/fixtures/ring-public-rsa/rsa_test_private_key_2048.p8",
+      "source_git_blob": "26c480b150b7df1f221743a12bbe7a3405d3c4ef",
+      "sha256": "a0d95a0b133b4c217bc11322b67d62eb13537b8a9f66e20b5c9b5ac31af21859",
+      "bytes": 1218,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-core-adapter/Cargo.toml",
+      "source_git_blob": "c7e0709648218fddafd66c7de49f18b054647db3",
+      "sha256": "d91660a4016d5e46c275b26843c72346230c223884a58c8efb1bb5616d39084e",
+      "bytes": 1955,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-core-adapter/src/bin/managed_worker.rs",
+      "source_git_blob": "3aecd243f6bb55bdddc3981dc55a6b7c21404888",
+      "sha256": "b7f87b0006935e9bcbd660f462f6a057c2543ea3b1b99e0930c49681df4d9152",
+      "bytes": 8346,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-core-adapter/src/capabilities.rs",
+      "source_git_blob": "66c8f91e0219792648cb57691f6828ad3444cf6d",
+      "sha256": "25723b263044468da391c096f8202dc9bb43de9657498ad048d2d371ff54b1cc",
+      "bytes": 2110,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-core-adapter/src/identity.rs",
+      "source_git_blob": "2bc372c455786f636b900b0cd276abafdd7d5337",
+      "sha256": "edbd237cf29f97bb9893a4217e55c127448df68ebc85fbdefdba97ec96dd2e20",
+      "bytes": 3398,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-core-adapter/src/lib.rs",
+      "source_git_blob": "51054b6e77e557dbec7bc1f9953eb13c7926e683",
+      "sha256": "ee24e8945c1385657d0d6c6c5ebcd0bf175d7c1f93d8017c302c9c0edaf12907",
+      "bytes": 825,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-core-adapter/src/listener_config.rs",
+      "source_git_blob": "e8f82dcc4fd7a7cfd84862fe69ec2de8734bd23b",
+      "sha256": "41cbc20ce5bb1a80808819b3c70ae9252c4fbf4cb276d816a9f15d1f21a0781e",
+      "bytes": 4426,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-core-adapter/src/managed/mod.rs",
+      "source_git_blob": "2626593464a1edd4df17af61799d9a1bba485eca",
+      "sha256": "de7e5a2f0136d67b9e5c9c7e42c9babc7be105e82d9353abe16e3ad8e16eef17",
+      "bytes": 17911,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-core-adapter/src/managed/protocol.rs",
+      "source_git_blob": "0ab28a8d63234b416c627c1223bd35e6ae67f3d7",
+      "sha256": "064eee47d9a26abf7c8a06516377469f09f6e5be9efbd6f242b108a14c4f3c60",
+      "bytes": 8890,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-core-adapter/src/managed/sealed_executable.rs",
+      "source_git_blob": "918f31610a7431af78472bbc1e18c334792afc24",
+      "sha256": "7bf9a0c6d1cf2ac919bb07776cea4ad84c4f7ad911f19c69179b362c8dadc919",
+      "bytes": 9261,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-core-adapter/src/managed/sealed_executable_tests.rs",
+      "source_git_blob": "c8b13ef245742b21f6ae15ed0dfe449c3dee3566",
+      "sha256": "628b0627d9743f0f69a42fb383a0bf0f0f113ebc0c71c01579cb4c486946ec21",
+      "bytes": 9613,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-core-adapter/src/mobile/config.rs",
+      "source_git_blob": "ce6c852d44583c412435ce2574baae53c4cbb0b3",
+      "sha256": "b84f85727046ac75d40cb382938314c606224abe6e363afd8871f170efda44e1",
+      "bytes": 19076,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-core-adapter/src/mobile/fd.rs",
+      "source_git_blob": "37aaeca49c2c0e54505974567679301dd784e67b",
+      "sha256": "daeeb2cb6a2128c237a8b0eb84396426214dfdd7c4e55281ae4cc63ed2b109ca",
+      "bytes": 5934,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-core-adapter/src/mobile/ffi.rs",
+      "source_git_blob": "4021f853bc53e620defa2c3dd2f3627167f7d4b3",
+      "sha256": "a62cf3ab16ce65d015a6fb303d43c197c69dd0fabbaf09fe851ce6faa11cdbe2",
+      "bytes": 42280,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-core-adapter/src/mobile/mod.rs",
+      "source_git_blob": "a54a07cd4d30607b5c782442eb0279db9789a224",
+      "sha256": "9bbd3244ee4f13c8d91a7a8512b960b0db884694b084a1bffc0e5a0ebd38778f",
+      "bytes": 21100,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-core-adapter/src/runtime.rs",
+      "source_git_blob": "9fbf2f26a3468dea7b38c371ebb9ff747f2b236c",
+      "sha256": "b35e5664f7e0c4ab8f65ceab327e6c9237fb588ee9fa09f16f85f0269f42794a",
+      "bytes": 4984,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-core-adapter/tests/fail_closed.rs",
+      "source_git_blob": "d0806a10a15d924ecc2319658ccc350e30974e0a",
+      "sha256": "a6af7d3c28f86d734b8be9c192b7b2a4868a4c919a97ef95e49263564beee351",
+      "bytes": 6547,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-core-adapter/tests/managed_runtime.rs",
+      "source_git_blob": "04288af7215fe585709c184e3bb2e50dce86e4f4",
+      "sha256": "a2de6c9c8eca25e34a8761b575c3f7981b82da7adb9a652decba86e2173c42d4",
+      "bytes": 15533,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-core-adapter/tests/mobile_abi_contract.c",
+      "source_git_blob": "6c118b5ddf892512c66d154803f27d5b1415e545",
+      "sha256": "1df1fc558c7e74ab3ccf0f3f4fa0185830be17862d5a719fb6797ba2548bdb38",
+      "bytes": 2120,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-core-adapter/tests/mobile_abi_inputs.c",
+      "source_git_blob": "4ce632f659c83a59dd092ab7a38eafd2fd05f546",
+      "sha256": "49d1b129a5fd68b4a6218b107cbe94ee56d29d4bcd2c6cea936f8d2e8528284c",
+      "bytes": 1503,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-core-adapter/tests/mobile_abi_lifecycle.c",
+      "source_git_blob": "2d0676835c3c5a353c1e36392e01be77900a6379",
+      "sha256": "80c1bb7f9e2538f8c21bd8cd82a5f93842b0589cc0f9883fa3763b64179a500a",
+      "bytes": 5062,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-domain/Cargo.toml",
+      "source_git_blob": "ade0bf6ef1f137a689b56a2e91019a8764bb405b",
+      "sha256": "30fac79700845b9a74146a9cd25f26046aad01b9adca88bfd4be8702b34e51dc",
+      "bytes": 373,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-domain/examples/export_schema.rs",
+      "source_git_blob": "ef32c947f14ff55c6687521e35177a93463e1632",
+      "sha256": "2370ab69379390517921740bd99262b0161bfdc635aa9a5536a01980409070ff",
+      "bytes": 4371,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-domain/src/capability.rs",
+      "source_git_blob": "b70e3f5f4f95f8d35f47eb88ec4ffc0e24e6d69d",
+      "sha256": "ab76e9eed003d60f7d33162844bc7acbc32570e514f43569dc6700ed22731e3c",
+      "bytes": 5986,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-domain/src/envelope.rs",
+      "source_git_blob": "c2c17f61c98ea0b5f375ce35ac3112e905dfffec",
+      "sha256": "e06adbe4b370cd9a57cedcddb2de8f89a5a8662c8a8e092e1133f8eed08dbbfa",
+      "bytes": 3677,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-domain/src/error.rs",
+      "source_git_blob": "5d0e55a13c7b8c1b0f055c1aa1a0dfb3234f2f7a",
+      "sha256": "fffba329194eca7924f0db8573d18c846fa68124358420c352e745cbb0159d71",
+      "bytes": 4046,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-domain/src/ids.rs",
+      "source_git_blob": "8e7c944b8be830848959c49761d8479eb64d2843",
+      "sha256": "4fcc1e60d1bab7ecfbf6bd66f522e407c2fec30c99ab42359db0bcd934c8225e",
+      "bytes": 4317,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-domain/src/lib.rs",
+      "source_git_blob": "3db0781acf860939d8f3561e390e8b25b8c0ee93",
+      "sha256": "314aa88ea77df3a596182ff2c2958f932b31660a387a8c30de09d78afb9eed7a",
+      "bytes": 618,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-domain/src/management_secrets.rs",
+      "source_git_blob": "ef9102e5f96dbb145ac9b535c0cf1064281f6bd5",
+      "sha256": "45d5516380f27216fffb281e5c6c4944b29cd67deee2fb5283c6b8488f93000a",
+      "bytes": 11311,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-domain/src/node.rs",
+      "source_git_blob": "d943840e87d3c258dc74674cf2b24457411a3b22",
+      "sha256": "9f160afb55a16a8ece7d61e05912fb044bebd5c936a7f7bc02a7964e695625b0",
+      "bytes": 21781,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-domain/src/operation.rs",
+      "source_git_blob": "d86dc5a4ebc03b92b92ca97911525d1071658cc5",
+      "sha256": "5dbe802c0c2cae8a8c880f4abfda146f5be18fba637bd8125686230a7f2b4ce8",
+      "bytes": 3299,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-domain/src/runtime.rs",
+      "source_git_blob": "3d55bd3d3d1722be9fe8746d96b9e1e84fe711f2",
+      "sha256": "eec0f9db2f2b950f6f6930b71cbcf924c7528978cc574f75facaea1ac41f8d8d",
+      "bytes": 7403,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-domain/src/secrets.rs",
+      "source_git_blob": "a97448175a50bc0051b17d1cc58b12ff9f4fe82f",
+      "sha256": "8329b5ff5e8bc53e235b87c91fe0be41aa02d636a15110efa3f2c135e5ea0131",
+      "bytes": 2797,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-domain/src/subscription.rs",
+      "source_git_blob": "8b8ccddafa6c047f51b4a22b7fdf97a9407487ed",
+      "sha256": "816fb71044025e7e5df37c04ddb7c9cf843ca26fc209f94cb0df10700d022fad",
+      "bytes": 6195,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-domain/src/version.rs",
+      "source_git_blob": "57f16596b609f0b8b301a7608495b1219a935f46",
+      "sha256": "13f85a36b1581e93c992573fa8029740b2c7d9fd298607b9856f3ed086218df3",
+      "bytes": 3914,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-domain/tests/contracts.rs",
+      "source_git_blob": "17edad44e5d5cfe715bd8ace9b9d7006ba10c9ff",
+      "sha256": "7a2b175d3aadf5c468b2185518d791e88dc596e02e13a45bda481b4827457f9f",
+      "bytes": 15064,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-domain/tests/management_secrets.rs",
+      "source_git_blob": "05fb8847898829d46d55fe6e11cb2a500cbf2018",
+      "sha256": "bdf5731dd5bdff31d271c645de8130dee215e648609893c71c67371b082fc51d",
+      "bytes": 6065,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-import/Cargo.toml",
+      "source_git_blob": "d80d4eee0113840ab1e3675d783552c4b1a5a353",
+      "sha256": "14d83a590e6f14f9eae31a3a16045543836adac139112a93d1a815617acb1a34",
+      "bytes": 398,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-import/src/encoding.rs",
+      "source_git_blob": "141d22551a215046900c672efc46ae085b76cb1b",
+      "sha256": "08d89d549208d72f17c086c0e3624d9b06378096ccf347001ac9e1dbb700612e",
+      "bytes": 2919,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-import/src/export.rs",
+      "source_git_blob": "40fe50357cea32e0c9c6ddff1b1e06a78ce03e3c",
+      "sha256": "53813b31a092b568ef154fc476023944d2234c5aed83f449973a7bf81efaafc5",
+      "bytes": 8813,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-import/src/json.rs",
+      "source_git_blob": "eba04bfdc0e930b603dd197598be4cc0192bdb72",
+      "sha256": "a6c8cb628bc2bffc716caa429712cc83482452db7d4500271495e52595ba3da9",
+      "bytes": 22290,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-import/src/lib.rs",
+      "source_git_blob": "15f1d5d1cd4be1e676c1507fd62d869455d8bd23",
+      "sha256": "57581aeb76c20b55a567f02e8742303346a3bcb211caa715db41e90a25ca3f4e",
+      "bytes": 18616,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-import/src/uri.rs",
+      "source_git_blob": "6f0f9b8fa2cf6d6b9ffe5b2a0bb6d07716b3255b",
+      "sha256": "d7635732d7144d7ebf4642855b07133f20e18a39383ec41a225a142633b37e6f",
+      "bytes": 15944,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-import/tests/import_export.rs",
+      "source_git_blob": "c8999ddbcd1be86e5b5b419002bb53f01b4bc4d0",
+      "sha256": "bec86c18b1179fe63b5fb8e970ec2b40d4668d7f93eb3f6df493e41da60fcc40",
+      "bytes": 16068,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-managementd/Cargo.toml",
+      "source_git_blob": "6fde9c2a1754a6a5a9bd2ed4e70dfdb1bea1408d",
+      "sha256": "2d149659b5135f6074c37cc163787316eb51f3b7a61fea53322a2cf1e07088b5",
+      "bytes": 1425,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-managementd/src/bin/fresh.rs",
+      "source_git_blob": "431ef086bba9512332060a78e7246490f31d249a",
+      "sha256": "1e91cb1bafcb9e97d33b67b663e7f1bb6161ea23df51f8d2149e4490f52670b4",
+      "bytes": 369,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-managementd/src/bin/fresh_runtime.rs",
+      "source_git_blob": "b67f3915e025edf38d9401130dae86c4fa2163a6",
+      "sha256": "ee954a4847d665f305bd13fe0353249dc55282fcce12fd198578d7d00dbec479",
+      "bytes": 762,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-managementd/src/bin/maintenance.rs",
+      "source_git_blob": "d9911ca7e52cf42db7cb68b61e140e6519a69d3b",
+      "sha256": "ce9a10ac11d69c28a5cb3327c57c617977b7419eb10fcdb1257568a5cec99cad",
+      "bytes": 445,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-managementd/src/fresh.rs",
+      "source_git_blob": "ffd94ce3aa9961976f922507f9f2b769595c5bd8",
+      "sha256": "fd9f7af62fb64ef816cb4d00b2e7041746a32efff9ef285aad5b52a6485b4949",
+      "bytes": 16383,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-managementd/src/fresh_runtime.rs",
+      "source_git_blob": "84e26c956964f9c71c24899652d33781dbeeebcf",
+      "sha256": "e51a74eeea7637bae276aea99aa450cf6c21ec20470d337dd5c373e4ebbe3ee6",
+      "bytes": 26873,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-managementd/src/fresh_web.rs",
+      "source_git_blob": "48e929946907f5f9cb7499053195cfe25784c309",
+      "sha256": "874e9c9495ff4d20a84390d3ee0183cbb00e45f7e27e69d63a053fd40e49bac0",
+      "bytes": 7231,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-managementd/src/main.rs",
+      "source_git_blob": "10b5c72b22d851f2495ddff4bb033ee6d54e9405",
+      "sha256": "b59c49f1e6bf578878c6fbfc02d13a1237c4b513033a7fff67ddf73c074d9588",
+      "bytes": 17432,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-managementd/src/maintenance.rs",
+      "source_git_blob": "c5790b0a880e3ee27b2d0af37d6d1a83a2edf365",
+      "sha256": "6fce104b0da75fcd7687589766f8f68208912b1e6ee29b15f6f9d1b0f686812d",
+      "bytes": 18253,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-managementd/src/maintenance_tests.rs",
+      "source_git_blob": "d413b7d176ee0e5a72c940ff44c77d98190c062c",
+      "sha256": "766f6b658b4d5062c974aa80fa9a113d36bd90624010d111883081cfc598afe8",
+      "bytes": 16450,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-managementd/src/probes.rs",
+      "source_git_blob": "1088b9dd3cb2ab9cf7e94dfb86f27274ef795b13",
+      "sha256": "ea7ed3937d0426804f7aede4e6563e403198bf45db0b98b96466afce2eabedb9",
+      "bytes": 18096,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-managementd/src/runtime.rs",
+      "source_git_blob": "f3bbcd7d770951db8c089215e2d80bc014953c5b",
+      "sha256": "1666591e77827fbe56429c7e0512022baa5e5515c2526a730844631c3e9ed7fa",
+      "bytes": 6428,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-managementd/src/secret_generation.rs",
+      "source_git_blob": "914717e93c9cbf8a3307f25577cfb8ce726ce15b",
+      "sha256": "273c9a9a9e4b60761796c4b63e51286c6432c6867a6263eca4b0c151a4c1e527",
+      "bytes": 3433,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-managementd/src/secret_manager.rs",
+      "source_git_blob": "fd955dfaf5ad1f23c0c1a5038cf8b0f0a0ddc541",
+      "sha256": "4b6becc7472f51bdb0e71844185d0e97da133c0797de75ee69f0abaab5922526",
+      "bytes": 4411,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-managementd/src/web.rs",
+      "source_git_blob": "ecf7d9ecb23ed843963d364819f05f3277d14182",
+      "sha256": "7cca50e4132ee639056499b3f22ec871aa94300cc4de88f413c5e6a00f2bca0c",
+      "bytes": 8257,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-managementd/tests/fixtures/vless_loopback.json",
+      "source_git_blob": "3ab9402b7f54dc4cedaaf84318d7d0c2ebbe91fc",
+      "sha256": "066498d991a11eaac79136e7c8316da21caf99714b1af9387a4ec1b4883ba786",
+      "bytes": 773,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-managementd/tests/loopback.py",
+      "source_git_blob": "cc1504b97526de84ef8080b53ffa06db0a5f7613",
+      "sha256": "0dcd71dc58d4edaa1e9ed64a9219f182dae2a634857fbc846e8dddae73e7f9b8",
+      "bytes": 10154,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-managementd/tests/migration_cli.py",
+      "source_git_blob": "337d2a31a9a2fb7d85d777d80dc2aa7db89defd3",
+      "sha256": "6ff4db1cef4807e18e82256bf466b52069e123c798f72f9cb5cd050ed5d7c56f",
+      "bytes": 9134,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-managementd/tests/runtime_http.py",
+      "source_git_blob": "d8320ee765365de81e73d51470f11c63af698504",
+      "sha256": "893353b14d61547e90977d707442e6b003c6888b2f6e6e8de1f633fe51de6a64",
+      "bytes": 15859,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-managementd/tests/serve_browser_qa.py",
+      "source_git_blob": "bc17648c2382e2699430d79fa30dccb1d486f07d",
+      "sha256": "b478443f96b7a6ce5a7c478a3855f6a577b08b9d7004870547672d75891e5bef",
+      "bytes": 1890,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-managementd/tests/subscription_http.py",
+      "source_git_blob": "187af4f013464590573cd524c4a72d5ed8d3fabc",
+      "sha256": "0e20140efc87110c31e3c657f518c21f3771c61fb703f501db4245b79a965a40",
+      "bytes": 42011,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-runtime-executor/Cargo.toml",
+      "source_git_blob": "61cf1e6648c3bfa9ec90d5bfed8f326fcf3c7f7d",
+      "sha256": "855710c3b9a804f4f1c8611b734bb2854bf30a7081b737d73a88ac5cf707dcbd",
+      "bytes": 801,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-runtime-executor/src/durable.rs",
+      "source_git_blob": "aad3e4f7f626201c97d57a5783324d5a46ff3a26",
+      "sha256": "2a598e0d6204bb62e37e61d715b01914e36fa06e38d273ae9038d345632d3e40",
+      "bytes": 24540,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-runtime-executor/src/lib.rs",
+      "source_git_blob": "924da0f1bb1c77edd449a3b4258c637e0b1668b2",
+      "sha256": "c921cfe7c4d4df55ecd9d6be38fce0672727bdcefb6ca664945cfe72f0ba7112",
+      "bytes": 45161,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-runtime-executor/src/ports.rs",
+      "source_git_blob": "6f53ad8e117b5419d04b49308283bbca67e6c914",
+      "sha256": "8b65081e1e11f2cfed14f3aa2f84862ebed7fd05a10effcd260d6fc88eda5ad8",
+      "bytes": 4889,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-runtime-executor/tests/actual_worker.rs",
+      "source_git_blob": "534287fa7ab690f4d4161b6830cba0c43c114882",
+      "sha256": "1c4f346adee3204b8d5b66f1fb6212fc6dff7a2e0c8cc0627695cad5c0daa2c2",
+      "bytes": 36453,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-secrets/Cargo.toml",
+      "source_git_blob": "42b5761c23208a76dc32b219075ed5c9d710be04",
+      "sha256": "c16c65e1a0074db7b587a7e5f0cd773a3570b27eefb3e92f9c8e09aec92ec90d",
+      "bytes": 1307,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-secrets/src/crypto.rs",
+      "source_git_blob": "eab6637ca00434adede2a94d56c72298ffd01274",
+      "sha256": "1b14f0236ac2072208f67a3e1c718063986971a0a22d9776d4f05aa43ecb5f71",
+      "bytes": 7731,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-secrets/src/filesystem.rs",
+      "source_git_blob": "4146aafdf0b0362274befd9bb3891542ea69c475",
+      "sha256": "11a79bf71c15c3ebd751d9e3865339b776f97266eb544a1fc7e875d87b33b050",
+      "bytes": 12793,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-secrets/src/inspection.rs",
+      "source_git_blob": "f65ada67d6a9e4b160eafbcc57ce5f455756abb6",
+      "sha256": "fe7b1e3544e4a59775191a4b1ad72424c15bda0b5b9ce18c7d1b02355237bcd2",
+      "bytes": 7497,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-secrets/src/inspection_tests.rs",
+      "source_git_blob": "3047f2e85ee2724643cc666ea3a18041c58ec4da",
+      "sha256": "bc9c1410c9abb260cb9522f4411513c52dda1a0fd26c55ec72718005f0a4a727",
+      "bytes": 8269,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-secrets/src/lib.rs",
+      "source_git_blob": "0202170d386edddfad45927eb86183f1d8d4f38d",
+      "sha256": "4be8d81f7a163b630c6d41f8b2ec81d8257ccda8e51dcb2858f4e59be694a9a1",
+      "bytes": 1055,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-secrets/src/server.rs",
+      "source_git_blob": "c3fc593643e9467398744843c62d0a94690b158b",
+      "sha256": "a54772a979f83992bd312790de6a8d2505a4231bf523bd54aee9412a8932284d",
+      "bytes": 24129,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-secrets/src/server/tls.rs",
+      "source_git_blob": "798bf54eb18c6c3feff19e0b8da38f59d3ef4a4f",
+      "sha256": "a5e047db0a938f9a8e28dfcf0b97899f80b67d5784aaf6858a5608256d926d7d",
+      "bytes": 26837,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-secrets/src/tests.rs",
+      "source_git_blob": "d33b4429849c1589bbabc177a760811a08473a30",
+      "sha256": "eb6caa87ba7344e68608cabd1669f7a7168b422beb35683584a03083daf6739b",
+      "bytes": 35754,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-secrets/src/types.rs",
+      "source_git_blob": "1ebf84ab102c29fb7e8ad1f385c9b9b934b31a39",
+      "sha256": "e5acc0308e70e2f47de3392dbc15215bef79d72eb0f37479161724708b1279f2",
+      "bytes": 6401,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-secrets/tests/actual_runtime.rs",
+      "source_git_blob": "a9fcf29377f806a0c84c5a15ecab979e0268b366",
+      "sha256": "eebadb70a510315941d78a8ecabbe14e08f6494e3bd7c57cbf7fe9c37852f878",
+      "bytes": 18744,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-secrets/tests/tls_import.rs",
+      "source_git_blob": "cf2116cbb4b30b45af1b8e07960839da4e2befba",
+      "sha256": "f95044b55d88bcd391909e21f0c2c2eb28d4cbcedef3e9e2b224244571215cde",
+      "bytes": 10594,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-storage/Cargo.toml",
+      "source_git_blob": "6b7d860d0d1a8c4f9f65db8a295a134474b9f0dd",
+      "sha256": "1a429fc2fc57927f9e259ae1e051d0258955f6765630b23f04ff460270e413ea",
+      "bytes": 693,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-storage/src/artifacts.rs",
+      "source_git_blob": "96b0cc848d1d210838acec69c55e3254f2d4e187",
+      "sha256": "a0834c1b7f95fd9bcf962d6f16221c86a4c40dc6cd30c0b459125cb1fdfb3f31",
+      "bytes": 17858,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-storage/src/bound.rs",
+      "source_git_blob": "18e958b0f49fc31ba989d5acd4bb72fddf2c9b48",
+      "sha256": "014a3ac36911e0fa75e51e62f5dd5ff1a010c4ab7da5538bd42e42150ea34aa6",
+      "bytes": 16644,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-storage/src/fresh.rs",
+      "source_git_blob": "9a6f00ba5f4a39880d17b292facac4d57d44438b",
+      "sha256": "a7916b62f26adfc0b9c80f8248a0f8886ac047db1221c36d477d8390f5968c60",
+      "bytes": 12384,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-storage/src/inspection.rs",
+      "source_git_blob": "91901f77b6a75dad0d18138a5b5403ac41202a2a",
+      "sha256": "8ed36df59467db62af9bca5b5f01f27ec10d9ca4d9c5273abce8732ea7b1f1e9",
+      "bytes": 22570,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-storage/src/inspection_scratch.rs",
+      "source_git_blob": "6d245c48138431b8bf3a031ffcbce18d5adabcd9",
+      "sha256": "173e8a790e255fde8035a8aa3d61543ac7484038184e9a51641ea9926f481111",
+      "bytes": 23021,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-storage/src/inspection_tests.rs",
+      "source_git_blob": "6b79a0b16b61c6732bf9eb8b9bba2eaeedfc53b1",
+      "sha256": "96f17484d13cd72a59852cead274d20e8738c6b6dbf750fe9698f79055335a38",
+      "bytes": 10726,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-storage/src/lib.rs",
+      "source_git_blob": "d000e6bbc5dd28afc726893275b1de5c9ca873dc",
+      "sha256": "483b480c70a4a146bd931b95aaca5755b0a21e7f1c0dfe2ac7891d508d320c41",
+      "bytes": 1589,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-storage/src/migration.rs",
+      "source_git_blob": "698ba1b4470fdfc01781dbda4acaff76cc25f33b",
+      "sha256": "648a2835b6af496e374b97e8caaba52daca9dd4ebe84a222260e95fb269c39ac",
+      "bytes": 47194,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-storage/src/sqlite.rs",
+      "source_git_blob": "07aef81e61e7c8979367407e09bf5f54daf36056",
+      "sha256": "4619db057d8c8b14fe63378639cf1960f67c6afb613d895c823ee883a36b701e",
+      "bytes": 18068,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-storage/src/tls.rs",
+      "source_git_blob": "82ff29c1ae7ee9351222a2e3fd2a77a5dd8b69fe",
+      "sha256": "64c3a96f4dcab50b7119fb8fa31be2757b713a04feb0461a3c587f89715dcf93",
+      "bytes": 27070,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-storage/tests/bound_directory.rs",
+      "source_git_blob": "f731bfb3736b0208e2dd948237d80aa70ed34c49",
+      "sha256": "de04b7145fc57c0a8524c777ee239be96e58da00d413e9bb9d485edf1f80fbdb",
+      "bytes": 2918,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-storage/tests/support/tls_lifecycle.rs",
+      "source_git_blob": "5dfb41ec8f1dec424b8f2c1f32b45937cb50ba4c",
+      "sha256": "6fec6b49f38757a43088b8b7d3c6a3cf73468e7caba283abb5356aa3590a6d64",
+      "bytes": 19722,
+      "mode": "100644"
+    },
+    {
+      "path": "crates/vp-storage/tests/tls_profile.rs",
+      "source_git_blob": "e46dce4e97abfcdb156989fb3adbb9e49cb649bb",
+      "sha256": "4d2d5f9f121fcc7ad9c5d3022e1595086b227eac87dc777dc786a83bc663b30c",
+      "bytes": 7705,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/.gitignore",
+      "source_git_blob": "436c30ff7df226ff422ead41f2f13a1e9d123359",
+      "sha256": "51546ba2efceb5842e7bb77c428e266040f2c389245efce9b4be937e997f8545",
+      "bytes": 170,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/analysis_options.yaml",
+      "source_git_blob": "1d0ea99534c87c01622d2f694241562ee927b210",
+      "sha256": "d439104f6731e63db9652a5f87c9636f7d116fbd9967c3e62e4d1a678bab5154",
+      "bytes": 382,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/apps/vp_admin/.metadata",
+      "source_git_blob": "faa9f99bb65483085025ad156fd5573fe4c1ab33",
+      "sha256": "6d1bfedd2e999274104436053e31bb7cbb73e6ec20fd9e7af729203d79e5dca1",
+      "bytes": 964,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/apps/vp_admin/lib/main.dart",
+      "source_git_blob": "5c6a8831a132e33480a0ac5159b174620a5f2236",
+      "sha256": "bdbbd5c4c0e1fde39458352ca2ae9a7b95dbf851b2fd1723395da01898fe7e3b",
+      "bytes": 4209,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/apps/vp_admin/pubspec.lock",
+      "source_git_blob": "f59392777932f24c84ef9b06700ef8c2e3a6e7d9",
+      "sha256": "8d288fdcdfaf2854fa49ebeb896db083da645cb4415b1c967f297c10829b7471",
+      "bytes": 16671,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/apps/vp_admin/pubspec.yaml",
+      "source_git_blob": "c75a272ee822ba4ffda36740cba44457ca6b9800",
+      "sha256": "dd11dc57a4e25245837c74b1a565526588f0319df7364c857a7785c03ee27c1c",
+      "bytes": 629,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/apps/vp_admin/test/goldens/admin_login_dark_desktop.png",
+      "source_git_blob": "37d3ee5bb2a8b584da0b236c5104f161e9028746",
+      "sha256": "927720ceb689fd59e2ea261a17a5a61f1d1ec321c7aec02c877348f17302d17d",
+      "bytes": 89035,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/apps/vp_admin/test/goldens/admin_login_dark_mobile.png",
+      "source_git_blob": "980ca1c90f32206f793a9aeb144299a8003e65ff",
+      "sha256": "428dc16d59d45abfe08e8b9abdd7341b243e0c211be56e0a63e9a8afdce547de",
+      "bytes": 44250,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/apps/vp_admin/test/goldens/admin_login_large_text_320.png",
+      "source_git_blob": "473f5567cc37bec1f360e0b5f4c023025dbfa86d",
+      "sha256": "a8c50fe7d07dbc261bf7a61e79970fa92980c9ea1616483cbc95a4f5c48eaf36",
+      "bytes": 65820,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/apps/vp_admin/test/goldens/admin_login_light_desktop.png",
+      "source_git_blob": "531f684ac9ff62a53d3edcaeee0adb4a9982bb50",
+      "sha256": "040bf094653a9fce7b05ec9e72a01cd239e72ae74cdd5f698f55e04daa39dde9",
+      "bytes": 88562,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/apps/vp_admin/test/goldens/admin_overview_dark_desktop.png",
+      "source_git_blob": "fcac21ef4aaf823cddb557daa2eadaf8e0a41bf9",
+      "sha256": "c1011bb007ef3c2bc8b34b903752e754ea2b4bf786df12d2bed3e5aefa455d23",
+      "bytes": 149264,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/apps/vp_admin/test/goldens/admin_overview_large_text_320.png",
+      "source_git_blob": "b8d7b8cf4840557beaf825f9ff6df72a71d9c49b",
+      "sha256": "69b307347b4e415377b2cf6cf1c21d3e3103a0453029fff28d97d12bb305e48e",
+      "bytes": 67687,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/apps/vp_admin/test/goldens/admin_overview_light_desktop.png",
+      "source_git_blob": "4d1e58ce91f7a1381576a98471bf1f066315c5f6",
+      "sha256": "7289ca8eee99ca05fb399525b9e411fc986158b838f5365fcad776cfc2a1c55f",
+      "bytes": 149289,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/apps/vp_admin/test/goldens/admin_overview_mobile.png",
+      "source_git_blob": "9645c80c10b758af20054ed0ea9b63aabddfe435",
+      "sha256": "a7c9c39be91374632c239cfa2fddae68d71adcdf54081bd7f5af80cb34b11528",
+      "bytes": 62482,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/apps/vp_admin/test/goldens/publication/credentials_desktop.png",
+      "source_git_blob": "184fa341a71715b2d570a2b2672a7c0849767cb2",
+      "sha256": "747370a36250c1650ba07b7dc0fd0c0034d020556c8c612ddd0b858312fca977",
+      "bytes": 123076,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/apps/vp_admin/test/goldens/publication/node_wizard_desktop.png",
+      "source_git_blob": "10496430725bcfa78b36a1ae6892f77bad7c70df",
+      "sha256": "591093ed7d14cc779a2615949ef6c12c0431479a44c4f6ac756c0b3c10411ce4",
+      "bytes": 140662,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/apps/vp_admin/test/goldens/publication/publications_dark.png",
+      "source_git_blob": "8e8698efbe092a78f4ea2986b5928a250e400aa0",
+      "sha256": "1f9f535321baaa7e0250a913dad12bf31ebbca698aafc5c8e691c5571833b2da",
+      "bytes": 114864,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/apps/vp_admin/test/goldens/publication/publications_desktop.png",
+      "source_git_blob": "81246553827cf1afa4ac1d74e4d2338457e25c15",
+      "sha256": "95fbfeeb87dcb434846cda25afb7b25a5493c7f72828baed317d00ceee0ec4cc",
+      "bytes": 115607,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/apps/vp_admin/test/goldens/publication/publications_large_type.png",
+      "source_git_blob": "ef3ccc97df71c42038cfa6ea8125228b43f02865",
+      "sha256": "b89eb4ebd28e6e2b343b91339a6456c498c7ab5ec3619d913e293367b890072c",
+      "bytes": 70636,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/apps/vp_admin/test/goldens/publication/wizard_mobile.png",
+      "source_git_blob": "82d33eaeeb78f2e9bf4ea973e48e63bd31e2ca50",
+      "sha256": "8d10c9716ca733fdb3b2dbe8c980484943ebf441a93479db883fbcc1b3ab6a58",
+      "bytes": 78463,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/apps/vp_admin/test/publication_design_test.dart",
+      "source_git_blob": "4de56710aa134c2787a738cdd4fe59c4020f0916",
+      "sha256": "3920705026eac8b2542e46b3e065aaf3ed8a0d5dbc96ef47370c49ea56b9c3d8",
+      "bytes": 5132,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/apps/vp_admin/test/session_flow_test.dart",
+      "source_git_blob": "5f255fcb0ab96e913074526c0d1b8bb466cca11d",
+      "sha256": "71cfd1da049c8f3e6f76eb7b8efa36747757aea5570d3afc242eb278b495e690",
+      "bytes": 10117,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/apps/vp_admin/test/unavailable_startup_test.dart",
+      "source_git_blob": "bec87dbb912c374303cbea22fa4b8b2c7ed3b5d6",
+      "sha256": "c1a92a5af6ed990a93f193adfaa0b66a0c34b9e0b36a5c2bc77a5ff5e86c5022",
+      "bytes": 629,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/apps/vp_admin/test/visual_layout_test.dart",
+      "source_git_blob": "7b91676671728708d9e1f656f83750f8106d593b",
+      "sha256": "b0c131ae9cc462199cc63d0d23559b41741ae20eff4709092f67c54de3d09646",
+      "bytes": 5919,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/apps/vp_admin/web/favicon.svg",
+      "source_git_blob": "fab70bb9e731478cfcb9de38c8efc2bd9b9b6157",
+      "sha256": "82aa67a2e852f2fc72a444f2e6fc70025ac1db215ed68c07a3ecd9fee3ae1abb",
+      "bytes": 266,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/apps/vp_admin/web/flutter_bootstrap.js",
+      "source_git_blob": "1c5aeb0111b4f997e5e8867e7eb40df8d38c5157",
+      "sha256": "f24733295619d4c64b84030652ed7909f6622a1128f6f78a1ac651fc814ce401",
+      "bytes": 278,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/apps/vp_admin/web/index.html",
+      "source_git_blob": "c151611b7ed5799330e66fe010d5350dd1ce45bc",
+      "sha256": "9d7346cfc4e9a38f858d106aee51bec316f898a4c37ea6eb8466f241ac9b65bb",
+      "bytes": 1106,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/flutter-sdk-lock.json",
+      "source_git_blob": "179e1e813465399751443b107fdcd7cf9da301a9",
+      "sha256": "91b2af2758fcee7a4ef218b6abbd193ebd26c2f7555e7ed78023340fc03f1cfd",
+      "bytes": 694,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_api_client/lib/src/browser_factory.dart",
+      "source_git_blob": "cbe2b997c0b2dc195e8c6ebf70f99907ac615f60",
+      "sha256": "d689f343e6946fa9d9b486a4682b988523a08766cb159344248fc9ca17f96824",
+      "bytes": 330,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_api_client/lib/src/http_management_api.dart",
+      "source_git_blob": "700384e2464d66672fd982b67b65cfcd037fcd5f",
+      "sha256": "3dfc2789102b1456c16c6f72df9ec466706177204c6f4f274f302f9f388cce16",
+      "bytes": 38604,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_api_client/lib/src/publication_wire.dart",
+      "source_git_blob": "813d1d5217d9bab73c9d24e31f1634569ec069e7",
+      "sha256": "2d2f44c3576e7c41dc8a62d0b8edbaca8d80cd7da0938b2409aed8582f463027",
+      "bytes": 13107,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_api_client/lib/src/session.dart",
+      "source_git_blob": "0b527c825b6729116ae8a556b372b39a22b62ef4",
+      "sha256": "e1a8b36bd766c5d68b1e1e77f51870afb5c976e6c42afccdf410835b92de8fe3",
+      "bytes": 711,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_api_client/lib/src/unavailable_factory.dart",
+      "source_git_blob": "f4a49b70ca5e3ab4e126c7b9c009aa0a43999088",
+      "sha256": "a849b417a854cdb57766863d74af7ba263a91761f8e0fca2a08b0eff4634ca20",
+      "bytes": 121,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_api_client/lib/src/wire.dart",
+      "source_git_blob": "71a618944962d2fc277eece40fb4915ba97f6256",
+      "sha256": "2dd3ceb3334ad19143a1e819bb2c72a318540452c93d359621eeb5040220efee",
+      "bytes": 5515,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_api_client/lib/vp_api_client.dart",
+      "source_git_blob": "a720d06def21f931aa7afa270d9991838ea2529a",
+      "sha256": "70fd6fb7e3ab1ea23e05b62ea2c02b5cc704771611358891c0b3b3e002e96c4b",
+      "bytes": 4135,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_api_client/pubspec.lock",
+      "source_git_blob": "1aa94400396fb5de1e4ebdfc7f009a61b049a018",
+      "sha256": "36afe3fc1fe9d6cbf0619f0c1dd426a9cfa22397877cafc2cfce577c4a909dfb",
+      "bytes": 6413,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_api_client/pubspec.yaml",
+      "source_git_blob": "8b6aefff3e8ab031fe1efc4fcd84ae65e1e15d49",
+      "sha256": "86ba86cacb636a29fa2357393e009668929e8c6504c38edfa9657c2c2ff69b3d",
+      "bytes": 278,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_api_client/test/http_management_api_test.dart",
+      "source_git_blob": "2006c2135f26582e7bd344ced9ddd1cc4798c1fe",
+      "sha256": "13c412c2b156f0b94cbe98a5c8751e6c7f30006b3cb00b386b003de2f7733b1d",
+      "bytes": 11510,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_api_client/test/live_management_api_test.dart",
+      "source_git_blob": "a967f55ccb57f9edfccb56cb6f6b6460b99ab235",
+      "sha256": "72836db23eaa0cda0654d32681481a262641506889c93c779743a942f35cce7a",
+      "bytes": 4002,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_api_client/test/live_publication_api_test.dart",
+      "source_git_blob": "87297097c438f4f5654e6607da59fc69abd16019",
+      "sha256": "c83af87e079bbbd00e036694bb0be4a7e119bf89d36e851813a7d4bad90dfecb",
+      "bytes": 20892,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_api_client/test/publication_api_test.dart",
+      "source_git_blob": "fcf4637ef9d415ca7a1050a36547a377870b5d54",
+      "sha256": "088044e8cb22045c9a04929330ea9b5aa0ba4d030a4abd519849aaeb616bf5d4",
+      "bytes": 25182,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_contracts/lib/src/publication.dart",
+      "source_git_blob": "0a900d196f8134674d0747f2abca32cdfe629b9d",
+      "sha256": "401bddbbfd39bfebab65999a1028dbd95a319ebc62a2f95c3cc5918735ac2ab8",
+      "bytes": 8565,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_contracts/lib/src/runtime_dto.dart",
+      "source_git_blob": "b8b53116f8a5bb3a7d7ee186d017e006324fb1be",
+      "sha256": "eea2ec06b9dc152d2ea660e39d8149c38f6e3539284de3f676d55fc79ecefc22",
+      "bytes": 9131,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_contracts/lib/vp_contracts.dart",
+      "source_git_blob": "0bceba6ae500e5646d120aeec8938cdad29b9320",
+      "sha256": "c05435e91ab6c6a5b951bc758b7ecc950046590682bce359a18ab1582c8f7c9a",
+      "bytes": 15903,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_contracts/pubspec.lock",
+      "source_git_blob": "4e5439eea55eb3f789988fab2eee76a0cdc4965d",
+      "sha256": "9b11e10dfbfd97dad1d50f53cbe45edf6fdb2013df17ab94ae4aeff37c6f2b88",
+      "bytes": 5360,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_contracts/pubspec.yaml",
+      "source_git_blob": "cdb0c8f9ef42661d4cc460b2c258b0218f0aa62d",
+      "sha256": "a391b631d4baef051f7f1bc1103ccd913d140efc2f023f781858e3c960754ff2",
+      "bytes": 206,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_contracts/test/runtime_dto_test.dart",
+      "source_git_blob": "89dfbc35cc2adc334be1c6765b3600efaf260295",
+      "sha256": "fa1156910eb6a9f51b55a1a12d8768818ad4ec6f717040b623b0d50f6f6f61c1",
+      "bytes": 5375,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_design_system/LICENSE",
+      "source_git_blob": "debe66bf6da93a12b591530b980a4ff82bb39fdb",
+      "sha256": "92d9a33b480ea658f8f02a8b11e801a48a8ae2be8888d824ee57c624ea6c4caa",
+      "bytes": 4679,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_design_system/assets/fonts/NotoSansSC-Variable.ttf",
+      "source_git_blob": "fb0637bafbcd804fe32152370a1225990745b4bc",
+      "sha256": "a3041811a78c361b1de50f953c805e0244951c21c5bd412f7232ef0d899af0da",
+      "bytes": 17772300,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_design_system/assets/fonts/OFL.txt",
+      "source_git_blob": "1c9f43281b8f216c5461fe9ac729afbade7724e4",
+      "sha256": "1c05c68c34f9708415aada51f17e1b0092d2cea709bf4a94cd38114f9e73d7d9",
+      "bytes": 4388,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_design_system/assets/fonts/provenance.json",
+      "source_git_blob": "1b8722a221a4f74e41f23636efd5cde9f7ada2e5",
+      "sha256": "34e4fd3da5755975cd8192093766cb3e788bf0f149728db44bff6d8596ee851f",
+      "bytes": 736,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_design_system/lib/src/components.dart",
+      "source_git_blob": "a0766fc5ee8f22833ee0601b6c33c46954a932c1",
+      "sha256": "04d6ddd9c68cc2c050595b2d894b5e43247a0820ea48a257f211cb6ce87f8d30",
+      "bytes": 8336,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_design_system/lib/src/connection_control.dart",
+      "source_git_blob": "c475b406b72592a1f3d4816e32d65afbc9e882e3",
+      "sha256": "e0ee6c01a14c55db038e778317a96325c3a8121ab5ae253ddb88c4565d80f304",
+      "bytes": 8287,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_design_system/lib/src/theme.dart",
+      "source_git_blob": "56a520d2084b5f29e8614c5122e443ec5bd4b5e2",
+      "sha256": "6aba3bca266aab1253b0b9d562f95961914b396472038488a989fe326a1923d4",
+      "bytes": 5230,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_design_system/lib/src/tokens.dart",
+      "source_git_blob": "3715ed6a9bed31589d5e7347621faf15e7110a6e",
+      "sha256": "eddb1fa609b14329d1753b5665232b3ad9ff348c957eafc8751866a1a7ddaf86",
+      "bytes": 5795,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_design_system/lib/vp_design_system.dart",
+      "source_git_blob": "f4770eda17e31b3f4cfc8ccbbccbaf808d6941c7",
+      "sha256": "226ff02a58e652b3b48a8360937f35f8b15fb5f16977203983b2c7bb09755e0c",
+      "bytes": 130,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_design_system/pubspec.lock",
+      "source_git_blob": "bb033b3c60ba3d676c6a81f46a6aa3e29d331a52",
+      "sha256": "d846979f86ee281d6c11e9499a11e8e27de4b9ae7be855f1a049c17dba67c245",
+      "bytes": 5607,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_design_system/pubspec.yaml",
+      "source_git_blob": "7e900166f3a280f1fd7ab498bed1dd3d0dead85d",
+      "sha256": "ae824f64edda69f3caf9dc64d5803df0cdc2b899c1f2e09bf0d5b6d4811c1e88",
+      "bytes": 459,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_design_system/test/accessibility_layout_test.dart",
+      "source_git_blob": "01d43aebaafea5e98528e120eaab6b4ed1553870",
+      "sha256": "ab30aac14f948c527114ade16a09ead6280fc39bf3ec49215803c36f586287ec",
+      "bytes": 1890,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_design_system/test/connection_control_test.dart",
+      "source_git_blob": "291df253d6912eaf7ecced35a7dee1c0ba270b03",
+      "sha256": "91a26b94f34ae0433f1de3d78f20dfd2be22b69331c10c936f7722390af72db7",
+      "bytes": 2066,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_design_system/test/connection_motion_test.dart",
+      "source_git_blob": "a7f5b4fb146e643de7b7d8cb24c2c3afb34e26aa",
+      "sha256": "6e231cd19a9783270516b4643b1d3a36844e7d03538672824101e73c487f05ca",
+      "bytes": 5399,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/lib/src/admin_overview.dart",
+      "source_git_blob": "096cf320f75d4bb0bfa8a8f69e9516f8e9f407bb",
+      "sha256": "4535fe068e95fc5be87b46ff00970f1ac436b488342680af11a1413e6c9d45d8",
+      "bytes": 20083,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/lib/src/admin_pages.dart",
+      "source_git_blob": "6b023ac582be6fad80d0b8c60acad85107f6c93b",
+      "sha256": "1ba98b5c9be83e77a96e9a8d871aedafd46ed118de09ea6a186a9b04a2979325",
+      "bytes": 19759,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/lib/src/client_pages.dart",
+      "source_git_blob": "05b721e891cfa84e0610068be15cb3a0c4724d91",
+      "sha256": "c2cf2e8211dc50bbe1adcbee057209de9b4cd69224c18d917acff7a4b0ba5a45",
+      "bytes": 25418,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/lib/src/common_widgets.dart",
+      "source_git_blob": "c97e525074f81e8d12a02ba14689ec57dbd69111",
+      "sha256": "4d308fb4a7149693a8d02e1b3c07c88cc64041ed2d91f7e67190e5a7cd766a2f",
+      "bytes": 6126,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/lib/src/connection_page.dart",
+      "source_git_blob": "6105fe9f1ad1903217e26090a07c841c9b4d2b0c",
+      "sha256": "f439e35361eb2f6fd5ed88685ad52f5124d3936d07e4863e00f01410a8307eb2",
+      "bytes": 26598,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/lib/src/controllers.dart",
+      "source_git_blob": "a8cb8ce70f5898ecafcaa58a9f9bc395214d5c41",
+      "sha256": "c31316b9766f8a84226c929b1b986307778bd019fdb807f5a8c5840dae9400bb",
+      "bytes": 22896,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/lib/src/credential_pages.dart",
+      "source_git_blob": "69fea3d2f5b67657d00faebceaa9b65b975246de",
+      "sha256": "641114e1cec80c9b54086dea6bdb484c03fe9a2bb376d986f73f41be78fcb5eb",
+      "bytes": 18479,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/lib/src/import_page.dart",
+      "source_git_blob": "5fece93753330c38cb14b1fec15d73f68aa6710c",
+      "sha256": "6b2eef079e84fccab93fbfa6d206cd65dbc1e7736d29de945bf59d2f0ca55b06",
+      "bytes": 13527,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/lib/src/login_page.dart",
+      "source_git_blob": "4faf82c0ae9dbf9250ea1f57149af2dff939d087",
+      "sha256": "0c3eaee6fcefc3a8cb5642e7f5bc7f4a4078c8ce525ca9310b0bd3476c2f49e2",
+      "bytes": 14220,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/lib/src/providers.dart",
+      "source_git_blob": "3eb98f8889e781fb00c86264ae172bee68a76336",
+      "sha256": "64b683f8cb1490e36cab06560968843368a4200794b7e564a1094fa1e36077a6",
+      "bytes": 2656,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/lib/src/publication_controller.dart",
+      "source_git_blob": "01c6becb4955d73e3f1c5024c30e08a5dfb6c10b",
+      "sha256": "b43923d45cfbd8a4ec78469a936bd1a7f9ebfeba48b8605758f2e7139dbe14a9",
+      "bytes": 15799,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/lib/src/publication_editor.dart",
+      "source_git_blob": "d2af5a09643c790d2d430829f860c8e703921251",
+      "sha256": "402e05cc52306c445117696301fde0233c91474ee6cdd4fcf9342f161924fde8",
+      "bytes": 13389,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/lib/src/publication_page.dart",
+      "source_git_blob": "b5d7008c63c9443246e48b765d9c8136021864f8",
+      "sha256": "c6bc5d4844ac7a7d58342ff662c256a63dc98b953e90f78e699a91b9d53e690a",
+      "bytes": 17861,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/lib/src/publication_secret_dialog.dart",
+      "source_git_blob": "45c9e20fff9cb075e7e8b96b5fec21f6688db35c",
+      "sha256": "d4e5fc84c6226b17955f8bf9e959de479cff0d2d84058719d58df860af5d04f5",
+      "bytes": 6285,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/lib/src/runtime_notification_settings.dart",
+      "source_git_blob": "d0b7219ace852201370ca38abc496800448ca8b4",
+      "sha256": "e4bc4fb3c1f8410f66809ffd3dc2c2620dfaca263b7a77aed0de265108524d3c",
+      "bytes": 3667,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/lib/src/shell.dart",
+      "source_git_blob": "b0c8c8d19cf99587873989e79dab780036155c94",
+      "sha256": "f4fa7ecb1d300679b03ccd9ab1a5748a3d4b839acb2edb7fc6321177dc1285d1",
+      "bytes": 16967,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/lib/src/state.dart",
+      "source_git_blob": "3fce23ea8c50bacf9d70b1b0fcaee27efba9585c",
+      "sha256": "b28330646dfe0f529bcdf897fb842e9711bfa1fa1f2c2b478166b2559cbd9e2d",
+      "bytes": 1302,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/lib/src/support_pages.dart",
+      "source_git_blob": "c0b020f1635fd1e4590d0076a61a44b67ee53f23",
+      "sha256": "a0a560383b8f2cf7e6b0968deef9d3a550c93bf7ef9cacf7eadeb5201038823d",
+      "bytes": 8254,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/lib/src/user_dns_settings.dart",
+      "source_git_blob": "9669e327456a61882b5a007afb09048e13338141",
+      "sha256": "151f162ff150ace7ca6a43586f1501fff0dd5c9cf46991bf61eb1c5e4e799735",
+      "bytes": 6031,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/lib/vp_features.dart",
+      "source_git_blob": "9aac372a17e082dce9dd35b6eced73da2fe25c46",
+      "sha256": "9d71e12b94c958d94ac4dde48b28255b7bf36ad3d72a131df29cf55a4568db08",
+      "bytes": 392,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/pubspec.lock",
+      "source_git_blob": "3ea8de0948ea87e2be2b20036a6d7f02e22c281c",
+      "sha256": "acab0208988a5c0ba94b8447a14dc025fe9bac6e4c66c4dfaecd65afb29ea7fa",
+      "bytes": 16461,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/pubspec.yaml",
+      "source_git_blob": "1606e89cb6dd3d6630725aaef6b1113e1ac25c5f",
+      "sha256": "8ed45f34ecb09a811c763e8a995630dc1c0545f32adeaefe77e16a87230a71d0",
+      "bytes": 484,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/test/connection_observation_test.dart",
+      "source_git_blob": "1d8398401a76905a761c91f9f94552182892f087",
+      "sha256": "9ce8b13ed9415742cae4571f93d85c3181db78b6bb70d6ce426ba5143aa6232e",
+      "bytes": 6038,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/test/controllers_test.dart",
+      "source_git_blob": "287a0b20ac498f73fbd2c623ce480cb6dc2eb2ee",
+      "sha256": "8efeb4f563d1dfaa048f97bd69b0e66d10b00ad6d6b4cd17eadf99ccb29296e8",
+      "bytes": 11249,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/test/development_connection_test.dart",
+      "source_git_blob": "bae98c72990e60739b5e06e1c28c32e13c8bc3f8",
+      "sha256": "c646434e5d84ec28b977e4897e7803335f1ae03ea304b226ed9225969e628acf",
+      "bytes": 5355,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/test/dns_settings_test.dart",
+      "source_git_blob": "31a48e2cc2fa1668207f8e45326f422d3855cf22",
+      "sha256": "41fd37b86ff2939ef688ebadbed05ad576ab7c6556a6daacc3bbadb9e6fcb6b4",
+      "bytes": 7144,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/test/fixtures/ports.dart",
+      "source_git_blob": "541b4ba8e1553d27f65425c5ac37d19befb92982",
+      "sha256": "015b3ceae986ee559f2c9409728736c7c8e4217283c74a6cfe7035c548ade199",
+      "bytes": 5712,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/test/import_actions_test.dart",
+      "source_git_blob": "f4f2c3414f7862f7b69b549d2cd1d27b421f8a4a",
+      "sha256": "961edd863fdd40bdb27ed761de2cdf78019d23e103a99694582a4541a2ddfe78",
+      "bytes": 2229,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/test/notification_settings_test.dart",
+      "source_git_blob": "03b708f2153c5b4003c1572fcaf716611927b6e0",
+      "sha256": "02f620a65fea83ec4c576e55f9fc44a05571178890472c5f9bf4ce1e77a0bc42",
+      "bytes": 2084,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/test/publication/controller_test.dart",
+      "source_git_blob": "738529aac6f91f837437f517ae066ff8677a5201",
+      "sha256": "8907a08f4a2ee2bcf1c7fe64d54709925d8562adc0eb1f5bd811f5c176c4c69c",
+      "bytes": 11136,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/test/publication/fixtures.dart",
+      "source_git_blob": "0d06c9f81d909d345b4ee4e7294cc6af1d47e177",
+      "sha256": "65ef9d0640d87717b9745df231ac2ef8fef2e9e208e6a9051a92b9fe7f5bc870",
+      "bytes": 7324,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/test/publication/page_flow_test.dart",
+      "source_git_blob": "d4762f42a46651dcc5a432deae642ff9767a1221",
+      "sha256": "b064a9730695ef63c93ed532d064554318727c63303ef6c9b7741404ee3455a2",
+      "bytes": 5014,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/test/publication/secret_dialog_test.dart",
+      "source_git_blob": "e07efa9885d1569ea686ad7760d532510130ff43",
+      "sha256": "7f86f0550edc4336c230aa3661afca2d4088d8db57069deba3ad5c9d6d503f53",
+      "bytes": 4375,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/test/publication/wizard_flow_test.dart",
+      "source_git_blob": "f903223ae7df2c04346e4d09c9f3bdcf475594b8",
+      "sha256": "8dad055948415b0a6d8c9ec2dacccdc93390045a74ec703089c51f7f879ed7f6",
+      "bytes": 3902,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/test/state_contract_test.dart",
+      "source_git_blob": "690d01bef3f09dd5b3bfc16bb9b67b2de664a3ab",
+      "sha256": "82f5b6dabff4bd449e48b65e51e3eec4948e4b51a19893ad5c937a5d11a682cb",
+      "bytes": 3227,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_features/test/subscription_lifecycle_test.dart",
+      "source_git_blob": "d13b5009f5f38e6e0500cf1bb9c2504ba15ee6b5",
+      "sha256": "7d0e93875ceecfdbce5c2aa893a78118688ca8dd5486c7dca998051ac966965f",
+      "bytes": 2351,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_runtime_platform/lib/vp_runtime_platform.dart",
+      "source_git_blob": "8c17a7cfb1a952a6e4c86dcc4f44ed6410968c82",
+      "sha256": "1dd17326dc8817fa9970ddac45d017aef277f6c5ec0a00003aeada983d0d2289",
+      "bytes": 4029,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_runtime_platform/pubspec.lock",
+      "source_git_blob": "9a48825e863bb59103fede328da0f7e3eff1bbbe",
+      "sha256": "c4f3ceb2ef6a3fe8ab46392cddb47bb432fe07c44d6b8575ffdf9baf6d80b72a",
+      "bytes": 5515,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/packages/vp_runtime_platform/pubspec.yaml",
+      "source_git_blob": "0df116ca06cf5a0e849cb209b5d98cfef8a6b98c",
+      "sha256": "ce05c4250cde1191f5401ae09ec59467026cca55aec8086e454c61aeea0d0eff",
+      "bytes": 304,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/tools/run_live_api_test.py",
+      "source_git_blob": "405fccd5aa020ff01d2b89111f69e6b17ae51935",
+      "sha256": "c20146e436602b963507dea2c222ea6043d1affabdce299c0980862595411c9f",
+      "bytes": 2461,
+      "mode": "100644"
+    },
+    {
+      "path": "flutter/tools/sdk.sh",
+      "source_git_blob": "9c92976aa2635c9199bcf2692b0885372bbacf7d",
+      "sha256": "38d4f86642bb400712ddc2f6351c7b7c03ba4c9c73bd943b714a72502fe3ec0c",
+      "bytes": 700,
+      "mode": "100755"
+    },
+    {
+      "path": "flutter/tools/verify.sh",
+      "source_git_blob": "bf94347e03a88c593a521f6cc5ebbcb3412ec7d8",
+      "sha256": "917186fc8ec60f5217a6be4b6eb6150dc2b956bcf4eb913a22a59bb8eb9695a8",
+      "bytes": 950,
+      "mode": "100755",
+      "source_sha256": "43b654f59da3b3581b259dff55c168b4dba3a73235344124afd6f67b0bd1249e",
+      "adaptation": "Remove excluded legacy Flutter client from admin-only verification loop."
+    },
+    {
+      "path": "patches/vp_core/0001-fail-closed-listener-startup.patch",
+      "source_git_blob": "688c5f437bb1f2406ba4d9a817159dc4b87c8dfd",
+      "sha256": "dc17b624124842e7351caf41f1ebb9a373eb08dca7d15321234f7787b3e475f8",
+      "bytes": 18278,
+      "mode": "100644"
+    },
+    {
+      "path": "patches/vp_core/0002-managed-async-lifecycle.patch",
+      "source_git_blob": "9515a155b05daa718d17094207d2b4d0b764db1e",
+      "sha256": "2a5c9f691f132b3a20c121251cc8f21fd3d7f4ba28d3b37200d24b4945d7f406",
+      "bytes": 108719,
+      "mode": "100644"
+    },
+    {
+      "path": "patches/vp_core/0003-quic-authentication-and-lifecycle.patch",
+      "source_git_blob": "e2df697b4e77352811789d3a6a33a9e2f63e6787",
+      "sha256": "4b64c46d44115dfbe87a523a3cd8899cdd2c01e9c860ff7067bf0de70e2395e1",
+      "bytes": 116947,
+      "mode": "100644"
+    },
+    {
+      "path": "patches/vp_core/0004-shadowsocks-wire-and-managed-sessions.patch",
+      "source_git_blob": "161e276ed6500f10fa3f3b1ee2c62e40d30bb574",
+      "sha256": "34b3858a7ba1e99fbcb4ae4bafcd7f638a803cbfad1e15a5e705eb8b5a978116",
+      "bytes": 136332,
+      "mode": "100644"
+    },
+    {
+      "path": "patches/vp_core/0005-reality-boundary-and-vision-fail-closed.patch",
+      "source_git_blob": "15beab12b08cc0d7e06b0048189e4c9f78e2b114",
+      "sha256": "946299bbf174caca4c32acfb0fca644cf8c2de97fa006b04032b82aa693dfbab",
+      "bytes": 21927,
+      "mode": "100644"
+    },
+    {
+      "path": "patches/vp_core/0006-server-stream-transports.patch",
+      "source_git_blob": "bec8f63a8853f939dd1f77b919ee11634572bf5a",
+      "sha256": "351c5666ee7a8d3a2dc02371985157a043b4d0f30a61b4dfc1fe26d0d52d39d1",
+      "bytes": 123019,
+      "mode": "100644"
+    },
+    {
+      "path": "patches/vp_core/0007-managed-loopback-destination-authority.patch",
+      "source_git_blob": "bccdfa5969def8f7958613a89f428b5f72aa00c7",
+      "sha256": "05f536c6fe2de10a7f774b6f940e030dd4361de23bf43559e2880608d243d1b5",
+      "bytes": 11268,
+      "mode": "100644"
+    },
+    {
+      "path": "patches/vp_core/0008-quic-reference-library-and-explicit-trust.patch",
+      "source_git_blob": "44a28a588bc24ec04f0c01a750dd42c0d224d2d3",
+      "sha256": "cfd942cfa6bf2573aa2c594edefd9f5d9c32776a49a1e8d0b3a4575379b988c2",
+      "bytes": 54552,
+      "mode": "100644"
+    },
+    {
+      "path": "patches/vp_core/0009-utls-inner-plaintext-padding.patch",
+      "source_git_blob": "cf494d9babf761ea7db6ba5789f957ebb365393f",
+      "sha256": "341ad98afa8d68d9e336355bd84f6279d86ceef6620daad64b781719c7e5a5f3",
+      "bytes": 3636,
+      "mode": "100644"
+    },
+    {
+      "path": "patches/vp_core/0010-experimental-authenticated-reality-server.patch",
+      "source_git_blob": "5b084ce7ad995b4f06617bf466e8c7134d8c1a7e",
+      "sha256": "b19d33bcfacbaa5191527d48434d295915872a89403ad81ad4af40ef5f1428c6",
+      "bytes": 47905,
+      "mode": "100644"
+    },
+    {
+      "path": "patches/vp_core/0011-shadowsocks-independent-library-peer.patch",
+      "source_git_blob": "04026f8c79e2832d952240aa2f380c573ffea737",
+      "sha256": "61d36606c2bbf01cb88b53fb4a0ef2c19404d340e4b2818c6c1fb4c3d24d39c6",
+      "bytes": 39270,
+      "mode": "100644"
+    },
+    {
+      "path": "patches/vp_core/0012-mobile-host-network-and-tun-ownership.patch",
+      "source_git_blob": "1d919db49ca031b7c5273b212fad7f263ce5a481",
+      "sha256": "566094e57ac2d344b45c402707eefd54d52106e1e396e553e6a016eec208cdc5",
+      "bytes": 28868,
+      "mode": "100644"
+    },
+    {
+      "path": "patches/vp_core/0013-reject-unsupported-chained-udp.patch",
+      "source_git_blob": "951460dba6230c24b518c903dcf9dc8f88058ace",
+      "sha256": "ca16fd57f8ae5a03126d3e211a572ae97aaebf5da71537f2fea95e28cd816bd0",
+      "bytes": 2777,
+      "mode": "100644"
+    },
+    {
+      "path": "patches/vp_core/0014-stream-framing-and-partial-io-corrections.patch",
+      "source_git_blob": "bf5dd91b9211823e37433f893c817d7d7360e595",
+      "sha256": "c4f797c8129e8f7cb2e90a2115dda56ab02018162a3ae6904a1572938dad776a",
+      "bytes": 41700,
+      "mode": "100644"
+    },
+    {
+      "path": "patches/vp_core/0015-stream-protocol-udp-and-independent-peer.patch",
+      "source_git_blob": "3a2019e275613a80e9837993cede698e84e11159",
+      "sha256": "df9292ca3f4828a30caa8116e764f8d8dee17c719baabf9d2af4aec0b9617dd2",
+      "bytes": 86533,
+      "mode": "100644"
+    },
+    {
+      "path": "patches/vp_core/0016-protect-tuic-reply-domain-dns.patch",
+      "source_git_blob": "f893da70073555e8da8b72f54d9c0cf69c416d46",
+      "sha256": "323e0b730118cb1c22ccf9a9539438b15504fe17f2e372cb29f1d0bfc4a9d95e",
+      "bytes": 3465,
+      "mode": "100644"
+    },
+    {
+      "path": "patches/vp_core/0017-proxy-user-dns-and-endpoint-bootstrap.patch",
+      "source_git_blob": "31fc47c4b1b9b4642536e519d500942500c6e46e",
+      "sha256": "0419ba7b2400782c04590433a8495705b63e03faecb54ae521f6e63b037de23f",
+      "bytes": 77573,
+      "mode": "100644"
+    },
+    {
+      "path": "patches/vp_core/0018-router-selected-server-egress.patch",
+      "source_git_blob": "75e59927e2abca09ea52aabbf2c88c4daafc2ea2",
+      "sha256": "251c6a8a8be00dc5aa207aa779b3fb086cd79140aae28e81099dee1f0c096a64",
+      "bytes": 255948,
+      "mode": "100644"
+    },
+    {
+      "path": "patches/vp_core/0019-uuid-byte-parsing-and-error-redaction.patch",
+      "source_git_blob": "cde6136aeb164db6b71ba8d2b9c5a92936122eaf",
+      "sha256": "9a9e810561c50975c52be3a3fd8b973a28d110a2703ea55bbecbc83b2a7ea5e2",
+      "bytes": 3352,
+      "mode": "100644"
+    },
+    {
+      "path": "patches/vp_core/0020-authenticated-shadowsocks-uot-routing.patch",
+      "source_git_blob": "ff1b66e3424758d3155658828f56cf32abd7f41b",
+      "sha256": "87a853e6b661d3fac6d6ab1df996fcb2f23c06a2c3d1490f2abbee118877846b",
+      "bytes": 17877,
+      "mode": "100644"
+    },
+    {
+      "path": "patches/vp_core/series.toml",
+      "source_git_blob": "60ad473998cc151e70f7497e909b1a9e72b081a0",
+      "sha256": "64e4bce120f113fc12440bba8bcd8f3dbe8bbd391a9bfe8d5b2fa7db5cc61909",
+      "bytes": 22415,
+      "mode": "100644"
+    },
+    {
+      "path": "rust-toolchain.toml",
+      "source_git_blob": "9a8b0ea11ca538d0e892315c0bbc17d1f4a0827c",
+      "sha256": "74ebb57e05a9bba20959a09656ba6ac91c884f927397732e8e1bbc3e3a386ad0",
+      "bytes": 171,
+      "mode": "100644"
+    },
+    {
+      "path": "tests/fixtures/import/clash-nodes.json",
+      "source_git_blob": "ddcf6faf2f0d8279db9b30383be4c0adbabbf994",
+      "sha256": "1175545b6c7b34d9b5fa9b8c49e1fb230d1a31520b8d308f70e877f8ca9a6499",
+      "bytes": 463,
+      "mode": "100644"
+    },
+    {
+      "path": "tests/fixtures/import/sing-box-nodes.json",
+      "source_git_blob": "5ce3c201f5cb9d220748fd30f8a35d508c7be302",
+      "sha256": "b8e46e2c834478a6df5c6baf9764ebcae5d496e09a8e2eafdf8e413caff38253",
+      "bytes": 947,
+      "mode": "100644"
+    },
+    {
+      "path": "tests/fixtures/import/uris.txt",
+      "source_git_blob": "e62fafd576870bf47fdf99f6ad1add1ac3ef2d9e",
+      "sha256": "45b46544d71d6ad73b643e32d4a0aab3813f24b7dc10501069a851d28623ef25",
+      "bytes": 906,
+      "mode": "100644"
+    },
+    {
+      "path": "tests/header_compile.c",
+      "source_git_blob": "d96a6303755e8d7c21ec1f09be095e047a283c11",
+      "sha256": "27d41d10e82756dc5b9e88ac81f37d3f27bb41cd7d252770ea1c0db21aae76fe",
+      "bytes": 782,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/check_contracts.py",
+      "source_git_blob": "bb2e79acc2d8ff5a8b1ebca6396e3ffae0796d0b",
+      "sha256": "0ba880023ab100676cab21e0b31945cd30ad32acd1e6d2f2c7609a1169aa43e8",
+      "bytes": 7088,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/contracts-requirements.txt",
+      "source_git_blob": "d0ef97fcb70352c6f326c3e3ba8aff7e28c48c2d",
+      "sha256": "d9af5a21d9bcfc89bb436285b800748c1b1dbdba4c53c4385ea320cf1c1aea84",
+      "bytes": 95,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/core/core_pipeline.py",
+      "source_git_blob": "ddf5988c307bb23634d62ebeb7b9cd1aee815406",
+      "sha256": "91c3109e5d08fa4b8e2a4be5986fb7ed3906e086a0f9c9ff65bc9fe61cf361ec",
+      "bytes": 13323,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/core/test_core_pipeline.py",
+      "source_git_blob": "533a442a9a9efde3eab51545dd6a2caa51e4ffd7",
+      "sha256": "03f7fb38a4a14779dd0d0e4fc2e4ce7e6655630498ebcfe78160af8c4c9ac285",
+      "bytes": 11035,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/.gitignore",
+      "source_git_blob": "43ae0e2a6c6d8fca34872506ca0f2e64194fec7c",
+      "sha256": "6feaded4e28ea86e001a6751b4e3d960e8b7c31b9616ff9936b79297086e809b",
+      "bytes": 23,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/build_bundle.py",
+      "source_git_blob": "5de1d7db9d257cae0e9f4ec72d684abf10a26465",
+      "sha256": "2f98aeeea409713801f8474388831a48056930e67252dff343283378b21297ab",
+      "bytes": 4568,
+      "mode": "100755"
+    },
+    {
+      "path": "tools/install/build_fresh_bundle.py",
+      "source_git_blob": "508a42d91372a30c9cf6740a1df6621aa37cd6b6",
+      "sha256": "83ba3951564ab30c3b3b7c171b64733c6050a4e9d2237d89dfdae340957dc253",
+      "bytes": 5698,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/install.sh",
+      "source_git_blob": "cc030ff0779ab70e3557d05d9ec7bb555da0f430",
+      "sha256": "05fcd5b46c5c542844d9eb5a4cc5682ba6716e5ff7b31c3b3edfe5115a140864",
+      "bytes": 482,
+      "mode": "100755"
+    },
+    {
+      "path": "tools/install/tests/fixtures/fresh-vless-loopback.json",
+      "source_git_blob": "3ab9402b7f54dc4cedaaf84318d7d0c2ebbe91fc",
+      "sha256": "066498d991a11eaac79136e7c8316da21caf99714b1af9387a4ec1b4883ba786",
+      "bytes": 773,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/tests/live_cli.py",
+      "source_git_blob": "c07b88d4b550fecab4c472821f2f312aee429042",
+      "sha256": "94e7bd83e24682aacc983a300102a11ef682aabeb1f71214ccc3a91a281ffa8b",
+      "bytes": 13320,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/tests/run_bound_maintenance_gate.py",
+      "source_git_blob": "89f09cc6305bea2623d973ea1fc721ca6eba2012",
+      "sha256": "54dbfce5ddd33fb528e50e77dc0979991dc4df0479b2757bfce643c0910b529f",
+      "bytes": 3012,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/tests/run_fresh_bundle_gate.py",
+      "source_git_blob": "5eb30504a61228fa1ebe6625ba6f2491155c4ef4",
+      "sha256": "a1be0e22abefa10841f5c9d07b2a51cc5b4dff5af8a37e47e3dcddfd38623009",
+      "bytes": 14060,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/tests/run_real_bootstrap_offline.py",
+      "source_git_blob": "aa0af2f44a764b9c2688f9521a41519d4e3eda59",
+      "sha256": "ed7a8bc61d9425c3afe52587b856ed486dcec8e70c74ee807d84b96de1606712",
+      "bytes": 3411,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/tests/test_bootstrap.py",
+      "source_git_blob": "dca2d09d7e4a2212d61e0868d871332bc760d98e",
+      "sha256": "ff1e0fd2f6b94d0cd67a7fa189ed07a643d4bd981eec8cf020deab1f0f05cc63",
+      "bytes": 29025,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/tests/test_bootstrap_offline.py",
+      "source_git_blob": "9b164d720b91c668074125536675990c48fdafdd",
+      "sha256": "333be8f88d9588536b56532367c19c1922e1d5e329b901ccef1a3a11612b8cfb",
+      "bytes": 9423,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/tests/test_bootstrap_process.py",
+      "source_git_blob": "b05f2afdf2f3b5e7da641bf4ba58479b7e2e3e2a",
+      "sha256": "f15499e631a29eeaf74751e03b03349f461eefe580a7678eadd8868841a86bbf",
+      "bytes": 7086,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/tests/test_fresh_bundle.py",
+      "source_git_blob": "6c40b044e3a6abccec9ea95ddcd7d6171c05f139",
+      "sha256": "7f5f42d8557049deb7c19f1e550ed082f184a279e55afbdc390ae4defe89e0e6",
+      "bytes": 7501,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/tests/test_fresh_lifecycle_inventory.py",
+      "source_git_blob": "dc93e83d3ffac9e4898d06b258ef75c411f26cdd",
+      "sha256": "b4bbb134a2c4529faedfb716cd3aeb5fb0afd448d695202c87e113f7d724de8a",
+      "bytes": 14878,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/tests/test_fresh_local.py",
+      "source_git_blob": "030781e36b09dc7dc82ec5c3f267c7389af79e54",
+      "sha256": "f412aeba7496856fd93daf0c8b6e6caf5a54b58432abc61a38e70e8f941316cb",
+      "bytes": 9373,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/tests/test_fresh_removal.py",
+      "source_git_blob": "7264f2930d4949e433924d96a04c8bbaa9171ef8",
+      "sha256": "f3267a2c7714a95d2dfa547cd128b4c40cd86210c93934243813e02734e5b48e",
+      "bytes": 21311,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/tests/test_host_preflight.py",
+      "source_git_blob": "7156f1939e8d33472c8aabaf610be171d2400285",
+      "sha256": "1302603a967501f6bb44f539aacf091f2fde076597819c638332095df4caeb78",
+      "bytes": 10211,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/tests/test_installer.py",
+      "source_git_blob": "4ff46c2b5ffd3b2275107faabac9e79ac45c0b64",
+      "sha256": "a2b77bc10d9906bbaf8f3ac46ab18fc76513a981a934e50b2d410e0a8e4ada08",
+      "bytes": 33129,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/tests/test_maintenance_bridge.py",
+      "source_git_blob": "c074e9675555bde7dd9e00ca15c8db9704eba30a",
+      "sha256": "d6014590f7e6d41fd8aa7a4339ddada73517bafd3f844874993c9af3efd276d1",
+      "bytes": 8378,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/tests/test_owned_runtime.py",
+      "source_git_blob": "383e186819a5797a138b098aa4597d91b200ce8f",
+      "sha256": "9e5045424974919e90b46242832669634de5204f6766e9fb1d2bc86adbe47ab3",
+      "bytes": 3540,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/tests/test_publications.py",
+      "source_git_blob": "de6e82c8e9588ced3cdbafb3720882be21f9ef73",
+      "sha256": "b44109ab6d8f1a89fe0f3d0c76435961e7dcdf7733c83ea397552bd552c7bb26",
+      "bytes": 22484,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/vp_api.py",
+      "source_git_blob": "1766259e0dbaf0fbc74286fa17978ad627d5ba1c",
+      "sha256": "e550bf1996d7f2b5468e3ccfff9f82cc8163df4945ed7412fbe8a72db13dee6f",
+      "bytes": 18266,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/vp_bootstrap.py",
+      "source_git_blob": "9da1e65560ab042f39c9f2ac5d8af3c8dee535f4",
+      "sha256": "36f7f2810bf25e762349f2a9b7c9f9270ba70f5718bbfe97170b888912efada2",
+      "bytes": 41476,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/vp_form.py",
+      "source_git_blob": "64e0c81ef868fcff6d0e9e13d140dddbc7c9e9ec",
+      "sha256": "dbc0172b7e323fbb454af61529e518ac757a17328cf2f16c7db729cb3b09e9e0",
+      "bytes": 9351,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/vp_fresh_bundle.py",
+      "source_git_blob": "6bbe13b55d57956c1bde8b7c6236b4c1a2dfdffc",
+      "sha256": "a42254f35f444fd79ada34847ca48b1d38b1a5adf55442d9f7089b7091c3363f",
+      "bytes": 9600,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/vp_fresh_cli.py",
+      "source_git_blob": "707f2e6301da18c75295934e969b243661e796da",
+      "sha256": "d49fdd15ea16a3ad610f5ba0b7528fbb46af6e3b4acba0518d376f896bff8080",
+      "bytes": 5324,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/vp_fresh_lifecycle_inventory.py",
+      "source_git_blob": "4ff5a3aacc3035b3dff02ed50b26ca80a8900df7",
+      "sha256": "b6f22a526ad03162f1bff039cc85466a4610851b948ea239e49e176828a9815d",
+      "bytes": 14070,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/vp_fresh_local.py",
+      "source_git_blob": "e9b8330ccce0a1691904259b313ec9e7c3315676",
+      "sha256": "95c34e30b4fbfd27cd9bbf52e218885b3b0528dfaa4a61ec43349057ab9afd45",
+      "bytes": 18114,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/vp_fresh_removal.py",
+      "source_git_blob": "6869330c359143556f4d436960ff6358eeca74d1",
+      "sha256": "ddf187c24d648137c1de03e1af2ce44e4ecc9aa0bbd5dda04fc7d97930345024",
+      "bytes": 14341,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/vp_host_preflight.py",
+      "source_git_blob": "fbf1daadcb9286fe1a48f47927443551ffb67d44",
+      "sha256": "ec75f9de2474899689855e0a4d805f529c38fc158ff01fdd8ef2fff746abf747",
+      "bytes": 3491,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/vp_install.py",
+      "source_git_blob": "8bfd87b82aad8c1488988e5596c185266a5a018f",
+      "sha256": "96f86bfbe4409283c4bb2396d8dacb5cf55e04459e68a722b1b9152a85e50eec",
+      "bytes": 56643,
+      "mode": "100755"
+    },
+    {
+      "path": "tools/install/vp_maintenance_bridge.py",
+      "source_git_blob": "79defb6a8b7ad45c66c6ea2b2a090212a2b9b497",
+      "sha256": "ff34d0ad3314bda670e4c12dfe951e9cc7adb31b17ebe79d90de6f1eb69723e7",
+      "bytes": 11775,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/vp_owned_runtime.py",
+      "source_git_blob": "801dbd3a2b2ed256d2e17fc77520f176a873f9c0",
+      "sha256": "efffb037e5890b3f7263cefd0273bee9ceda2374190b7a4ed19796a25885e49c",
+      "bytes": 8730,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/vp_publications.py",
+      "source_git_blob": "fb9c3402d4f18d21ddf29d5bc0b675374b61405e",
+      "sha256": "ce7402208b138d43fe2924f7d5a3a71ab40aee4ef271e152be88c34e6e1a53d9",
+      "bytes": 25032,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/install/vpctl.py",
+      "source_git_blob": "91f8da33346926d51518bd07b228e1bd90c354a7",
+      "sha256": "8878c76f0ab4ca8139c98a9f9c8e8b423529bd0f9765a8f526f24ca135632574",
+      "bytes": 571,
+      "mode": "100644"
+    },
+    {
+      "path": "tools/prepare_management_contracts.py",
+      "source_git_blob": "aff65ad8d70408b2f50a78a9c8bb6a064ec9525c",
+      "sha256": "b53ac84ec4bed44328f376b970ed4689736d6bd842db2438155ae2b0b58f75f8",
+      "bytes": 9835,
+      "mode": "100644"
+    }
+  ],
+  "excluded_selected_paths": [
+    "contracts/README.md",
+    "contracts/STATIC_VALIDATION.md",
+    "contracts/abi/vp_codec.v1.md",
+    "crates/vp-api/README.md",
+    "crates/vp-codec-ffi/README.md",
+    "crates/vp-compiler/README.md",
+    "crates/vp-control/README.md",
+    "crates/vp-core-adapter/README.md",
+    "crates/vp-import/README.md",
+    "crates/vp-managementd/README.md",
+    "crates/vp-runtime-executor/README.md",
+    "crates/vp-secrets/README.md",
+    "crates/vp-secrets/VALIDATION.md",
+    "crates/vp-storage/README.md",
+    "tests/fixtures/import/README.md",
+    "tools/install/BUNDLE_V2_CONTRACT.md",
+    "tools/install/FRESH_BUNDLE_CONTRACT.md",
+    "tools/install/FRESH_LOCAL_USAGE.md",
+    "tools/install/README.md",
+    "tools/install/tests/live-cli-attempts.json",
+    "tools/install/tests/live-cli-results.json",
+    "tools/install/tests/validation.json"
+  ],
+  "source_bytes": 23743415,
+  "validation": {
+    "build": "not-run",
+    "tests": "not-run",
+    "secret_scan": "pattern scan only; not a guarantee",
+    "python_ast": "passed",
+    "toml_json_parse": "passed",
+    "core_lock_patch_hashes": "passed",
+    "synthetic_git_unit_tests": {
+      "passed": 20
+    },
+    "real_core_replay": "not-run",
+    "rust_build": "not-run",
+    "flutter_build": "not-run"
+  },
+  "pattern_review_paths": [],
+  "public_test_fixture_exception": {
+    "path": "crates/vp-control/tests/fixtures/ring-public-rsa/rsa_test_private_key_2048.p8",
+    "purpose": "Intentionally insecure public ring 0.17.14 test material; archive/fixture hash checked; never deploy."
+  }
+}

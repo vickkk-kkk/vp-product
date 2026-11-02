@@ -1,0 +1,443 @@
+diff --git a/crates/vp-app/src/lib.rs b/crates/vp-app/src/lib.rs
+index afea1ed..e5ddd64 100644
+--- a/crates/vp-app/src/lib.rs
++++ b/crates/vp-app/src/lib.rs
+@@ -1625,9 +1625,16 @@ listeners:
+     port: {ss_port}
+     users: [pw]
+     cipher: aes-128-gcm
+-rules: ['MATCH,ss-uot']
++rules: ['IN-NAME,uot-srv,DIRECT', 'MATCH,ss-uot']
+ "
+         );
++        assert!(
++            vp_config::parse(&cfg, vp_config::Format::Yaml)
++                .unwrap()
++                .proxies[0]
++                .udp_over_tcp,
++            "this positive test must exercise TCP encapsulation, not native SS UDP"
++        );
+         let _app = App::start(&cfg, vp_config::Format::Yaml, &std::env::temp_dir(), true)
+             .await
+             .unwrap();
+@@ -1795,7 +1802,10 @@ rules:
+         let sess1 =
+             vp_core::Session::new_tcp("in".into(), None, vp_common::DstAddr::new("google.com", 80));
+         let res1 = app.router.current().pick(&sess1).await;
+-        assert_eq!(res1.outbound.name(), "PROXY");
++        assert_eq!(res1.rule.as_ref().unwrap().target, "PROXY");
++        assert_eq!(res1.rule.as_ref().unwrap().rule, "RULE-SET,test-prov,PROXY");
++        assert_eq!(res1.outbound.name(), "DIRECT");
++        assert_eq!(res1.connected_via().as_ref(), "DIRECT");
+ 
+         let sess2 = vp_core::Session::new_tcp(
+             "in".into(),
+@@ -1804,6 +1814,9 @@ rules:
+         );
+         let res2 = app.router.current().pick(&sess2).await;
+         assert_eq!(res2.outbound.name(), "DIRECT");
++        assert_eq!(res2.rule.as_ref().unwrap().target, "DIRECT");
++        assert_eq!(res2.rule.as_ref().unwrap().rule, "MATCH,DIRECT");
++        assert_eq!(res2.connected_via().as_ref(), "DIRECT");
+ 
+         // 缓存文件已写入磁盘
+         assert!(cache_file.exists(), "离线缓存文件应已生成");
+@@ -1813,11 +1826,10 @@ rules:
+ 
+         // 验证定时更新后：youtube.com 命中 PROXY！
+         let res3 = app.router.current().pick(&sess2).await;
+-        assert_eq!(
+-            res3.outbound.name(),
+-            "PROXY",
+-            "定时更新后 youtube.com 应命中 RULE-SET"
+-        );
++        assert_eq!(res3.rule.as_ref().unwrap().target, "PROXY");
++        assert_eq!(res3.rule.as_ref().unwrap().rule, "RULE-SET,test-prov,PROXY");
++        assert_eq!(res3.outbound.name(), "DIRECT");
++        assert_eq!(res3.connected_via().as_ref(), "DIRECT");
+ 
+         let _ = tokio::fs::remove_file(&cache_file).await;
+     }
+diff --git a/crates/vp-config/src/lib.rs b/crates/vp-config/src/lib.rs
+index 6eeee6b..ba79a30 100644
+--- a/crates/vp-config/src/lib.rs
++++ b/crates/vp-config/src/lib.rs
+@@ -69,6 +69,21 @@ pub fn parse_and_validate(text: &str, fmt: Format) -> std::result::Result<Config
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn udp_over_tcp_kebab_and_underscore_are_not_silently_ignored() {
++        for field in ["udp-over-tcp", "udp_over_tcp"] {
++            let text = format!(
++                "proxies: [{{name: uot, type: ss, server: 127.0.0.1, port: 1234, cipher: aes-128-gcm, password: test, {field}: true}}]"
++            );
++            assert!(parse(&text, Format::Yaml).unwrap().proxies[0].udp_over_tcp);
++        }
++        let both = "proxies: [{name: uot, type: ss, udp-over-tcp: true, udp_over_tcp: false}]";
++        assert!(
++            parse(both, Format::Yaml).is_err(),
++            "conflicting spellings must not select one silently"
++        );
++    }
++
+     const SAMPLE_YAML: &str = r#"
+ mixed-port: 7890
+ allow-lan: true
+diff --git a/crates/vp-config/src/model.rs b/crates/vp-config/src/model.rs
+index 468076b..1870007 100644
+--- a/crates/vp-config/src/model.rs
++++ b/crates/vp-config/src/model.rs
+@@ -414,7 +414,7 @@ pub struct SmuxConfig {
+ pub struct ProxyCfg {
+     pub name: String,
+     /// UDP over TCP（UoT v1）：仅流型协议出站生效
+-    #[serde(default, alias = "udp_over_tcp")]
++    #[serde(default, rename = "udp-over-tcp", alias = "udp_over_tcp")]
+     pub udp_over_tcp: bool,
+     /// 链式代理/前置代理（dialer-proxy / detour）
+     #[serde(alias = "dialer-proxy", alias = "detour", default)]
+diff --git a/crates/vp-protocol/src/server_route.rs b/crates/vp-protocol/src/server_route.rs
+index f269d30..923512d 100644
+--- a/crates/vp-protocol/src/server_route.rs
++++ b/crates/vp-protocol/src/server_route.rs
+@@ -45,7 +45,7 @@ pub(crate) async fn connect_routed(
+     session: &Session,
+ ) -> Result<(Box<dyn ProxyStream>, Resolution)> {
+     // The reserved UoT control name is not a network destination. Raw
+-    // authenticated ingress has no generic UoT bridge yet; never leak it to DNS
++    // handlers without an authenticated UoT bridge must never leak it to DNS
+     // or silently turn it into a direct/proxy TCP connection.
+     if crate::uot::is_magic(&session.dst) {
+         return Err(Error::Unsupported(
+@@ -246,6 +246,12 @@ impl DatagramSender {
+         data: Bytes,
+         source: Option<SocketAddr>,
+     ) -> Result<()> {
++        // Nested control names are not UDP destinations, regardless of policy.
++        if crate::uot::is_magic(&destination) {
++            return Err(Error::Unsupported(
++                "UoT control name is not a datagram destination".into(),
++            ));
++        }
+         crate::stream_udp::validate_target(&destination)?;
+         crate::stream_udp::validate_payload(&data)?;
+         if self.0.scope.as_ref().is_some_and(|s| {
+diff --git a/crates/vp-protocol/src/ss.rs b/crates/vp-protocol/src/ss.rs
+index 7c5df3f..d279bec 100644
+--- a/crates/vp-protocol/src/ss.rs
++++ b/crates/vp-protocol/src/ss.rs
+@@ -846,7 +846,6 @@ impl SsInbound {
+             self.port,
+             Some(user_index),
+         );
+-        let (remote, resolution) = crate::server_route::connect_routed(ctx, &sess).await?;
+         let client = SsCryptoStream::new_server(
+             stream,
+             self.cipher.clone(),
+@@ -856,6 +855,13 @@ impl SsInbound {
+             salt,
+             &early_data,
+         )?;
++        // Only the authenticated, replay-checked decrypted stream may enter UoT.
++        // The control name is framing, never a network/DNS destination. Every
++        // real datagram target is routed with this listener/user/session identity.
++        if crate::uot::is_magic(&sess.dst) {
++            return crate::uot::serve_client(ctx, sess, Box::new(client)).await;
++        }
++        let (remote, resolution) = crate::server_route::connect_routed(ctx, &sess).await?;
+         let meta = crate::server_route::metadata(&sess, &resolution);
+         let hook = RelayHook {
+             table: Some(ctx.conns.clone()),
+diff --git a/crates/vp-protocol/src/uot.rs b/crates/vp-protocol/src/uot.rs
+index 9b3191d..91c21dd 100644
+--- a/crates/vp-protocol/src/uot.rs
++++ b/crates/vp-protocol/src/uot.rs
+@@ -36,7 +36,12 @@ pub fn magic_dst() -> DstAddr {
+ 
+ /// 是否 UoT 魔法地址（v1 服务端中继；v2 帧格式不同，明确拒绝）
+ pub fn is_magic(dst: &DstAddr) -> bool {
+-    matches!(&dst.host, Host::Domain(d) if d == MAGIC_HOST_V1 || d == MAGIC_HOST_V2)
++    matches!(&dst.host, Host::Domain(d) if {
++        // Reserved DNS names must not escape to ordinary egress via case or a
++        // root-label suffix. Framing admission below remains canonical v1 only.
++        let name = d.strip_suffix('.').unwrap_or(d);
++        name.eq_ignore_ascii_case(MAGIC_HOST_V1) || name.eq_ignore_ascii_case(MAGIC_HOST_V2)
++    })
+ }
+ 
+ const ATYP_V4: u8 = 0x00;
+@@ -237,6 +242,11 @@ pub async fn serve_client(
+     mut sess: Session,
+     client: Box<dyn ProxyStream>,
+ ) -> Result<()> {
++    if !matches!(&sess.dst.host, Host::Domain(name) if name == MAGIC_HOST_V1) {
++        return Err(Error::Unsupported(
++            "only UoT v1 ingress framing is implemented".into(),
++        ));
++    }
+     sess.network = vp_core::Network::Udp;
+     let (read, write) = tokio::io::split(client);
+     crate::stream_udp::serve(
+@@ -285,6 +295,17 @@ mod tests {
+     fn magic_detection() {
+         assert!(is_magic(&DstAddr::new(MAGIC_HOST_V1, 443)));
+         assert!(is_magic(&DstAddr::new(MAGIC_HOST_V2, 443)));
++        for reserved in [
++            "SP.UDP-OVER-TCP.ARPA",
++            "sp.udp-over-tcp.arpa.",
++            "Sp.V2.Udp-Over-Tcp.Arpa.",
++        ] {
++            assert!(is_magic(&DstAddr {
++                host: Host::Domain(reserved.into()),
++                port: 443
++            }));
++        }
++        assert!(!is_magic(&DstAddr::new("not-sp.udp-over-tcp.arpa", 443)));
+         assert!(!is_magic(&DstAddr::new("example.com", 443)));
+         assert!(!is_magic(&dst4([1, 2, 3, 4], 443)));
+     }
+diff --git a/crates/vp-protocol/tests/server_routing.rs b/crates/vp-protocol/tests/server_routing.rs
+index 4cf4002..3fbc684 100644
+--- a/crates/vp-protocol/tests/server_routing.rs
++++ b/crates/vp-protocol/tests/server_routing.rs
+@@ -419,3 +419,239 @@ async fn authenticated_domain_match_reject_happens_before_any_dns_or_target_sock
+         );
+     }
+ }
++
++#[tokio::test]
++async fn authenticated_ss_uot_routes_each_target_and_selection_without_magic_dns() {
++    let dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
++    let host = Arc::new(DenyHost {
++        calls: 0.into(),
++        dns: dns.local_addr().unwrap(),
++    });
++    let scope = TaskScope::with_host_network(
++        vp_core::task_scope::DestinationPolicy::Unrestricted,
++        Some(host.clone()),
++    );
++    let router = probe();
++    let port = scope.run(server("ss", router.clone())).await;
++    let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
++    let second = UdpSocket::bind("127.0.0.1:0").await.unwrap();
++    let out = outbound("ss", port);
++    let magic = vp_protocol::uot::magic_dst();
++    let session = Session::new_tcp("client".into(), None, magic.clone());
++    let mut stream = out.connect_stream(&session, &magic).await.unwrap();
++    // Same authenticated connection, distinct targets, then a changed selection
++    // for the original target. None may use the real observer sockets directly.
++    for (selected, target) in [
++        (0, first.local_addr().unwrap()),
++        (0, second.local_addr().unwrap()),
++        (1, first.local_addr().unwrap()),
++    ] {
++        router.selected.store(selected, Ordering::SeqCst);
++        let destination = DstAddr::ip(target.ip(), target.port());
++        stream
++            .write_all(&vp_protocol::uot::encode_frame(&destination, b"uot-probe"))
++            .await
++            .unwrap();
++        stream.flush().await.unwrap();
++        let (source, bytes) = timeout(
++            Duration::from_secs(2),
++            vp_protocol::uot::read_frame(&mut stream),
++        )
++        .await
++        .unwrap()
++        .unwrap();
++        assert_eq!(source, destination);
++        assert_eq!(bytes.as_ref(), &[selected as u8 + 1]);
++    }
++    // Shared SOCKS parsing intentionally normalizes ASCII case. A raw uppercase
++    // v1 control token must therefore enter the authenticated bridge, not DNS.
++    let uppercase = DstAddr {
++        host: vp_common::Host::Domain("SP.UDP-OVER-TCP.ARPA".into()),
++        port: 443,
++    };
++    let mut normalized = out.connect_stream(&session, &uppercase).await.unwrap();
++    let target = first.local_addr().unwrap();
++    let destination = DstAddr::ip(target.ip(), target.port());
++    normalized
++        .write_all(&vp_protocol::uot::encode_frame(&destination, b"normalized"))
++        .await
++        .unwrap();
++    normalized.flush().await.unwrap();
++    let (source, bytes) = timeout(
++        Duration::from_secs(2),
++        vp_protocol::uot::read_frame(&mut normalized),
++    )
++    .await
++    .unwrap()
++    .unwrap();
++    assert_eq!(source, destination);
++    assert_eq!(bytes.as_ref(), &[2]);
++    assert_eq!(router.seen.lock().unwrap().len(), 4);
++    check_metadata(&router, "ss", port, Network::Udp);
++    assert!(
++        router
++            .seen
++            .lock()
++            .unwrap()
++            .iter()
++            .all(|s| !vp_protocol::uot::is_magic(&s.dst))
++    );
++    assert_eq!(
++        host.calls.load(Ordering::SeqCst),
++        0,
++        "control name/targets must not reach DNS/direct sockets"
++    );
++    for observer in [&first, &second, &dns] {
++        assert!(
++            timeout(Duration::from_millis(20), observer.recv_from(&mut [0; 64]))
++                .await
++                .is_err()
++        );
++    }
++    // Leave an accepted stream and its routed packet workers live, then force
++    // managed stop. All scoped workers must be destroyed and TCP must close.
++    let stopped = scope.shutdown(Duration::ZERO, Duration::from_secs(1)).await;
++    assert_eq!(stopped.remaining_tasks, 0);
++    assert_eq!(stopped.panics, 0);
++    assert!(!matches!(
++        timeout(Duration::from_secs(1), stream.read_u8()).await,
++        Ok(Ok(_))
++    ));
++    let rebound = tokio::net::TcpListener::bind(("127.0.0.1", port))
++        .await
++        .unwrap();
++    drop(rebound);
++}
++
++#[tokio::test]
++async fn authenticated_ss_uot_match_reject_precedes_domain_dns_and_target_io() {
++    for destination in [
++        DstAddr::new("blocked.test", 53),
++        DstAddr::new("127.0.0.1", 5353),
++    ] {
++        let dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
++        let host = Arc::new(DenyHost {
++            calls: 0.into(),
++            dns: dns.local_addr().unwrap(),
++        });
++        let scope = TaskScope::with_host_network(
++            vp_core::task_scope::DestinationPolicy::Unrestricted,
++            Some(host.clone()),
++        );
++        let router = probe();
++        router.selected.store(2, Ordering::SeqCst);
++        let port = scope.run(server("ss", router.clone())).await;
++        let magic = vp_protocol::uot::magic_dst();
++        let out = outbound("ss", port);
++        let session = Session::new_tcp("client".into(), None, magic.clone());
++        let mut stream = out.connect_stream(&session, &magic).await.unwrap();
++        stream
++            .write_all(&vp_protocol::uot::encode_frame(&destination, b"blocked"))
++            .await
++            .unwrap();
++        stream.flush().await.unwrap();
++        assert!(!matches!(
++            timeout(Duration::from_secs(1), stream.read_u8()).await,
++            Ok(Ok(_))
++        ));
++        let seen = router.seen.lock().unwrap().clone();
++        assert_eq!(seen.len(), 1);
++        assert_eq!(seen[0].dst, destination);
++        check_metadata(&router, "ss", port, Network::Udp);
++        assert_eq!(
++            host.calls.load(Ordering::SeqCst),
++            0,
++            "REJECT must precede DNS/socket creation"
++        );
++        assert!(
++            timeout(Duration::from_millis(20), dns.recv_from(&mut [0; 64]))
++                .await
++                .is_err()
++        );
++        assert_eq!(
++            scope
++                .shutdown(Duration::ZERO, Duration::from_secs(1))
++                .await
++                .remaining_tasks,
++            0
++        );
++    }
++}
++
++#[tokio::test]
++async fn ss_uot_wrong_credentials_v2_and_nested_magic_never_reach_router() {
++    for scenario in [
++        "wrong-password",
++        "v2",
++        "nested-magic",
++        "trailing-dot",
++        "nested-variant",
++    ] {
++        let dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
++        let host = Arc::new(DenyHost {
++            calls: 0.into(),
++            dns: dns.local_addr().unwrap(),
++        });
++        let scope = TaskScope::with_host_network(
++            vp_core::task_scope::DestinationPolicy::Unrestricted,
++            Some(host.clone()),
++        );
++        let router = probe();
++        let port = scope.run(server("ss", router.clone())).await;
++        let magic = match scenario {
++            "v2" => DstAddr::new(vp_protocol::uot::MAGIC_HOST_V2, 443),
++            "trailing-dot" => DstAddr::new("sp.udp-over-tcp.arpa.", 443),
++            _ => vp_protocol::uot::magic_dst(),
++        };
++        let destination = match scenario {
++            "nested-magic" => magic.clone(),
++            "nested-variant" => DstAddr {
++                host: vp_common::Host::Domain("Sp.V2.Udp-Over-Tcp.Arpa.".into()),
++                port: 443,
++            },
++            _ => DstAddr::new("127.0.0.1", 5353),
++        };
++        let config = serde_json::json!({"server":"127.0.0.1","port":port,"cipher":"aes-128-gcm","password":if scenario=="wrong-password" {"wrong"} else {PASSWORD}});
++        let out =
++            vp_protocol::ss::SsOutbound::new(&serde_json::from_value(config).unwrap()).unwrap();
++        let session = Session::new_tcp("client".into(), None, magic.clone());
++        let result = timeout(Duration::from_secs(1), async {
++            let mut stream = out.connect_stream(&session, &magic).await?;
++            stream
++                .write_all(&vp_protocol::uot::encode_frame(
++                    &destination,
++                    b"must-not-forward",
++                ))
++                .await?;
++            stream.flush().await?;
++            stream.read_u8().await?;
++            Ok::<(), vp_common::Error>(())
++        })
++        .await;
++        assert!(
++            matches!(result, Ok(Err(_))),
++            "{scenario}: rejection must close promptly, not merely time out: {result:?}"
++        );
++        assert!(
++            router.seen.lock().unwrap().is_empty(),
++            "{scenario}: unauthenticated/control data reached routing"
++        );
++        assert_eq!(
++            host.calls.load(Ordering::SeqCst),
++            0,
++            "{scenario}: DNS/socket leak"
++        );
++        assert!(
++            timeout(Duration::from_millis(20), dns.recv_from(&mut [0; 64]))
++                .await
++                .is_err()
++        );
++        assert_eq!(
++            scope
++                .shutdown(Duration::ZERO, Duration::from_secs(1))
++                .await
++                .remaining_tasks,
++            0
++        );
++    }
++}

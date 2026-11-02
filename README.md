@@ -2,7 +2,7 @@
 
 统一管理客户端、Linux 服务端、Web 控制台与部署工具。客户端基于 `vpn-parser` fork 演进，服务端优先使用 `vp_core`；组件可以独立开发，产品版本在这里统一锁定。
 
-**当前阶段：工程整合中，尚无可直接安装的正式发行版。** 首个基础版本包含文档与真实客户端 submodule；服务端、管理 Web 和安装工具已在本地归集，正在发布前审查，尚未纳入这个基础版本。既有原型与测试结果不会自动视为新产品验收结果。
+**当前阶段：工程整合中，尚无可直接安装的正式发行版。** 本源码版本包含真实客户端 submodule、服务端 Rust 基线、管理 Web 与安装工具。源码已归集，不等于整套产品已完成构建或运行验收。既有原型与测试结果不会自动视为新产品验收结果。
 
 主仓：[vickkk-kkk/vp-product](https://github.com/vickkk-kkk/vp-product)（私有） · 客户端 fork：[vickkk-kkk/vpn-parser](https://github.com/vickkk-kkk/vpn-parser)（公开）。源码、发布与验证是不同状态，详见 [当前快照](docs/source-snapshot.md)。
 
@@ -32,9 +32,9 @@ flowchart TB
 | 入口 | 负责什么 | 本轮落地状态 |
 | --- | --- | --- |
 | `client/` | 客户端 fork；桌面界面、共享业务层及未来移动端适配 | 已绑定上游基线提交，尚不含未提交的客户端改造 |
-| `crates/`、`contracts/` | 服务端 Rust workspace 与共享管理契约 | 本地已归集，未纳入基础版本，待审查 |
-| `flutter/apps/vp_admin/` | Web 管理端，保留所需 `flutter/packages/` | 本地已归集，未纳入基础版本；不含旧 Flutter 客户端 |
-| `tools/install/` | 安装、打包、升级与运维工具 | 本地已归集，未纳入基础版本；无线上安装命令 |
+| `crates/`、`contracts/` | 服务端 Rust workspace 与共享管理契约 | 已纳入源码；新目录完整构建与运行验收待完成 |
+| `flutter/apps/vp_admin/` | Web 管理端，保留所需 `flutter/packages/` | 已纳入源码及所需五个共享包；不含旧 Flutter 客户端 |
+| `tools/install/` | 安装、打包、升级与运维工具 | 已纳入源码；无正式线上安装发行版 |
 | [docs/](docs/README.md) | 架构、开发、支持范围与发布规范 | 已建立 |
 
 根目录不建立跨客户端与服务端的“大 Cargo workspace”。客户端保留自己的依赖锁；主仓通过 submodule 的精确提交绑定它。旧 Flutter 客户端保留在历史工程中，不作为第二套活跃客户端带入。
@@ -45,7 +45,7 @@ flowchart TB
 2. 按 [开发指南](docs/development.md) 克隆主仓并检查 submodule。
 3. 修改客户端在 fork 中提交；修改服务端、Web 或部署工具在主仓提交。跨组件变更同时更新契约与版本清单。
 
-当前不提供 `curl | sh`、自动下载内核或一键改系统代理的快速启动命令。构建入口将在新目录完成复核后补充，避免给出无法复现的操作。
+当前不提供 `curl | sh`、自动下载内核或一键改系统代理的快速启动命令。服务端构建前必须按锁重建核心工作树；见 [开发指南](docs/development.md)。完整构建命令将在新目录验证后补充。
 
 ## 质量与边界
 

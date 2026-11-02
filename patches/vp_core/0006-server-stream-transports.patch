@@ -1,0 +1,3141 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 6c48e80023cd9c094f5caf6ebe80737c4dce4671..2689ffa4ee22494ad0e7aef4f7b8a0846fe23fb1 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2801,6 +2801,7 @@ dependencies = [
+  "smoltcp",
+  "socket2",
+  "tokio",
++ "tokio-rustls",
+  "tracing",
+  "tracing-subscriber",
+  "universal-hash",
+diff --git a/crates/vp-protocol/Cargo.toml b/crates/vp-protocol/Cargo.toml
+index 850ac63733c6ca0e70c357fd890ad6481e31ad29..2a1c755594e574cc6894f0b77fd6008eed67669f 100644
+--- a/crates/vp-protocol/Cargo.toml
++++ b/crates/vp-protocol/Cargo.toml
+@@ -53,6 +53,7 @@ serde_yaml.workspace = true
+ regex.workspace = true
+ 
+ [dev-dependencies]
++tokio-rustls.workspace = true
+ chacha20 = { version = "0.10", features = ["legacy"] }
+ cipher = "0.5"
+ log = "0.4"
+diff --git a/crates/vp-protocol/src/anytls.rs b/crates/vp-protocol/src/anytls.rs
+index 1bbedccc2360f01bc4d29a10ebcfc5d9d4711de3..0fb62b89a61afa3f9a1697eb5c5dc04b0ca8bcb4 100644
+--- a/crates/vp-protocol/src/anytls.rs
++++ b/crates/vp-protocol/src/anytls.rs
+@@ -665,9 +665,11 @@ impl AnytlsInbound {
+         })
+     }
+ 
+-    async fn serve(
++    /// Serve one already-decapsulated stream; await its entire protocol lifetime.
++    /// Listener/security/carrier ownership belongs to the composition caller.
++    pub async fn serve_stream(
+         self: &Arc<Self>,
+-        stream: tokio::net::TcpStream,
++        stream: Box<dyn ProxyStream>,
+         src: SocketAddr,
+         _ctx: &InboundCtx,
+     ) -> Result<()> {
+@@ -686,7 +688,7 @@ impl AnytlsInbound {
+             io.read_exact(&mut sink).await?;
+         }
+ 
+-        let (r, w) = io.into_split();
++        let (r, w) = tokio::io::split(io);
+         let writer = Arc::new(Mutex::new(ServerWriter {
+             io: w,
+             padder: Padder::new(self.padding.clone()),
+@@ -694,10 +696,46 @@ impl AnytlsInbound {
+         let mut session = SessionReader::new(r);
+         let mut settings_received = false;
+         let mut peer_version = 0u32;
++        let mut last_stream_id = 0u32;
+         let mut streams: HashMap<u32, StreamState> = HashMap::new();
++        // Bound both pre-address streams and live forwarding tasks. Owned tasks
++        // are aborted when the session ends, including disconnect/cancellation.
++        let mut tasks = tokio::task::JoinSet::new();
++        const MAX_SERVER_STREAMS: usize = 128;
++        let scope = vp_core::task_scope::current_scope();
++        let drain = async {
++            match &scope {
++                Some(scope) => scope.draining().await,
++                None => std::future::pending::<()>().await,
++            }
++        };
++        tokio::pin!(drain);
++        let mut draining = false;
+ 
+         loop {
+-            let (cmd, sid, body) = session.next_frame().await?;
++            // Keep one frame-read future pinned while joining work or observing
++            // drain: cancel/restart of read_exact would lose a partial frame.
++            let next = session.next_frame();
++            tokio::pin!(next);
++            let (cmd, sid, body) = loop {
++                tokio::select! {
++                    frame = &mut next => break frame?,
++                    complete = tasks.join_next(), if !tasks.is_empty() => {
++                        match complete {
++                            Some(Ok(sid)) => { streams.remove(&sid); },
++                            Some(Err(error)) if error.is_cancelled() => {},
++                            Some(Err(_)) => return Err(Error::Proto("anytls: forwarding task failed")),
++                            None => {},
++                        }
++                        if draining && tasks.is_empty() { return Ok(()); }
++                    }
++                    _ = &mut drain, if !draining => {
++                        draining = true;
++                        streams.retain(|_, state| matches!(state, StreamState::Open { .. }));
++                        if tasks.is_empty() { return Ok(()); }
++                    }
++                }
++            };
+             match cmd {
+                 CMD_SETTINGS => {
+                     settings_received = true;
+@@ -733,6 +771,14 @@ impl AnytlsInbound {
+                     }
+                 }
+                 CMD_SYN => {
++                    if draining {
++                        writer
++                            .lock()
++                            .await
++                            .write_packet(&frame(CMD_FIN, sid, &[]))
++                            .await?;
++                        continue;
++                    }
+                     if !settings_received {
+                         let msg = b"client did not send its settings";
+                         let _ = writer
+@@ -742,54 +788,78 @@ impl AnytlsInbound {
+                             .await;
+                         return Err(Error::Proto("anytls: 客户端未发 settings"));
+                     }
+-                    streams
+-                        .entry(sid)
+-                        .or_insert(StreamState::Pending(Vec::new()));
++                    // AnyTLS specifies monotonically increasing IDs. In
++                    // particular a FIN cannot race a reused ID/new stream.
++                    if sid <= last_stream_id || streams.len() >= MAX_SERVER_STREAMS {
++                        writer
++                            .lock()
++                            .await
++                            .write_packet(&frame(CMD_ALERT, 0, b"invalid or excessive stream id"))
++                            .await?;
++                        return Err(Error::Proto("anytls: invalid or excessive stream id"));
++                    }
++                    last_stream_id = sid;
++                    streams.insert(sid, StreamState::Pending(Vec::new()));
+                 }
+                 CMD_PSH => {
+                     let Some(state) = streams.get_mut(&sid) else {
+                         continue;
+                     };
+                     match state {
+-                        StreamState::Open(tx) => {
+-                            if tx.send(body).await.is_err() {
++                        StreamState::Open { sender, .. } => {
++                            if sender.send(body).await.is_err() {
+                                 streams.remove(&sid);
+                             }
+                         }
+                         StreamState::Pending(buf) => {
+                             buf.extend_from_slice(&body);
+-                            if buf.len() > MAX_ADDR_LEN {
+-                                streams.remove(&sid);
+-                                continue;
+-                            }
+                             let (dst, used) = match decode_socks_addr(buf) {
+                                 Ok(x) => x,
+                                 Err(Error::Proto("address truncated"))
+-                                | Err(Error::Proto("empty domain")) => continue,
++                                | Err(Error::Proto("empty domain")) => {
++                                    if buf.len() > MAX_ADDR_LEN {
++                                        return Err(Error::Proto("anytls: address limit"));
++                                    }
++                                    continue;
++                                }
+                                 Err(e) => {
+                                     streams.remove(&sid);
+                                     return Err(e);
+                                 }
+                             };
+                             let rest = buf[used..].to_vec();
+-                            let (tx, rx) = mpsc::channel(64);
+-                            *state = StreamState::Open(tx);
+-                            vp_core::task_scope::spawn(pump_stream(
+-                                self.direct.clone(),
+-                                self.tag.clone(),
+-                                src,
+-                                dst,
+-                                sid,
+-                                peer_version,
+-                                rx,
+-                                rest,
+-                                writer.clone(),
+-                            ));
++                            if tasks.len() >= MAX_SERVER_STREAMS {
++                                return Err(Error::Proto("anytls: forwarding task limit"));
++                            }
++                            let (tx, rx) = mpsc::channel(8);
++                            let direct = self.direct.clone();
++                            let tag = self.tag.clone();
++                            let writer = writer.clone();
++                            let abort = vp_core::task_scope::spawn_in(&mut tasks, async move {
++                                pump_stream(
++                                    direct,
++                                    tag,
++                                    src,
++                                    dst,
++                                    sid,
++                                    peer_version,
++                                    rx,
++                                    rest,
++                                    writer,
++                                )
++                                .await;
++                                sid
++                            });
++                            *state = StreamState::Open { sender: tx, abort };
+                         }
+                     }
+                 }
+                 CMD_FIN => {
+-                    streams.remove(&sid);
++                    // FIN closes this stream, not just its upload direction.
++                    // Do not retain a target task until some remote timeout.
++                    if let Some(StreamState::Open { abort, .. }) = streams.remove(&sid) {
++                        abort.abort();
++                    }
+                 }
+                 CMD_HEART_REQ => {
+                     writer
+@@ -808,7 +878,10 @@ enum StreamState {
+     /// 地址未收全：累积 PSH 载荷
+     Pending(Vec<u8>),
+     /// 中继中：数据通道
+-    Open(mpsc::Sender<Vec<u8>>),
++    Open {
++        sender: mpsc::Sender<Vec<u8>>,
++        abort: tokio::task::AbortHandle,
++    },
+ }
+ 
+ /// 服务端写侧：padded 帧写出
+@@ -827,6 +900,8 @@ impl<W: AsyncWrite + Unpin> ServerWriter<W> {
+     }
+ }
+ 
++type SharedServerWriter = Arc<Mutex<ServerWriter<tokio::io::WriteHalf<Box<dyn ProxyStream>>>>>;
++
+ /// 单条流的转发：anytls PSH/FIN ⇄ 目标 TCP
+ #[allow(clippy::too_many_arguments)]
+ async fn pump_stream(
+@@ -838,7 +913,7 @@ async fn pump_stream(
+     peer_version: u32,
+     mut rx: mpsc::Receiver<Vec<u8>>,
+     initial: Vec<u8>,
+-    writer: Arc<Mutex<ServerWriter<tokio::net::tcp::OwnedWriteHalf>>>,
++    writer: SharedServerWriter,
+ ) {
+     let sess = Session::new_tcp(tag, Some(src), dst.clone());
+     let mut remote = match direct.connect_stream(&sess, &dst).await {
+@@ -942,7 +1017,7 @@ impl Inbound for AnytlsInbound {
+                         let this = this.clone();
+                         let ctx = ctx.clone();
+                         vp_core::task_scope::spawn(async move {
+-                            if let Err(e) = this.serve(stream, src, &ctx).await {
++                            if let Err(e) = this.serve_stream(Box::new(stream), src, &ctx).await {
+                                 tracing::warn!("anytls 入站会话结束: {e}");
+                             }
+                         });
+diff --git a/crates/vp-protocol/src/lib.rs b/crates/vp-protocol/src/lib.rs
+index df7c938009b9cfebd4e3e89ca4bb1904ee089c28..f1127a565c9cf1c53f2c59a715f5cfb531de24a5 100644
+--- a/crates/vp-protocol/src/lib.rs
++++ b/crates/vp-protocol/src/lib.rs
+@@ -23,6 +23,7 @@ pub mod sniff;
+ pub mod ss;
+ pub mod ssh;
+ pub mod ssr;
++pub mod stream_inbound;
+ pub mod sub;
+ #[cfg(feature = "trojan")]
+ pub mod trojan;
+diff --git a/crates/vp-protocol/src/stream_inbound.rs b/crates/vp-protocol/src/stream_inbound.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..f0b5821e2996aac47a0a00a91a16215399c63f1d
+--- /dev/null
++++ b/crates/vp-protocol/src/stream_inbound.rs
+@@ -0,0 +1,117 @@
++//! Composes a real TCP listener, bounded accepted sessions, a server carrier,
++//! and an injected protocol handler. It never opens a hidden raw loopback proxy.
++use async_trait::async_trait;
++use std::{net::SocketAddr, sync::Arc};
++use vp_common::{Error, Result};
++use vp_core::{Inbound, ProxyStream, inbound::InboundCtx};
++use vp_transport::server::ServerTransport;
++
++#[derive(Clone)]
++pub enum StreamProtocol {
++    #[cfg(feature = "trojan")]
++    Trojan(Arc<crate::trojan::TrojanInbound>),
++    #[cfg(feature = "vmess")]
++    Vmess(Arc<crate::vmess::VmessInbound>),
++    #[cfg(feature = "vless")]
++    Vless(Arc<crate::vless::VlessInbound>),
++    Anytls(Arc<crate::anytls::AnytlsInbound>),
++}
++impl StreamProtocol {
++    async fn serve(
++        &self,
++        io: Box<dyn ProxyStream>,
++        peer: SocketAddr,
++        ctx: &InboundCtx,
++    ) -> Result<()> {
++        match self {
++            #[cfg(feature = "trojan")]
++            Self::Trojan(protocol) => protocol.serve_stream(io, peer, ctx).await,
++            #[cfg(feature = "vmess")]
++            Self::Vmess(protocol) => protocol.serve_stream(io, peer, ctx).await,
++            #[cfg(feature = "vless")]
++            Self::Vless(protocol) => protocol.serve_stream(io, peer, ctx).await,
++            Self::Anytls(protocol) => protocol.serve_stream(io, peer, ctx).await,
++        }
++    }
++}
++
++pub struct TransportInbound {
++    bind: String,
++    port: u16,
++    tag: String,
++    transport: ServerTransport,
++    protocol: StreamProtocol,
++    max_connections: usize,
++}
++impl TransportInbound {
++    pub fn new(
++        bind: &str,
++        port: u16,
++        tag: &str,
++        transport: ServerTransport,
++        protocol: StreamProtocol,
++        max_connections: usize,
++    ) -> Result<Self> {
++        // A caller cannot silently fall back to a public interface for an invalid
++        // bind. DNS names are excluded from listener binding (IP literal only).
++        bind.parse::<std::net::IpAddr>()
++            .map_err(|_| Error::Config("listener bind must be an IP literal".into()))?;
++        if tag.is_empty() || tag.len() > 256 || !(1..=1024).contains(&max_connections) {
++            return Err(Error::Config(
++                "invalid stream listener tag/connection bound".into(),
++            ));
++        }
++        Ok(Self {
++            bind: bind.into(),
++            port,
++            tag: tag.into(),
++            transport,
++            protocol,
++            max_connections,
++        })
++    }
++}
++#[async_trait]
++impl Inbound for TransportInbound {
++    fn tag(&self) -> &str {
++        &self.tag
++    }
++    async fn start(self: Arc<Self>, ctx: InboundCtx) -> Result<u16> {
++        let listener = tokio::net::TcpListener::bind((self.bind.as_str(), self.port)).await?;
++        let bound = listener.local_addr()?.port();
++        let permits = Arc::new(tokio::sync::Semaphore::new(self.max_connections));
++        vp_core::task_scope::spawn_listener(self.tag.clone(), async move {
++            // The accept task stops immediately; tracked connection tasks remain
++            // Work until drain completes. This JoinSet only reaps their handles,
++            // so dropping it does not abort the independently tracked sessions.
++            let mut sessions = tokio::task::JoinSet::new();
++            loop {
++                tokio::select! {
++                    accepted = listener.accept() => {
++                        let (tcp, peer) = match accepted {
++                            Ok(value) => value,
++                            Err(_) => { tokio::time::sleep(std::time::Duration::from_millis(50)).await; continue; }
++                        };
++                        let Ok(permit) = permits.clone().try_acquire_owned() else { drop(tcp); continue; };
++                        vp_transport::tune(&tcp);
++                        let this = self.clone(); let ctx = ctx.clone();
++                        let session = vp_core::task_scope::spawn(async move {
++                            let _permit = permit;
++                            let protocol = this.protocol.clone();
++                            let _ = this.transport.serve(Box::new(tcp), move |io| {
++                                let protocol = protocol.clone(); let ctx = ctx.clone();
++                                async move { protocol.serve(io, peer, &ctx).await }
++                            }).await;
++                        });
++                        sessions.spawn(async move { let _ = session.await; });
++                    }
++                    _ = sessions.join_next(), if !sessions.is_empty() => {}
++                }
++            }
++        });
++        Ok(bound)
++    }
++}
++
++#[cfg(all(test, feature = "vless", feature = "trojan", feature = "vmess"))]
++mod tests;
+diff --git a/crates/vp-protocol/src/stream_inbound/tests.rs b/crates/vp-protocol/src/stream_inbound/tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..93884db99bd4f2d018ecd00e768544b6386d3ce0
+--- /dev/null
++++ b/crates/vp-protocol/src/stream_inbound/tests.rs
+@@ -0,0 +1,713 @@
++use super::*;
++use sha2::Digest;
++use std::time::Duration;
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use vp_core::task_scope::TaskScope;
++use vp_transport::server::{HttpRoute, ServerLimits, ServerNetwork, ServerTlsIdentity};
++
++fn context() -> InboundCtx {
++    InboundCtx {
++        router: Arc::new(crate::test_support::NoopRouter()),
++        stats: Arc::new(vp_common::Stats::default()),
++        conns: Arc::new(vp_core::ConnTable::new()),
++    }
++}
++fn vless() -> StreamProtocol {
++    StreamProtocol::Vless(Arc::new(
++        crate::vless::VlessInbound::new(
++            "127.0.0.1",
++            0,
++            "composed",
++            &["11111111-1111-1111-1111-111111111111".into()],
++        )
++        .unwrap(),
++    ))
++}
++fn vless_request(port: u16, payload: &[u8]) -> Vec<u8> {
++    let mut out = vec![0];
++    out.extend_from_slice(&[0x11; 16]);
++    out.extend_from_slice(&[0, 1]);
++    out.extend_from_slice(&port.to_be_bytes());
++    out.extend_from_slice(&[1, 127, 0, 0, 1]);
++    out.extend_from_slice(payload);
++    out
++}
++async fn target(payload: Vec<u8>) -> (u16, tokio::task::JoinHandle<()>) {
++    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let port = listener.local_addr().unwrap().port();
++    (
++        port,
++        tokio::spawn(async move {
++            let (mut io, _) = listener.accept().await.unwrap();
++            let mut actual = vec![0; payload.len()];
++            io.read_exact(&mut actual).await.unwrap();
++            assert_eq!(actual, payload);
++            io.write_all(b"TARGET-ACK").await.unwrap();
++            io.shutdown().await.unwrap();
++        }),
++    )
++}
++async fn start(
++    protocol: StreamProtocol,
++    network: ServerNetwork,
++    tls: Option<ServerTlsIdentity>,
++    max: usize,
++) -> (u16, Arc<TaskScope>) {
++    let transport = ServerTransport::new(network, tls, ServerLimits::default()).unwrap();
++    let listener = Arc::new(
++        TransportInbound::new("127.0.0.1", 0, "composed", transport, protocol, max).unwrap(),
++    );
++    let scope = TaskScope::new();
++    let port = scope.run(listener.start(context())).await.unwrap();
++    assert_eq!(scope.snapshot().listeners, vec!["composed"]);
++    assert!(scope.snapshot().healthy());
++    (port, scope)
++}
++async fn connect(
++    port: u16,
++    cert: Option<&rcgen::CertifiedKey>,
++    alpn: &str,
++) -> Box<dyn ProxyStream> {
++    let io = tokio::net::TcpStream::connect(("127.0.0.1", port))
++        .await
++        .unwrap();
++    if let Some(cert) = cert {
++        let mut roots = rustls::RootCertStore::empty();
++        roots.add(cert.cert.der().clone()).unwrap();
++        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
++            rustls::crypto::ring::default_provider(),
++        ))
++        .with_safe_default_protocol_versions()
++        .unwrap()
++        .with_root_certificates(roots)
++        .with_no_client_auth();
++        if !alpn.is_empty() {
++            config.alpn_protocols = vec![alpn.as_bytes().to_vec()];
++        }
++        let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
++            .connect("localhost".try_into().unwrap(), io)
++            .await
++            .unwrap();
++        Box::new(tls)
++    } else {
++        Box::new(io)
++    }
++}
++fn carrier_network(mode: u8) -> ServerNetwork {
++    let route = HttpRoute::new("/proxy", vec!["localhost".into()]).unwrap();
++    match mode {
++        2 | 5 => ServerNetwork::WebSocket(route),
++        3 => ServerNetwork::HttpUpgrade(route),
++        4 => ServerNetwork::Http2(route),
++        _ => ServerNetwork::Tcp,
++    }
++}
++// Test harness only: map HTTP/2 DATA to a bounded duplex stream for exercising
++// an existing VMess encoder over each carrier. This is NOT independent interop.
++async fn carrier(
++    port: u16,
++    cert: &rcgen::CertifiedKey,
++    mode: u8,
++) -> (Box<dyn ProxyStream>, Vec<tokio::task::JoinHandle<()>>) {
++    let mut io = connect(
++        port,
++        (mode != 5).then_some(cert),
++        if mode == 4 {
++            "h2"
++        } else if mode >= 2 {
++            "http/1.1"
++        } else {
++            ""
++        },
++    )
++    .await;
++    if mode == 2 || mode == 5 {
++        io = Box::new(
++            vp_transport::ws::ws_handshake_client(
++                io,
++                "localhost",
++                &vp_transport::WsConfig {
++                    path: "/proxy".into(),
++                    headers: vec![],
++                },
++            )
++            .await
++            .unwrap(),
++        );
++    } else if mode == 3 {
++        io.write_all(b"GET /proxy HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n").await.unwrap();
++        let mut head = Vec::new();
++        while !head.ends_with(b"\r\n\r\n") {
++            head.push(io.read_u8().await.unwrap());
++        }
++        assert!(head.starts_with(b"HTTP/1.1 101 "));
++    } else if mode == 4 {
++        let (mut client, connection) = h2::client::handshake(io).await.unwrap();
++        let driver = tokio::spawn(async move {
++            let _ = connection.await;
++        });
++        let request = http::Request::builder()
++            .method("PUT")
++            .uri("https://localhost/proxy")
++            .body(())
++            .unwrap();
++        let (response, mut send) = client.send_request(request, false).unwrap();
++        let response = response.await.unwrap();
++        assert_eq!(response.status(), 200);
++        let mut receive = response.into_body();
++        let (local, remote) = tokio::io::duplex(65536);
++        let (mut read, mut write) = tokio::io::split(remote);
++        let bridge = tokio::spawn(async move {
++            let upload = async move {
++                let mut buf = [0; 16384];
++                loop {
++                    let n = match read.read(&mut buf).await {
++                        Ok(n) => n,
++                        Err(_) => return,
++                    };
++                    if n == 0 {
++                        let _ = send.send_data(bytes::Bytes::new(), true);
++                        return;
++                    }
++                    let mut offset = 0;
++                    while offset < n {
++                        send.reserve_capacity(n - offset);
++                        let cap = match std::future::poll_fn(|cx| send.poll_capacity(cx)).await {
++                            Some(Ok(cap)) => cap,
++                            _ => return,
++                        };
++                        let count = cap.min(n - offset);
++                        if count == 0 {
++                            tokio::task::yield_now().await;
++                            continue;
++                        }
++                        if send
++                            .send_data(
++                                bytes::Bytes::copy_from_slice(&buf[offset..offset + count]),
++                                false,
++                            )
++                            .is_err()
++                        {
++                            return;
++                        }
++                        offset += count;
++                    }
++                }
++            };
++            let download = async move {
++                while let Some(data) = receive.data().await {
++                    let data = match data {
++                        Ok(data) => data,
++                        Err(_) => break,
++                    };
++                    if write.write_all(&data).await.is_err() {
++                        break;
++                    }
++                    if receive.flow_control().release_capacity(data.len()).is_err() {
++                        break;
++                    }
++                }
++                let _ = write.shutdown().await;
++            };
++            tokio::join!(upload, download);
++        });
++        return (Box::new(local), vec![driver, bridge]);
++    }
++    (io, vec![])
++}
++async fn finish_carrier(tasks: Vec<tokio::task::JoinHandle<()>>) {
++    for task in tasks {
++        task.abort();
++        let _ = task.await;
++    }
++}
++
++async fn stop(scope: Arc<TaskScope>) {
++    let report = scope.shutdown(Duration::ZERO, Duration::from_secs(2)).await;
++    assert_eq!(report.remaining_tasks, 0);
++    assert_eq!(report.panics, 0);
++}
++
++#[tokio::test]
++async fn composed_vless_tcp_tls_websocket_and_httpupgrade() {
++    for mode in 0..4 {
++        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
++        let tls = (mode != 0).then(|| {
++            ServerTlsIdentity::from_pem(
++                cert.cert.pem().as_bytes(),
++                cert.key_pair.serialize_pem().as_bytes(),
++            )
++            .unwrap()
++        });
++        let route = HttpRoute::new("/proxy", vec!["localhost".into()]).unwrap();
++        let network = match mode {
++            0 | 1 => ServerNetwork::Tcp,
++            2 => ServerNetwork::WebSocket(route),
++            _ => ServerNetwork::HttpUpgrade(route),
++        };
++        let (port, scope) = start(vless(), network, tls, 8).await;
++        let (target_port, target) = target(b"independent-payload".to_vec()).await;
++        let mut io = connect(
++            port,
++            (mode != 0).then_some(&cert),
++            if mode >= 2 { "http/1.1" } else { "" },
++        )
++        .await;
++        if mode == 2 {
++            io = Box::new(
++                vp_transport::ws::ws_handshake_client(
++                    io,
++                    "localhost",
++                    &vp_transport::WsConfig {
++                        path: "/proxy".into(),
++                        headers: vec![],
++                    },
++                )
++                .await
++                .unwrap(),
++            );
++        } else if mode == 3 {
++            io.write_all(b"GET /proxy HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n").await.unwrap();
++            let mut head = Vec::new();
++            while !head.ends_with(b"\r\n\r\n") {
++                head.push(io.read_u8().await.unwrap());
++            }
++            assert!(head.starts_with(b"HTTP/1.1 101 "));
++        }
++        io.write_all(&vless_request(target_port, b"independent-payload"))
++            .await
++            .unwrap();
++        io.flush().await.unwrap();
++        let mut result = [0; 12];
++        tokio::time::timeout(Duration::from_secs(2), io.read_exact(&mut result))
++            .await
++            .unwrap()
++            .unwrap();
++        assert_eq!(&result, b"\0\0TARGET-ACK");
++        let _ = io.shutdown().await;
++        drop(io);
++        target.await.unwrap();
++        stop(scope).await;
++    }
++}
++
++#[tokio::test]
++async fn composed_vless_http2_tls_raw_wire_and_scope_cleanup() {
++    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
++    let tls = ServerTlsIdentity::from_pem(
++        cert.cert.pem().as_bytes(),
++        cert.key_pair.serialize_pem().as_bytes(),
++    )
++    .unwrap();
++    let network = ServerNetwork::Http2(HttpRoute::new("/proxy", vec!["localhost".into()]).unwrap());
++    let (port, scope) = start(vless(), network, Some(tls), 8).await;
++    let (target_port, target) = target(b"h2-wire-payload".to_vec()).await;
++    let io = connect(port, Some(&cert), "h2").await;
++    let (mut client, connection) = h2::client::handshake(io).await.unwrap();
++    let driver = tokio::spawn(async move {
++        let _ = connection.await;
++    });
++    let request = http::Request::builder()
++        .method("PUT")
++        .uri("https://localhost/proxy/suffix")
++        .body(())
++        .unwrap();
++    let (response, mut send) = client.send_request(request, false).unwrap();
++    send.send_data(
++        bytes::Bytes::from(vless_request(target_port, b"h2-wire-payload")),
++        true,
++    )
++    .unwrap();
++    let response = response.await.unwrap();
++    assert_eq!(response.status(), 200);
++    let mut receive = response.into_body();
++    let mut got = Vec::new();
++    while let Some(data) = receive.data().await {
++        let data = data.unwrap();
++        got.extend_from_slice(&data);
++        receive.flow_control().release_capacity(data.len()).unwrap();
++    }
++    assert_eq!(got, b"\0\0TARGET-ACK");
++    target.await.unwrap();
++    drop(client);
++    driver.abort();
++    let _ = driver.await;
++    stop(scope).await;
++}
++
++#[tokio::test]
++async fn composed_trojan_tls_ws_upgrade_h2_raw_wire() {
++    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
++    for mode in 1..=4 {
++        let tls = ServerTlsIdentity::from_pem(
++            cert.cert.pem().as_bytes(),
++            cert.key_pair.serialize_pem().as_bytes(),
++        )
++        .unwrap();
++        let protocol = StreamProtocol::Trojan(Arc::new(
++            crate::trojan::TrojanInbound::new(
++                "127.0.0.1",
++                0,
++                "composed",
++                &["ephemeral-password".into()],
++            )
++            .unwrap(),
++        ));
++        let (port, scope) = start(protocol, carrier_network(mode), Some(tls), 8).await;
++        let (target_port, target) = target(b"trojan-wire-payload".to_vec()).await;
++        let (mut io, tasks) = carrier(port, &cert, mode).await;
++        let hash: String = sha2::Sha224::digest(b"ephemeral-password")
++            .iter()
++            .map(|b| format!("{b:02x}"))
++            .collect();
++        let mut fixture = hash.into_bytes();
++        fixture.extend_from_slice(b"\r\n\x01\x01\x7f\x00\x00\x01");
++        fixture.extend_from_slice(&target_port.to_be_bytes());
++        fixture.extend_from_slice(b"\r\ntrojan-wire-payload");
++        io.write_all(&fixture).await.unwrap();
++        io.flush().await.unwrap();
++        let mut result = [0; 10];
++        tokio::time::timeout(Duration::from_secs(2), io.read_exact(&mut result))
++            .await
++            .unwrap()
++            .unwrap();
++        assert_eq!(&result, b"TARGET-ACK");
++        let _ = io.shutdown().await;
++        drop(io);
++        target.await.unwrap();
++        finish_carrier(tasks).await;
++        stop(scope).await;
++    }
++}
++
++#[tokio::test]
++async fn composed_vmess_tls_ws_upgrade_h2_self_codec_not_independent_interop() {
++    use vp_core::Outbound;
++    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
++    for mode in 1..=5 {
++        let tls = (mode != 5).then(|| {
++            ServerTlsIdentity::from_pem(
++                cert.cert.pem().as_bytes(),
++                cert.key_pair.serialize_pem().as_bytes(),
++            )
++            .unwrap()
++        });
++        let uuid = "11111111-1111-1111-1111-111111111111";
++        let protocol = StreamProtocol::Vmess(Arc::new(
++            crate::vmess::VmessInbound::new("127.0.0.1", 0, "composed", &[uuid.into()]).unwrap(),
++        ));
++        let (port, scope) = start(protocol, carrier_network(mode), tls, 8).await;
++        let (target_port, target) = target(b"vmess-payload".to_vec()).await;
++        let cfg: vp_config::VmessCfg = serde_json::from_value(serde_json::json!({"server":"localhost","port":port,"uuid":uuid,"alterId":0,"cipher":"auto","tls":false})).unwrap();
++        let outbound = crate::vmess::VmessOutbound::new(&cfg).unwrap();
++        let dst = vp_common::DstAddr::new("127.0.0.1", target_port);
++        let session = vp_core::Session::new_tcp("test".into(), None, dst.clone());
++        let (carrier, tasks) = carrier(port, &cert, mode).await;
++        let mut io = outbound
++            .connect_over(&session, &dst, carrier)
++            .await
++            .unwrap();
++        io.write_all(b"vmess-payload").await.unwrap();
++        io.flush().await.unwrap();
++        let mut result = [0; 10];
++        tokio::time::timeout(Duration::from_secs(2), io.read_exact(&mut result))
++            .await
++            .unwrap()
++            .unwrap();
++        assert_eq!(&result, b"TARGET-ACK");
++        let _ = io.shutdown().await;
++        drop(io);
++        target.await.unwrap();
++        finish_carrier(tasks).await;
++        stop(scope).await;
++    }
++}
++
++fn anytls_frame(cmd: u8, sid: u32, body: &[u8], out: &mut Vec<u8>) {
++    out.push(cmd);
++    out.extend_from_slice(&sid.to_be_bytes());
++    out.extend_from_slice(&(body.len() as u16).to_be_bytes());
++    out.extend_from_slice(body);
++}
++#[tokio::test]
++async fn composed_anytls_tls_raw_wire_and_coalesced_large_first_payload() {
++    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
++    let tls = ServerTlsIdentity::from_pem(
++        cert.cert.pem().as_bytes(),
++        cert.key_pair.serialize_pem().as_bytes(),
++    )
++    .unwrap();
++    let protocol = StreamProtocol::Anytls(Arc::new(
++        crate::anytls::AnytlsInbound::new(
++            "127.0.0.1",
++            0,
++            "composed",
++            &["ephemeral-password".into()],
++        )
++        .unwrap(),
++    ));
++    let (port, scope) = start(protocol, ServerNetwork::Tcp, Some(tls), 8).await;
++    let payload = vec![42; 4096];
++    let (target_port, target) = target(payload.clone()).await;
++    let mut io = connect(port, Some(&cert), "").await;
++    let mut fixture = sha2::Sha256::digest(b"ephemeral-password").to_vec();
++    fixture.extend_from_slice(&[0, 0]);
++    anytls_frame(4, 0, b"v=2", &mut fixture);
++    anytls_frame(1, 1, &[], &mut fixture);
++    let mut body = vec![1, 127, 0, 0, 1];
++    body.extend_from_slice(&target_port.to_be_bytes());
++    body.extend_from_slice(&payload);
++    anytls_frame(2, 1, &body, &mut fixture);
++    io.write_all(&fixture).await.unwrap();
++    tokio::time::timeout(Duration::from_secs(2), async {
++        let mut got = Vec::new();
++        while got.len() < 10 {
++            let cmd = io.read_u8().await.unwrap();
++            let sid = io.read_u32().await.unwrap();
++            let len = io.read_u16().await.unwrap();
++            let mut data = vec![0; len as usize];
++            io.read_exact(&mut data).await.unwrap();
++            if cmd == 2 && sid == 1 {
++                got.extend_from_slice(&data);
++            }
++        }
++        assert_eq!(got, b"TARGET-ACK");
++    })
++    .await
++    .unwrap();
++    drop(io);
++    target.await.unwrap();
++    stop(scope).await;
++}
++
++#[tokio::test]
++async fn anytls_existing_stream_drains_without_forcing_and_rejects_excess_syn() {
++    let protocol = || {
++        StreamProtocol::Anytls(Arc::new(
++            crate::anytls::AnytlsInbound::new(
++                "127.0.0.1",
++                0,
++                "composed",
++                &["ephemeral-password".into()],
++            )
++            .unwrap(),
++        ))
++    };
++    let (port, scope) = start(protocol(), ServerNetwork::Tcp, None, 4).await;
++    let (target_port, target) = target(b"late-anytls-payload".to_vec()).await;
++    let mut io = connect(port, None, "").await;
++    let mut fixture = sha2::Sha256::digest(b"ephemeral-password").to_vec();
++    fixture.extend_from_slice(&[0, 0]);
++    anytls_frame(4, 0, b"v=2", &mut fixture);
++    anytls_frame(1, 1, &[], &mut fixture);
++    let mut address = vec![1, 127, 0, 0, 1];
++    address.extend_from_slice(&target_port.to_be_bytes());
++    anytls_frame(2, 1, &address, &mut fixture);
++    io.write_all(&fixture).await.unwrap();
++    loop {
++        let cmd = io.read_u8().await.unwrap();
++        let sid = io.read_u32().await.unwrap();
++        let len = io.read_u16().await.unwrap();
++        let mut body = vec![0; len as usize];
++        io.read_exact(&mut body).await.unwrap();
++        if cmd == 7 && sid == 1 {
++            assert!(body.is_empty());
++            break;
++        }
++    }
++    let draining_scope = scope.clone();
++    let shutdown = tokio::spawn(async move {
++        draining_scope
++            .shutdown(Duration::from_secs(2), Duration::from_secs(2))
++            .await
++    });
++    scope.draining().await;
++    let mut frames = Vec::new();
++    anytls_frame(2, 1, b"late-anytls-payload", &mut frames);
++    io.write_all(&frames).await.unwrap();
++    let mut received = Vec::new();
++    while received.len() < 10 {
++        let cmd = io.read_u8().await.unwrap();
++        let sid = io.read_u32().await.unwrap();
++        let len = io.read_u16().await.unwrap();
++        let mut body = vec![0; len as usize];
++        io.read_exact(&mut body).await.unwrap();
++        if cmd == 2 && sid == 1 {
++            received.extend_from_slice(&body);
++        }
++    }
++    assert_eq!(received, b"TARGET-ACK");
++    target.await.unwrap();
++    let report = shutdown.await.unwrap();
++    assert!(report.drained);
++    assert_eq!(report.forced_tasks, 0);
++    assert_eq!(report.remaining_tasks, 0);
++    drop(io);
++
++    let (port, scope) = start(protocol(), ServerNetwork::Tcp, None, 4).await;
++    let mut io = connect(port, None, "").await;
++    let mut fixture = sha2::Sha256::digest(b"ephemeral-password").to_vec();
++    fixture.extend_from_slice(&[0, 0]);
++    anytls_frame(4, 0, b"v=2", &mut fixture);
++    for sid in 1..=129 {
++        anytls_frame(1, sid, &[], &mut fixture);
++    }
++    io.write_all(&fixture).await.unwrap();
++    let mut buffer = Vec::new();
++    // No pending address stream is allowed to grow the map past 128.
++    tokio::time::timeout(Duration::from_secs(2), io.read_to_end(&mut buffer))
++        .await
++        .unwrap()
++        .unwrap();
++    drop(io);
++    stop(scope).await;
++}
++
++#[tokio::test]
++async fn anytls_fin_cancels_target_but_keeps_session_and_forbids_id_reuse() {
++    let protocol = StreamProtocol::Anytls(Arc::new(
++        crate::anytls::AnytlsInbound::new(
++            "127.0.0.1",
++            0,
++            "composed",
++            &["ephemeral-password".into()],
++        )
++        .unwrap(),
++    ));
++    let (port, scope) = start(protocol, ServerNetwork::Tcp, None, 4).await;
++    let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let mut io = connect(port, None, "").await;
++    let mut fixture = sha2::Sha256::digest(b"ephemeral-password").to_vec();
++    fixture.extend_from_slice(&[0, 0]);
++    anytls_frame(4, 0, b"v=2", &mut fixture);
++    anytls_frame(1, 1, &[], &mut fixture);
++    let mut address = vec![1, 127, 0, 0, 1];
++    address.extend_from_slice(&target.local_addr().unwrap().port().to_be_bytes());
++    anytls_frame(2, 1, &address, &mut fixture);
++    io.write_all(&fixture).await.unwrap();
++    let (mut target_io, _) = tokio::time::timeout(Duration::from_secs(2), target.accept())
++        .await
++        .unwrap()
++        .unwrap();
++    let mut frames = Vec::new();
++    anytls_frame(3, 1, &[], &mut frames);
++    anytls_frame(8, 0, &[], &mut frames);
++    io.write_all(&frames).await.unwrap();
++    assert_eq!(
++        tokio::time::timeout(Duration::from_secs(2), target_io.read_u8())
++            .await
++            .unwrap()
++            .unwrap_err()
++            .kind(),
++        std::io::ErrorKind::UnexpectedEof
++    );
++    loop {
++        let cmd = io.read_u8().await.unwrap();
++        let _sid = io.read_u32().await.unwrap();
++        let len = io.read_u16().await.unwrap();
++        let mut body = vec![0; len as usize];
++        io.read_exact(&mut body).await.unwrap();
++        if cmd == 9 {
++            assert!(body.is_empty());
++            break;
++        }
++    }
++    let mut frames = Vec::new();
++    anytls_frame(1, 1, &[], &mut frames);
++    io.write_all(&frames).await.unwrap();
++    loop {
++        let cmd = io.read_u8().await.unwrap();
++        let _sid = io.read_u32().await.unwrap();
++        let len = io.read_u16().await.unwrap();
++        let mut body = vec![0; len as usize];
++        io.read_exact(&mut body).await.unwrap();
++        if cmd == 5 {
++            assert_eq!(body, b"invalid or excessive stream id");
++            break;
++        }
++    }
++    // The alert may be followed by legal waste/padding frames before EOF.
++    let mut tail = Vec::new();
++    tokio::time::timeout(Duration::from_secs(2), io.read_to_end(&mut tail))
++        .await
++        .unwrap()
++        .unwrap();
++    assert!(
++        tokio::time::timeout(Duration::from_millis(25), target.accept())
++            .await
++            .is_err()
++    );
++    drop(io);
++    stop(scope).await;
++}
++
++#[tokio::test]
++async fn bounded_sessions_force_stop_rebind_and_graceful_drain() {
++    let (port, scope) = start(vless(), ServerNetwork::Tcp, None, 1).await;
++    let mut idle = connect(port, None, "").await;
++    tokio::time::timeout(Duration::from_secs(2), async {
++        while scope.snapshot().work == 0 {
++            tokio::task::yield_now().await;
++        }
++    })
++    .await
++    .unwrap();
++    let mut excess = connect(port, None, "").await;
++    assert_eq!(
++        tokio::time::timeout(Duration::from_secs(2), excess.read_u8())
++            .await
++            .unwrap()
++            .unwrap_err()
++            .kind(),
++        std::io::ErrorKind::UnexpectedEof
++    );
++    let report = scope.shutdown(Duration::ZERO, Duration::from_secs(2)).await;
++    assert_eq!(report.remaining_tasks, 0);
++    assert!(report.forced_tasks > 0);
++    assert!(idle.read_u8().await.is_err());
++    drop(idle);
++    let rebound = tokio::net::TcpListener::bind(("127.0.0.1", port))
++        .await
++        .unwrap();
++    drop(rebound);
++    let (port, scope) = start(vless(), ServerNetwork::Tcp, None, 2).await;
++    let mut client = connect(port, None, "").await;
++    let (target_port, target) = target(b"payload-during-drain".to_vec()).await;
++    // Authenticate and establish the target before graceful shutdown begins.
++    client
++        .write_all(&vless_request(target_port, &[]))
++        .await
++        .unwrap();
++    let mut response = [0; 2];
++    client.read_exact(&mut response).await.unwrap();
++    assert_eq!(response, [0, 0]);
++    let stop_scope = scope.clone();
++    let shutdown = tokio::spawn(async move {
++        stop_scope
++            .shutdown(Duration::from_secs(2), Duration::from_secs(2))
++            .await
++    });
++    tokio::time::timeout(Duration::from_secs(1), async {
++        while !scope.snapshot().listeners.is_empty() {
++            tokio::task::yield_now().await;
++        }
++    })
++    .await
++    .unwrap();
++    assert!(
++        tokio::net::TcpStream::connect(("127.0.0.1", port))
++            .await
++            .is_err()
++    );
++    client.write_all(b"payload-during-drain").await.unwrap();
++    let mut reply = [0; 10];
++    client.read_exact(&mut reply).await.unwrap();
++    assert_eq!(&reply, b"TARGET-ACK");
++    client.shutdown().await.unwrap();
++    drop(client);
++    target.await.unwrap();
++    let report = shutdown.await.unwrap();
++    assert!(report.drained);
++    assert_eq!(report.forced_tasks, 0);
++    assert_eq!(report.remaining_tasks, 0);
++}
+diff --git a/crates/vp-protocol/src/trojan.rs b/crates/vp-protocol/src/trojan.rs
+index 4451c27bb95a3664be83b3e83e4d16664b8e870d..e1f78f676a8250f62430ab3d098537f01bf9be9c 100644
+--- a/crates/vp-protocol/src/trojan.rs
++++ b/crates/vp-protocol/src/trojan.rs
+@@ -153,9 +153,11 @@ impl TrojanInbound {
+         })
+     }
+ 
+-    async fn serve(
++    /// Serve one already-decapsulated stream; await its entire protocol lifetime.
++    /// Listener/security/carrier ownership belongs to the composition caller.
++    pub async fn serve_stream(
+         self: &Arc<Self>,
+-        mut stream: tokio::net::TcpStream,
++        mut stream: Box<dyn ProxyStream>,
+         src: std::net::SocketAddr,
+         ctx: &InboundCtx,
+     ) -> Result<()> {
+@@ -220,10 +222,7 @@ impl TrojanInbound {
+             meta: Some(meta),
+             stats: Some(ctx.stats.clone()),
+         };
+-        let client: Box<dyn ProxyStream> = Box::new(stream);
+-        vp_core::task_scope::spawn(async move {
+-            let _ = relay(client, remote, hook).await;
+-        });
++        let _ = relay(stream, remote, hook).await;
+         Ok(())
+     }
+ }
+@@ -246,7 +245,7 @@ impl Inbound for TrojanInbound {
+                         let this = this.clone();
+                         let ctx = ctx.clone();
+                         vp_core::task_scope::spawn(async move {
+-                            if let Err(e) = this.serve(stream, src, &ctx).await {
++                            if let Err(e) = this.serve_stream(Box::new(stream), src, &ctx).await {
+                                 tracing::warn!("trojan 入站会话结束: {e}");
+                             }
+                         });
+diff --git a/crates/vp-protocol/src/vless.rs b/crates/vp-protocol/src/vless.rs
+index 76c6f6144e35c3ea796d7b4f94818e3a5b7a5115..61533a73650022254b57343e89ec953b422bcd41 100644
+--- a/crates/vp-protocol/src/vless.rs
++++ b/crates/vp-protocol/src/vless.rs
+@@ -69,6 +69,10 @@ fn decode_request(buf: &[u8]) -> Result<([u8; 16], DstAddr, bool, usize)> {
+         }
+         if &buf[i..i + addons_len] == VISION_FLOW_BYTES {
+             is_vision = true;
++        } else {
++            return Err(Error::Unsupported(
++                "vless: unknown addon/flow cannot be downgraded".into(),
++            ));
+         }
+         i += addons_len;
+     }
+@@ -145,6 +149,7 @@ impl VlessOutbound {
+     }
+ 
+     fn internal_new(name: Option<&str>, cfg: &VlessCfg) -> Result<Self> {
++        crate::vless_vision::validate_flow(cfg.flow.as_deref())?;
+         let uuid = parse_uuid(&cfg.uuid)?;
+         let mut t = crate::transport_of_full(
+             cfg.tls,
+@@ -185,11 +190,8 @@ impl VlessOutbound {
+         full.push(VERSION);
+         full.extend_from_slice(&self.uuid);
+         full.extend_from_slice(&req);
+-        tracing::debug!(
+-            "vless 请求 {} 字节: {}",
+-            full.len(),
+-            full.iter().map(|b| format!("{b:02x}")).collect::<String>()
+-        );
++        // The request contains the UUID credential; never log its bytes.
++        tracing::debug!("vless request header: {} bytes", full.len());
+ 
+         if is_vision {
+             io.write_all(&full).await?;
+@@ -378,6 +380,43 @@ impl Outbound for VlessOutbound {
+ // 入站
+ // ---------------------------------------------------------------------------
+ 
++/// Preserves payload consumed by the bounded request-header parser.
++struct RequestTailStream {
++    inner: Box<dyn ProxyStream>,
++    tail: BytesMut,
++}
++impl AsyncRead for RequestTailStream {
++    fn poll_read(
++        mut self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        buf: &mut ReadBuf<'_>,
++    ) -> Poll<std::io::Result<()>> {
++        if !self.tail.is_empty() {
++            let n = self.tail.len().min(buf.remaining());
++            buf.put_slice(&self.tail[..n]);
++            self.tail.advance(n);
++            Poll::Ready(Ok(()))
++        } else {
++            Pin::new(&mut self.inner).poll_read(cx, buf)
++        }
++    }
++}
++impl AsyncWrite for RequestTailStream {
++    fn poll_write(
++        mut self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        buf: &[u8],
++    ) -> Poll<std::io::Result<usize>> {
++        Pin::new(&mut self.inner).poll_write(cx, buf)
++    }
++    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
++        Pin::new(&mut self.inner).poll_flush(cx)
++    }
++    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
++        Pin::new(&mut self.inner).poll_shutdown(cx)
++    }
++}
++
+ pub struct VlessInbound {
+     bind: String,
+     port: u16,
+@@ -404,9 +443,11 @@ impl VlessInbound {
+         })
+     }
+ 
+-    async fn serve(
++    /// Serve one already-decapsulated stream; await its entire protocol lifetime.
++    /// Listener/security/carrier ownership belongs to the composition caller.
++    pub async fn serve_stream(
+         self: &Arc<Self>,
+-        mut stream: tokio::net::TcpStream,
++        mut stream: Box<dyn ProxyStream>,
+         src: std::net::SocketAddr,
+         ctx: &InboundCtx,
+     ) -> Result<()> {
+@@ -427,21 +468,19 @@ impl VlessInbound {
+                     if !self.uuids.contains(&uuid) {
+                         return Err(Error::Proto("vless: 用户认证失败"));
+                     }
+-                    let extra = filled - used;
+-                    let sess = Session::new_tcp(self.tag.clone(), Some(src), dst.clone());
+-                    let remote = self.direct.connect_stream(&sess, &dst).await?;
+-                    // 响应：如果启用了 vision，回送 [VERSION, 18, VISION_FLOW_BYTES]
+                     if is_vision {
+-                        stream
+-                            .write_all(&[VERSION, VISION_FLOW_BYTES.len() as u8])
+-                            .await?;
+-                        stream.write_all(VISION_FLOW_BYTES).await?;
+-                    } else {
+-                        stream.write_all(&[VERSION, 0]).await?;
+-                    }
+-                    if extra > 0 {
+-                        stream.write_all(&buf[used..filled]).await?;
++                        return Err(Error::Unsupported("vless Vision needs the authenticated raw TLS record boundary; generic stream transport cannot provide it".into()));
+                     }
++                    let sess = Session::new_tcp(self.tag.clone(), Some(src), dst.clone());
++                    let remote = self.direct.connect_stream(&sess, &dst).await?;
++                    stream.write_all(&[VERSION, 0]).await?;
++                    // Bytes coalesced behind the request belong to the inbound
++                    // payload, never to the response. The relay must read this
++                    // tail before reading any later carrier bytes.
++                    let stream = RequestTailStream {
++                        inner: stream,
++                        tail: BytesMut::from(&buf[used..filled]),
++                    };
+                     let meta = vp_core::conn_table::ConnMeta {
+                         id: sess.id,
+                         inbound: self.tag.clone(),
+@@ -459,14 +498,8 @@ impl VlessInbound {
+                         meta: Some(meta),
+                         stats: Some(ctx.stats.clone()),
+                     };
+-                    let client: Box<dyn ProxyStream> = if is_vision {
+-                        Box::new(VisionStream::new_server(stream))
+-                    } else {
+-                        Box::new(stream)
+-                    };
+-                    vp_core::task_scope::spawn(async move {
+-                        let _ = relay(client, remote, hook).await;
+-                    });
++                    let client: Box<dyn ProxyStream> = Box::new(stream);
++                    let _ = relay(client, remote, hook).await;
+                     return Ok(());
+                 }
+                 Err(Error::Proto("vless 请求头过短" | "vless 请求头截断" | "vless 地址截断")) =>
+@@ -497,7 +530,7 @@ impl Inbound for VlessInbound {
+                         let this = this.clone();
+                         let ctx = ctx.clone();
+                         vp_core::task_scope::spawn(async move {
+-                            if let Err(e) = this.serve(stream, src, &ctx).await {
++                            if let Err(e) = this.serve_stream(Box::new(stream), src, &ctx).await {
+                                 tracing::warn!("vless 入站会话结束: {e}");
+                             }
+                         });
+@@ -571,91 +604,114 @@ mod tests {
+         assert_eq!(&buf, b"ping-vless");
+     }
+ 
++    /// Independent wire fixture: the target sends a distinct acknowledgement,
++    /// so a mistaken server-side reflection of early data cannot pass as echo.
+     #[tokio::test]
+-    async fn vless_vision_handshake_and_direct_splice() {
+-        // echo 回显服务器
+-        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+-        let echo_addr = echo.local_addr().unwrap();
+-        vp_core::task_scope::spawn(async move {
+-            let (mut s, _) = echo.accept().await.unwrap();
+-            let mut b = [0u8; 8192];
+-            loop {
+-                let n = s.read(&mut b).await.unwrap();
+-                if n == 0 {
+-                    break;
+-                }
+-                s.write_all(&b[..n]).await.unwrap();
+-            }
++    async fn vless_coalesced_request_payload_reaches_target_not_client() {
++        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let port = target.local_addr().unwrap().port();
++        let target_task = vp_core::task_scope::spawn(async move {
++            let (mut stream, _) = target.accept().await.unwrap();
++            let mut payload = [0u8; 13];
++            stream.read_exact(&mut payload).await.unwrap();
++            assert_eq!(&payload, b"EARLY-REQUEST");
++            stream.write_all(b"TARGET-ACK").await.unwrap();
++            stream.shutdown().await.unwrap();
+         });
+-
+-        let ctx = InboundCtx {
+-            router: Arc::new(crate::test_support::NoopRouter()),
+-            stats: Arc::new(vp_common::Stats::default()),
+-            conns: Arc::new(vp_core::ConnTable::new()),
+-        };
+-        let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811".to_string();
+-        let server =
+-            VlessInbound::new("127.0.0.1", 0, "vl-vision-srv", std::slice::from_ref(&uuid))
++        let (mut client, server) = tokio::io::duplex(1024);
++        let mut fixture = vec![0];
++        fixture.extend_from_slice(&[0x11; 16]);
++        fixture.extend_from_slice(&[0, 1]);
++        fixture.extend_from_slice(&port.to_be_bytes());
++        fixture.extend_from_slice(&[1, 127, 0, 0, 1]);
++        fixture.extend_from_slice(b"EARLY-REQUEST");
++        // Queue the complete wire fixture before the parser starts: coalescing is
++        // deterministic and does not depend on TCP packet scheduling.
++        client.write_all(&fixture).await.unwrap();
++        let inbound = Arc::new(
++            VlessInbound::new(
++                "127.0.0.1",
++                0,
++                "tail-test",
++                &["11111111-1111-1111-1111-111111111111".into()],
++            )
++            .unwrap(),
++        );
++        let task = vp_core::task_scope::spawn(async move {
++            let ctx = InboundCtx {
++                router: Arc::new(crate::test_support::NoopRouter()),
++                stats: Arc::new(vp_common::Stats::default()),
++                conns: Arc::new(vp_core::ConnTable::new()),
++            };
++            inbound
++                .serve_stream(Box::new(server), "127.0.0.1:12345".parse().unwrap(), &ctx)
++                .await
+                 .unwrap();
+-        let port = Arc::new(server).start(ctx).await.unwrap();
+-
+-        // 构造配置了 flow: xtls-rprx-vision 的出站
+-        let out = VlessOutbound::new(&VlessCfg {
+-            server: "127.0.0.1".into(),
+-            port,
+-            uuid,
+-            flow: Some("xtls-rprx-vision".into()),
+-            tls: false,
+-            server_name: None,
+-            skip_cert_verify: false,
+-            client_fingerprint: None,
+-            alpn: None,
+-            network: None,
+-            ws_opts: None,
+-            grpc_opts: None,
+-            http_opts: None,
+-            reality_opts: None,
+-            ech_opts: None,
+-            udp: false,
+-        })
++        });
++        let mut reply = [0; 12];
++        tokio::time::timeout(
++            std::time::Duration::from_secs(2),
++            client.read_exact(&mut reply),
++        )
++        .await
++        .unwrap()
+         .unwrap();
++        assert_eq!(&reply, b"\0\0TARGET-ACK");
++        client.shutdown().await.unwrap();
++        tokio::time::timeout(std::time::Duration::from_secs(2), target_task)
++            .await
++            .unwrap()
++            .unwrap();
++        tokio::time::timeout(std::time::Duration::from_secs(2), task)
++            .await
++            .unwrap()
++            .unwrap();
++    }
+ 
+-        let dst = DstAddr::new("127.0.0.1", echo_addr.port());
+-        let sess = Session::new_tcp("t".into(), None, dst.clone());
+-        let mut s = out.connect_stream(&sess, &dst).await.unwrap();
+-
+-        // 1. 发送伪造的内层 TLS 1.3 ClientHello（触发布局伪装与填充）
+-        let mut client_hello = vec![0x16, 0x03, 0x03, 0x01, 0x00, 0x01, 0x00, 0x00, 0xfc];
+-        client_hello.resize(256, 0xaa);
+-        s.write_all(&client_hello).await.unwrap();
+-
+-        let mut recv_ch = vec![0u8; client_hello.len()];
+-        s.read_exact(&mut recv_ch).await.unwrap();
+-        assert_eq!(
+-            recv_ch, client_hello,
+-            "ClientHello 内容经 Vision 填充/剥离后应完全一致"
+-        );
+-
+-        // 2. 发送 ApplicationData（0x17），触发 PaddingEnd 并切换到裸流直通
+-        let mut app_data = vec![0x17, 0x03, 0x03, 0x00, 0x20];
+-        app_data.extend_from_slice(b"secret-application-data-content!");
+-        s.write_all(&app_data).await.unwrap();
+-
+-        let mut recv_ad = vec![0u8; app_data.len()];
+-        s.read_exact(&mut recv_ad).await.unwrap();
+-        assert_eq!(recv_ad, app_data);
+-
+-        // 3. 大流量（128 KB）直通传输测试（验证 Splice / Direct 状态零分帧损耗）
+-        let large_payload = vec![0x42u8; 128 * 1024];
+-        let mut recv_large = vec![0u8; large_payload.len()];
+-        let (mut rh, mut wh) = tokio::io::split(s);
+-        let write_fut = async move {
+-            wh.write_all(&large_payload).await.unwrap();
+-        };
+-        let read_fut = async {
+-            rh.read_exact(&mut recv_large).await.unwrap();
+-        };
+-        tokio::join!(write_fut, read_fut);
+-        assert_eq!(recv_large, vec![0x42u8; 128 * 1024]);
++    /// The old same-engine Vision echo test did not establish its required
++    /// UUID prefix/raw TLS bypass behavior. Replace that misleading success
++    /// expectation with an explicit no-target/no-success-response safety gate.
++    #[tokio::test]
++    async fn vless_vision_and_unknown_addons_rejected_before_target_io() {
++        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let port = target.local_addr().unwrap().port();
++        for addon in [VISION_FLOW_BYTES, b"\x10\x03foo".as_slice()] {
++            let (mut client, server) = tokio::io::duplex(1024);
++            let mut fixture = vec![0];
++            fixture.extend_from_slice(&[0x11; 16]);
++            fixture.push(addon.len() as u8);
++            fixture.extend_from_slice(addon);
++            fixture.push(1);
++            fixture.extend_from_slice(&port.to_be_bytes());
++            fixture.extend_from_slice(&[1, 127, 0, 0, 1]);
++            fixture.extend_from_slice(b"must-not-forward");
++            client.write_all(&fixture).await.unwrap();
++            let inbound = Arc::new(
++                VlessInbound::new(
++                    "127.0.0.1",
++                    0,
++                    "flow-gate",
++                    &["11111111-1111-1111-1111-111111111111".into()],
++                )
++                .unwrap(),
++            );
++            let ctx = InboundCtx {
++                router: Arc::new(crate::test_support::NoopRouter()),
++                stats: Arc::new(vp_common::Stats::default()),
++                conns: Arc::new(vp_core::ConnTable::new()),
++            };
++            let result = inbound
++                .serve_stream(Box::new(server), "127.0.0.1:12345".parse().unwrap(), &ctx)
++                .await;
++            assert!(matches!(result, Err(Error::Unsupported(_))));
++            let mut response = Vec::new();
++            client.read_to_end(&mut response).await.unwrap();
++            assert!(response.is_empty());
++            assert!(
++                tokio::time::timeout(std::time::Duration::from_millis(25), target.accept())
++                    .await
++                    .is_err()
++            );
++        }
+     }
+ }
+diff --git a/crates/vp-protocol/src/vmess.rs b/crates/vp-protocol/src/vmess.rs
+index 6d9efb415620ed9131f39b7919093387a5343b31..059babcdbee8c602ca26f897ada3899c8ae207f9 100644
+--- a/crates/vp-protocol/src/vmess.rs
++++ b/crates/vp-protocol/src/vmess.rs
+@@ -1042,9 +1042,11 @@ impl VmessInbound {
+         })
+     }
+ 
+-    async fn serve(
++    /// Serve one already-decapsulated stream; await its entire protocol lifetime.
++    /// Listener/security/carrier ownership belongs to the composition caller.
++    pub async fn serve_stream(
+         self: &Arc<Self>,
+-        mut stream: tokio::net::TcpStream,
++        mut stream: Box<dyn ProxyStream>,
+         src: std::net::SocketAddr,
+         ctx: &InboundCtx,
+     ) -> Result<()> {
+@@ -1112,9 +1114,7 @@ impl VmessInbound {
+             meta: Some(meta),
+             stats: Some(ctx.stats.clone()),
+         };
+-        vp_core::task_scope::spawn(async move {
+-            let _ = relay(Box::new(client), remote, hook).await;
+-        });
++        let _ = relay(Box::new(client), remote, hook).await;
+         Ok(())
+     }
+ }
+@@ -1137,7 +1137,7 @@ impl Inbound for VmessInbound {
+                         let this = this.clone();
+                         let ctx = ctx.clone();
+                         vp_core::task_scope::spawn(async move {
+-                            if let Err(e) = this.serve(stream, src, &ctx).await {
++                            if let Err(e) = this.serve_stream(Box::new(stream), src, &ctx).await {
+                                 warn!("vmess 入站会话结束: {e}");
+                             }
+                         });
+diff --git a/crates/vp-transport/src/lib.rs b/crates/vp-transport/src/lib.rs
+index 014237e503d1cf6479b8f96f101818f4f9b3b93b..de5b9876f77032462fdf90370f8007a85f9a93a2 100644
+--- a/crates/vp-transport/src/lib.rs
++++ b/crates/vp-transport/src/lib.rs
+@@ -6,6 +6,7 @@ pub mod grpc;
+ pub mod hpke;
+ pub mod http;
+ pub mod quic;
++pub mod server;
+ pub mod tls;
+ pub mod utls;
+ pub mod ws;
+diff --git a/crates/vp-transport/src/server.rs b/crates/vp-transport/src/server.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..e47aeb4753da11c0497964cea4a100f37daa7b4e
+--- /dev/null
++++ b/crates/vp-transport/src/server.rs
+@@ -0,0 +1,408 @@
++//! Bounded server-side stream composition. This is not an outbound dialer.
++//!
++//! TLS terminates before the selected carrier. HTTPUpgrade is the sing-box
++//! upgrade-to-raw-stream profile, NOT RFC 6455 framing. HTTP/2 maps every request
++//! body/response body pair to an independent stream; it is not gRPC.
++//! The caller owns the TCP listener and this future. Dropping it closes the
++//! connection and aborts all owned H2 stream tasks. No task is detached here.
++
++use crate::ProxyStreamBox;
++use base64::Engine;
++use std::{future::Future, io, sync::Arc, time::Duration};
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use vp_common::{Error, Result};
++
++mod h2_stream;
++mod websocket;
++
++/// Limits apply per accepted TCP connection; the listener must separately bound
++/// concurrent TCP sessions. None of these bounds is a protocol-authentication gate.
++#[derive(Clone, Debug)]
++pub struct ServerLimits {
++    pub handshake_timeout: Duration,
++    pub idle_timeout: Duration,
++    pub max_header_bytes: usize,
++    pub max_ws_frame_bytes: usize,
++    pub max_ws_message_bytes: usize,
++    pub max_h2_streams: u32,
++    pub max_h2_requests: usize,
++}
++impl Default for ServerLimits {
++    fn default() -> Self {
++        Self {
++            handshake_timeout: Duration::from_secs(10),
++            idle_timeout: Duration::from_secs(30),
++            max_header_bytes: 16 * 1024,
++            max_ws_frame_bytes: 1024 * 1024,
++            max_ws_message_bytes: 4 * 1024 * 1024,
++            max_h2_streams: 32,
++            max_h2_requests: 1024,
++        }
++    }
++}
++impl ServerLimits {
++    fn validate(&self) -> Result<()> {
++        if self.handshake_timeout.is_zero()
++            || self.handshake_timeout > Duration::from_secs(60)
++            || self.idle_timeout.is_zero()
++            || self.idle_timeout > Duration::from_secs(3600)
++            || !(512..=65536).contains(&self.max_header_bytes)
++            || !(125..=4 * 1024 * 1024).contains(&self.max_ws_frame_bytes)
++            || self.max_ws_message_bytes < self.max_ws_frame_bytes
++            || self.max_ws_message_bytes > 16 * 1024 * 1024
++            || !(1..=128).contains(&self.max_h2_streams)
++            || !(1..=65536).contains(&self.max_h2_requests)
++        {
++            return Err(Error::Config(
++                "invalid server transport resource limits".into(),
++            ));
++        }
++        Ok(())
++    }
++}
++
++/// Host is a complete HTTP authority (including a port if configured). Empty
++/// hosts means no virtual-host restriction. Path is a decoded absolute URI path.
++#[derive(Clone, Debug)]
++pub struct HttpRoute {
++    path: String,
++    hosts: Vec<String>,
++    method: Option<http::Method>,
++}
++impl HttpRoute {
++    pub fn new(path: &str, hosts: Vec<String>) -> Result<Self> {
++        let path = if path.is_empty() { "/" } else { path };
++        if !path.starts_with('/')
++            || path.len() > 2048
++            || path
++                .bytes()
++                .any(|b| b <= 32 || b == 127 || b == b'?' || b == b'#')
++            || hosts.len() > 32
++        {
++            return Err(Error::Config("invalid transport path/host list".into()));
++        }
++        for host in &hosts {
++            if !valid_authority(host) {
++                return Err(Error::Config("invalid transport host authority".into()));
++            }
++        }
++        Ok(Self {
++            path: path.into(),
++            hosts,
++            method: None,
++        })
++    }
++    /// HTTP/2 method check. None accepts any valid method, matching the V2Ray
++    /// HTTP server default; its clients normally send PUT. Upgrades require GET.
++    pub fn with_method(mut self, method: &str) -> Result<Self> {
++        self.method = Some(
++            method
++                .parse()
++                .map_err(|_| Error::Config("invalid HTTP method".into()))?,
++        );
++        Ok(self)
++    }
++    fn matches(&self, authority: &str, target: &str, prefix: bool) -> bool {
++        if !valid_authority(authority)
++            || (!self.hosts.is_empty()
++                && !self.hosts.iter().any(|h| h.eq_ignore_ascii_case(authority)))
++        {
++            return false;
++        }
++        let Ok(uri) = target.parse::<http::Uri>() else {
++            return false;
++        };
++        if !target.starts_with('/') {
++            return false;
++        }
++        let Some(path) = decode_path(uri.path()) else {
++            return false;
++        };
++        if prefix {
++            path.starts_with(&self.path)
++        } else {
++            path == self.path
++        }
++    }
++}
++fn valid_authority(value: &str) -> bool {
++    if value.is_empty() || value.len() > 255 || !value.is_ascii() || value.contains('@') {
++        return false;
++    }
++    let Ok(authority) = value.parse::<http::uri::Authority>() else {
++        return false;
++    };
++    let suffix = if value.starts_with('[') {
++        value.split_once(']').map(|(_, tail)| tail)
++    } else {
++        Some(value.find(':').map_or("", |index| &value[index..]))
++    };
++    let Some(suffix) = suffix else {
++        return false;
++    };
++    if !suffix.is_empty()
++        && !suffix.strip_prefix(':').is_some_and(|port| {
++            !port.is_empty()
++                && port.bytes().all(|b| b.is_ascii_digit())
++                && port.parse::<u16>().is_ok()
++        })
++    {
++        return false;
++    }
++    let host = authority.host();
++    if let Some(ip) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
++        return ip.parse::<std::net::Ipv6Addr>().is_ok();
++    }
++    let host = host.strip_suffix('.').unwrap_or(host);
++    !host.is_empty()
++        && host.split('.').all(|label| {
++            !label.is_empty()
++                && label.len() <= 63
++                && label
++                    .as_bytes()
++                    .first()
++                    .is_some_and(u8::is_ascii_alphanumeric)
++                && label
++                    .as_bytes()
++                    .last()
++                    .is_some_and(u8::is_ascii_alphanumeric)
++                && label
++                    .bytes()
++                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
++        })
++}
++
++fn decode_path(path: &str) -> Option<String> {
++    let mut bytes = Vec::with_capacity(path.len());
++    let mut it = path.as_bytes().iter().copied();
++    while let Some(b) = it.next() {
++        if b == b'%' {
++            let h = (it.next()? as char).to_digit(16)?;
++            let l = (it.next()? as char).to_digit(16)?;
++            bytes.push((h * 16 + l) as u8);
++        } else {
++            bytes.push(b);
++        }
++    }
++    if bytes.iter().any(|b| *b < 32 || *b == 127) {
++        return None;
++    }
++    String::from_utf8(bytes).ok()
++}
++
++#[derive(Clone, Debug)]
++pub enum ServerNetwork {
++    Tcp,
++    WebSocket(HttpRoute),
++    HttpUpgrade(HttpRoute),
++    Http2(HttpRoute),
++}
++
++/// In-memory identity only. No filesystem, certificate issuance, or trust bypass.
++/// rustls verifies DER/key usability and the leaf/key match at construction.
++/// The connecting client remains responsible for chain/name/time verification.
++#[derive(Clone)]
++pub struct ServerTlsIdentity {
++    config: rustls::ServerConfig,
++}
++impl ServerTlsIdentity {
++    pub fn from_pem(cert_pem: &[u8], key_pem: &[u8]) -> Result<Self> {
++        if cert_pem.is_empty() || cert_pem.len() > 1024 * 1024 || key_pem.len() > 65536 {
++            return Err(Error::Config(
++                "TLS identity exceeds bounds or is empty".into(),
++            ));
++        }
++        let certs = rustls_pemfile::certs(&mut &cert_pem[..])
++            .collect::<io::Result<Vec<_>>>()
++            .map_err(|_| Error::Config("invalid TLS certificate PEM".into()))?;
++        if certs.is_empty() || certs.len() > 8 {
++            return Err(Error::Config("invalid TLS chain length".into()));
++        }
++        let mut keys = key_pem;
++        let key = rustls_pemfile::private_key(&mut keys)
++            .map_err(|_| Error::Config("invalid TLS private key PEM".into()))?
++            .ok_or_else(|| Error::Config("missing TLS private key".into()))?;
++        if rustls_pemfile::private_key(&mut keys)
++            .map_err(|_| Error::Config("invalid trailing TLS key PEM".into()))?
++            .is_some()
++        {
++            return Err(Error::Config("multiple TLS private keys".into()));
++        }
++        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
++            rustls::crypto::ring::default_provider(),
++        ))
++        .with_safe_default_protocol_versions()
++        .map_err(|_| Error::Config("TLS protocol configuration".into()))?
++        .with_no_client_auth()
++        .with_single_cert(certs, key)
++        .map_err(|_| {
++            Error::Config("TLS certificate/key mismatch or unsupported identity".into())
++        })?;
++        Ok(Self { config })
++    }
++}
++
++#[derive(Clone)]
++pub struct ServerTransport {
++    network: ServerNetwork,
++    tls: Option<tokio_rustls::TlsAcceptor>,
++    limits: ServerLimits,
++}
++impl ServerTransport {
++    pub fn new(
++        network: ServerNetwork,
++        tls: Option<ServerTlsIdentity>,
++        limits: ServerLimits,
++    ) -> Result<Self> {
++        limits.validate()?;
++        if matches!(&network, ServerNetwork::WebSocket(r) | ServerNetwork::HttpUpgrade(r) if r.method.is_some())
++        {
++            return Err(Error::Config(
++                "upgrade method must be GET (do not set a method override)".into(),
++            ));
++        }
++        let tls = tls.map(|mut identity| {
++            identity.config.alpn_protocols = match network {
++                ServerNetwork::Http2(_) => vec![b"h2".to_vec()],
++                ServerNetwork::WebSocket(_) | ServerNetwork::HttpUpgrade(_) => {
++                    vec![b"http/1.1".to_vec()]
++                }
++                ServerNetwork::Tcp => Vec::new(),
++            };
++            tokio_rustls::TlsAcceptor::from(Arc::new(identity.config))
++        });
++        Ok(Self {
++            network,
++            tls,
++            limits,
++        })
++    }
++
++    /// Call handler once per logical stream and retain it until it finishes.
++    /// The handler must not detach relay work, or stream concurrency/drain would
++    /// cease to measure actual stream lifetime. Protocol authentication is its job.
++    pub async fn serve<F, Fut>(&self, io: ProxyStreamBox, handler: F) -> Result<()>
++    where
++        F: Fn(ProxyStreamBox) -> Fut + Send + Sync,
++        Fut: Future<Output = Result<()>> + Send + 'static,
++    {
++        let io = tokio::time::timeout(self.limits.handshake_timeout, async {
++            let mut io = if let Some(tls) = &self.tls {
++                let stream = tls.accept(io).await?;
++                let alpn = stream.get_ref().1.alpn_protocol();
++                if matches!(self.network, ServerNetwork::Http2(_)) && alpn != Some(b"h2".as_slice()) {
++                    return Err(Error::Proto("HTTP/2 requires negotiated h2 ALPN"));
++                }
++                Box::new(stream) as ProxyStreamBox
++            } else { io };
++            match &self.network {
++                ServerNetwork::WebSocket(route) | ServerNetwork::HttpUpgrade(route) => {
++                    let head = read_http_head(&mut io, self.limits.max_header_bytes).await?;
++                    let key = validate_upgrade(&head, route, matches!(self.network, ServerNetwork::WebSocket(_)))?;
++                    let accept = if let Some(key) = key {
++                        use sha1::Digest;
++                        let digest = sha1::Sha1::digest(format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11").as_bytes());
++                        format!("Sec-WebSocket-Accept: {}\r\n", base64::engine::general_purpose::STANDARD.encode(digest))
++                    } else { String::new() };
++                    io.write_all(format!("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n{accept}\r\n").as_bytes()).await?;
++                    io.flush().await?;
++                    if matches!(self.network, ServerNetwork::WebSocket(_)) {
++                        return Ok(Box::new(websocket::ServerWebSocket::new(io, &self.limits)) as ProxyStreamBox);
++                    }
++                }
++                _ => {}
++            }
++            Ok(io)
++        }).await.map_err(|_| Error::Io(io::Error::new(io::ErrorKind::TimedOut, "server transport handshake timed out")))??;
++        match &self.network {
++            ServerNetwork::Http2(route) => {
++                h2_stream::serve(io, route, &self.limits, self.tls.is_some(), handler).await
++            }
++            _ => handler(io).await,
++        }
++    }
++}
++
++/// Read only through CRLFCRLF: deliberately do not consume early payload bytes.
++async fn read_http_head(io: &mut ProxyStreamBox, limit: usize) -> Result<Vec<u8>> {
++    let mut head = Vec::with_capacity(limit.min(1024));
++    loop {
++        if head.len() == limit {
++            return Err(Error::Proto("HTTP header limit exceeded"));
++        }
++        head.push(io.read_u8().await?);
++        if head.ends_with(b"\r\n\r\n") {
++            return Ok(head);
++        }
++    }
++}
++fn validate_upgrade<'a>(
++    head: &'a [u8],
++    route: &HttpRoute,
++    websocket: bool,
++) -> Result<Option<&'a str>> {
++    let mut headers = [httparse::EMPTY_HEADER; 64];
++    let mut req = httparse::Request::new(&mut headers);
++    let status = req
++        .parse(head)
++        .map_err(|_| Error::Proto("malformed HTTP upgrade"))?;
++    if !status.is_complete() || req.method != Some("GET") || req.version != Some(1) {
++        return Err(Error::Proto("HTTP upgrade requires GET HTTP/1.1"));
++    }
++    let get = |name: &str| -> Result<Option<&'a str>> {
++        let mut values = req
++            .headers
++            .iter()
++            .filter(|h| h.name.eq_ignore_ascii_case(name));
++        let first = values
++            .next()
++            .map(|h| std::str::from_utf8(h.value).map(str::trim));
++        if values.next().is_some() {
++            return Err(Error::Proto("duplicate HTTP security header"));
++        }
++        first
++            .transpose()
++            .map_err(|_| Error::Proto("non-ASCII HTTP security header"))
++    };
++    let host = get("host")?.ok_or(Error::Proto("HTTP Host required"))?;
++    if !route.matches(host, req.path.unwrap_or(""), false) {
++        return Err(Error::Proto("HTTP route mismatch"));
++    }
++    let connection = get("connection")?.unwrap_or("");
++    if !connection
++        .split(',')
++        .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
++        || !get("upgrade")?
++            .unwrap_or("")
++            .eq_ignore_ascii_case("websocket")
++        || get("transfer-encoding")?.is_some()
++        || get("content-length")?.is_some_and(|v| v != "0")
++    {
++        return Err(Error::Proto("invalid HTTP upgrade headers/body"));
++    }
++    let key = get("sec-websocket-key")?;
++    if websocket {
++        let key = key.ok_or(Error::Proto("missing WebSocket key"))?;
++        if get("sec-websocket-version")? != Some("13")
++            || base64::engine::general_purpose::STANDARD
++                .decode(key)
++                .map_or(true, |k| k.len() != 16)
++            || get("sec-websocket-protocol")?.is_some()
++            || get("sec-websocket-extensions")?.is_some()
++        {
++            return Err(Error::Proto("invalid or unsupported WebSocket handshake"));
++        }
++        Ok(Some(key))
++    } else {
++        if key.is_some()
++            || get("sec-websocket-version")?.is_some()
++            || get("sec-websocket-protocol")?.is_some()
++        {
++            return Err(Error::Proto("HTTPUpgrade is not framed WebSocket"));
++        }
++        Ok(None)
++    }
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/crates/vp-transport/src/server/h2_stream.rs b/crates/vp-transport/src/server/h2_stream.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..e9a2649dd2476a63becf4724b74043530d0ed782
+--- /dev/null
++++ b/crates/vp-transport/src/server/h2_stream.rs
+@@ -0,0 +1,226 @@
++use super::{HttpRoute, ServerLimits};
++use crate::ProxyStreamBox;
++use bytes::{Buf, Bytes};
++use std::{
++    future::Future,
++    io,
++    pin::Pin,
++    task::{Context, Poll},
++};
++use tokio::{
++    io::{AsyncRead, AsyncWrite, ReadBuf},
++    task::JoinSet,
++};
++use vp_common::{Error, Result};
++
++fn h2_error(error: h2::Error) -> io::Error {
++    io::Error::other(error)
++}
++
++pub(super) async fn serve<F, Fut>(
++    io: ProxyStreamBox,
++    route: &HttpRoute,
++    limits: &ServerLimits,
++    tls: bool,
++    handler: F,
++) -> Result<()>
++where
++    F: Fn(ProxyStreamBox) -> Fut + Send + Sync,
++    Fut: Future<Output = Result<()>> + Send + 'static,
++{
++    let mut builder = h2::server::Builder::new();
++    builder
++        .max_concurrent_streams(limits.max_h2_streams)
++        .max_header_list_size(limits.max_header_bytes as u32)
++        .header_table_size(4096)
++        .initial_window_size(65535)
++        .initial_connection_window_size(1024 * 1024)
++        .max_frame_size(16384)
++        .max_send_buffer_size(65536)
++        .max_concurrent_reset_streams(32)
++        .max_pending_accept_reset_streams(32)
++        .max_local_error_reset_streams(Some(32));
++    let mut connection =
++        tokio::time::timeout(limits.handshake_timeout, builder.handshake::<_, Bytes>(io))
++            .await
++            .map_err(|_| {
++                Error::Io(io::Error::new(
++                    io::ErrorKind::TimedOut,
++                    "h2 preface timeout",
++                ))
++            })?
++            .map_err(h2_error)?;
++    let mut tasks = JoinSet::new();
++    let mut requests = 0;
++    let scope = vp_core::task_scope::current_scope();
++    let drain = async {
++        match &scope {
++            Some(scope) => scope.draining().await,
++            None => std::future::pending::<()>().await,
++        }
++    };
++    tokio::pin!(drain);
++    let mut draining = false;
++    let mut idle_deadline = tokio::time::Instant::now() + limits.handshake_timeout;
++    loop {
++        if draining && tasks.is_empty() {
++            tokio::time::timeout(
++                limits.handshake_timeout,
++                std::future::poll_fn(|cx| connection.poll_closed(cx)),
++            )
++            .await
++            .map_err(|_| Error::Io(io::Error::new(io::ErrorKind::TimedOut, "h2 drain timeout")))?
++            .map_err(h2_error)?;
++            break;
++        }
++        tokio::select! {
++            _ = &mut drain, if !draining => {
++                draining = true;
++                connection.graceful_shutdown();
++            }
++            incoming = connection.accept() => {
++                let Some(incoming) = incoming else { break; };
++                let (request, mut response) = incoming.map_err(h2_error)?;
++                requests += 1;
++                let authority = request.uri().authority().map(|a| a.as_str()).unwrap_or("");
++                let path = request.uri().path_and_query().map(|p| p.as_str()).unwrap_or("");
++                let host_ok = request.headers().get_all(http::header::HOST).iter().count() <= 1
++                    && request.headers().get(http::header::HOST).is_none_or(|h| h.to_str().is_ok_and(|h| h.eq_ignore_ascii_case(authority)));
++                let matches = host_ok && route.matches(authority, path, true)
++                    && route.method.as_ref().is_none_or(|m| request.method() == m)
++                    && request.uri().scheme_str() == Some(if tls { "https" } else { "http" });
++                if draining {
++                    response.send_reset(h2::Reason::REFUSED_STREAM);
++                } else if !matches {
++                    let response_head = http::Response::builder().status(404).body(())
++                        .map_err(|_| Error::Proto("h2 rejection response"))?;
++                    response.send_response(response_head, true).map_err(h2_error)?;
++                } else if tasks.len() >= limits.max_h2_streams as usize {
++                    response.send_reset(h2::Reason::REFUSED_STREAM);
++                } else {
++                    let response_head = http::Response::builder().status(200)
++                        .header("cache-control", "no-store").body(())
++                        .map_err(|_| Error::Proto("h2 response"))?;
++                    let send = response.send_response(response_head, false).map_err(h2_error)?;
++                    let stream = H2Stream { recv: request.into_body(), send, pending: Bytes::new(), closed: false };
++                    // Owned and tracked: parent-drop cancellation plus managed drain.
++                    vp_core::task_scope::spawn_in(&mut tasks, handler(Box::new(stream)));
++                }
++                if requests >= limits.max_h2_requests {
++                    draining = true;
++                    connection.graceful_shutdown();
++                }
++                if tasks.is_empty() { idle_deadline = tokio::time::Instant::now() + limits.idle_timeout; }
++            }
++            completed = tasks.join_next(), if !tasks.is_empty() => {
++                if let Some(result) = completed {
++                    match result {
++                        Ok(Ok(())) => {},
++                        Ok(Err(_)) => {}, // a protocol failure is local to this stream
++                        Err(_) => return Err(Error::Proto("h2 stream task failed")),
++                    }
++                }
++                if tasks.is_empty() { idle_deadline = tokio::time::Instant::now() + limits.idle_timeout; }
++            }
++            _ = tokio::time::sleep_until(idle_deadline), if tasks.is_empty() && !draining => {
++                connection.abrupt_shutdown(h2::Reason::NO_ERROR);
++                // Drive the queued GOAWAY once, without permitting an unbounded drain.
++                let _ = tokio::time::timeout(limits.handshake_timeout, std::future::poll_fn(|cx| connection.poll_closed(cx))).await;
++                break;
++            }
++        }
++    }
++    // A peer connection close cancels the stream handlers, including stalled IO.
++    tasks.shutdown().await;
++    Ok(())
++}
++
++/// A real HTTP/2 DATA stream with per-stream flow control. Receive capacity is
++/// returned only after the application consumes bytes; writes are at most 16KiB.
++struct H2Stream {
++    recv: h2::RecvStream,
++    send: h2::SendStream<Bytes>,
++    pending: Bytes,
++    closed: bool,
++}
++impl AsyncRead for H2Stream {
++    fn poll_read(
++        mut self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        buf: &mut ReadBuf<'_>,
++    ) -> Poll<io::Result<()>> {
++        if buf.remaining() == 0 {
++            return Poll::Ready(Ok(()));
++        }
++        for _ in 0..32 {
++            if !self.pending.is_empty() {
++                let count = buf.remaining().min(self.pending.len());
++                buf.put_slice(&self.pending[..count]);
++                self.pending.advance(count);
++                self.recv
++                    .flow_control()
++                    .release_capacity(count)
++                    .map_err(h2_error)?;
++                return Poll::Ready(Ok(()));
++            }
++            match self.recv.poll_data(cx) {
++                Poll::Ready(Some(Ok(data))) => self.pending = data,
++                Poll::Ready(Some(Err(error))) => return Poll::Ready(Err(h2_error(error))),
++                Poll::Ready(None) => return Poll::Ready(Ok(())),
++                Poll::Pending => return Poll::Pending,
++            }
++        }
++        cx.waker().wake_by_ref();
++        Poll::Pending
++    }
++}
++impl AsyncWrite for H2Stream {
++    fn poll_write(
++        mut self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        buf: &[u8],
++    ) -> Poll<io::Result<usize>> {
++        if self.closed {
++            return Poll::Ready(Err(io::Error::new(
++                io::ErrorKind::BrokenPipe,
++                "h2 send closed",
++            )));
++        }
++        if buf.is_empty() {
++            return Poll::Ready(Ok(0));
++        }
++        let wanted = buf.len().min(16384);
++        self.send.reserve_capacity(wanted);
++        match self.send.poll_capacity(cx) {
++            Poll::Ready(Some(Ok(capacity))) if capacity > 0 => {
++                let count = wanted.min(capacity);
++                self.send
++                    .send_data(Bytes::copy_from_slice(&buf[..count]), false)
++                    .map_err(h2_error)?;
++                Poll::Ready(Ok(count))
++            }
++            Poll::Ready(Some(Ok(_))) => {
++                cx.waker().wake_by_ref();
++                Poll::Pending
++            }
++            Poll::Ready(Some(Err(error))) => Poll::Ready(Err(h2_error(error))),
++            Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
++                io::ErrorKind::BrokenPipe,
++                "h2 stream reset",
++            ))),
++            Poll::Pending => Poll::Pending,
++        }
++    }
++    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
++        // send_data transfers ownership into h2's bounded send queue. The parent
++        // serve future continuously drives that queue; no detached driver exists.
++        Poll::Ready(Ok(()))
++    }
++    fn poll_shutdown(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
++        if !self.closed {
++            self.send.send_data(Bytes::new(), true).map_err(h2_error)?;
++            self.closed = true;
++        }
++        Poll::Ready(Ok(()))
++    }
++}
+diff --git a/crates/vp-transport/src/server/tests.rs b/crates/vp-transport/src/server/tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..cac2467f129c4c6750d6e1a5f5997b837d5e4f83
+--- /dev/null
++++ b/crates/vp-transport/src/server/tests.rs
+@@ -0,0 +1,678 @@
++use super::*;
++use bytes::Bytes;
++use std::{
++    net::SocketAddr,
++    sync::atomic::{AtomicUsize, Ordering},
++};
++use tokio::{
++    net::{TcpListener, TcpStream},
++    task::JoinHandle,
++};
++
++fn route() -> HttpRoute {
++    HttpRoute::new("/proxy", vec!["localhost".into()]).unwrap()
++}
++fn transport(network: ServerNetwork) -> ServerTransport {
++    ServerTransport::new(network, None, ServerLimits::default()).unwrap()
++}
++async fn start<F, Fut>(server: ServerTransport, handler: F) -> (SocketAddr, JoinHandle<Result<()>>)
++where
++    F: Fn(ProxyStreamBox) -> Fut + Send + Sync + 'static,
++    Fut: Future<Output = Result<()>> + Send + 'static,
++{
++    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let addr = listener.local_addr().unwrap();
++    // Bound before returning: a second bind is evidence of readiness/ownership.
++    assert!(TcpListener::bind(addr).await.is_err());
++    let task = vp_core::task_scope::spawn(async move {
++        let (io, _) = listener.accept().await?;
++        server.serve(Box::new(io), handler).await
++    });
++    (addr, task)
++}
++async fn echo(mut io: ProxyStreamBox) -> Result<()> {
++    let mut buf = [0u8; 8192];
++    loop {
++        let n = io.read(&mut buf).await?;
++        if n == 0 {
++            return Ok(());
++        }
++        io.write_all(&buf[..n]).await?;
++        io.flush().await?;
++    }
++}
++async fn head(io: &mut TcpStream) -> Vec<u8> {
++    let mut head = Vec::new();
++    while !head.ends_with(b"\r\n\r\n") {
++        head.push(io.read_u8().await.unwrap());
++        assert!(head.len() <= 16384);
++    }
++    head
++}
++fn upgrade(path: &str, host: &str, ws: bool) -> Vec<u8> {
++    format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\n{}\r\n",
++        if ws { "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" } else { "" }).into_bytes()
++}
++fn masked(op: u8, data: &[u8]) -> Vec<u8> {
++    let mut out = vec![op];
++    if data.len() < 126 {
++        out.push(0x80 | data.len() as u8);
++    } else {
++        out.push(0x80 | 126);
++        out.extend_from_slice(&(data.len() as u16).to_be_bytes());
++    }
++    let mask = [17, 29, 73, 101];
++    out.extend_from_slice(&mask);
++    out.extend(data.iter().enumerate().map(|(i, b)| *b ^ mask[i % 4]));
++    out
++}
++async fn ws_frame(io: &mut TcpStream) -> (u8, Vec<u8>) {
++    let op = io.read_u8().await.unwrap();
++    let len = io.read_u8().await.unwrap();
++    assert_eq!(len & 0x80, 0);
++    let len = if len == 126 {
++        io.read_u16().await.unwrap() as usize
++    } else {
++        len as usize
++    };
++    let mut data = vec![0; len];
++    io.read_exact(&mut data).await.unwrap();
++    (op, data)
++}
++
++#[tokio::test]
++async fn websocket_rfc_accept_fragment_ping_close() {
++    let (addr, task) = start(transport(ServerNetwork::WebSocket(route())), echo).await;
++    let mut client = TcpStream::connect(addr).await.unwrap();
++    client
++        .write_all(&upgrade("/proxy", "localhost", true))
++        .await
++        .unwrap();
++    let response = String::from_utf8(head(&mut client).await).unwrap();
++    assert!(response.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
++    let mut frames = masked(0x02, b"ab");
++    frames.extend(masked(0x89, b"keep-alive"));
++    frames.extend(masked(0x80, b"cd"));
++    client.write_all(&frames).await.unwrap();
++    assert_eq!(ws_frame(&mut client).await, (0x82, b"ab".to_vec()));
++    assert_eq!(ws_frame(&mut client).await, (0x8a, b"keep-alive".to_vec()));
++    assert_eq!(ws_frame(&mut client).await, (0x82, b"cd".to_vec()));
++    client.write_all(&masked(0x88, &[3, 232])).await.unwrap();
++    assert_eq!(ws_frame(&mut client).await, (0x88, vec![3, 232]));
++    task.await.unwrap().unwrap();
++}
++
++#[tokio::test]
++async fn upgrades_validate_host_path_and_mode_without_calling_protocol() {
++    let cases = [
++        (ServerNetwork::WebSocket(route()), upgrade("/wrong", "localhost", true)),
++        (ServerNetwork::WebSocket(route()), upgrade("/proxy", "wrong.test", true)),
++        (ServerNetwork::WebSocket(route()), upgrade("/proxy", "localhost", false)),
++        (ServerNetwork::HttpUpgrade(route()), upgrade("/proxy", "localhost", true)),
++        (ServerNetwork::HttpUpgrade(route()), upgrade("/proxy/suffix", "localhost", false)),
++        (ServerNetwork::HttpUpgrade(route()), b"GET /proxy HTTP/1.1\r\nHost: localhost\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n".to_vec()),
++        (ServerNetwork::WebSocket(route()), b"POST /proxy HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec()),
++    ];
++    for (network, request) in cases {
++        let called = Arc::new(AtomicUsize::new(0));
++        let check = called.clone();
++        let (addr, task) = start(transport(network), move |_| {
++            check.fetch_add(1, Ordering::SeqCst);
++            async { Ok(()) }
++        })
++        .await;
++        let mut client = TcpStream::connect(addr).await.unwrap();
++        client.write_all(&request).await.unwrap();
++        assert!(task.await.unwrap().is_err());
++        assert_eq!(called.load(Ordering::SeqCst), 0);
++    }
++}
++
++#[tokio::test]
++async fn httpupgrade_is_raw_and_preserves_coalesced_payload() {
++    let (addr, task) = start(transport(ServerNetwork::HttpUpgrade(route())), echo).await;
++    let mut client = TcpStream::connect(addr).await.unwrap();
++    let mut request = upgrade("/proxy?ordinary=query", "localhost", false);
++    request.extend_from_slice(b"unframed first payload");
++    client.write_all(&request).await.unwrap();
++    let response = head(&mut client).await;
++    assert!(!response.windows(20).any(|x| x == b"Sec-WebSocket-Accept:"));
++    let mut data = [0u8; 22];
++    client.read_exact(&mut data).await.unwrap();
++    assert_eq!(&data, b"unframed first payload");
++    client.shutdown().await.unwrap();
++    task.await.unwrap().unwrap();
++}
++
++#[tokio::test]
++async fn websocket_malformed_frames_and_size_bounds_are_errors() {
++    let malformed = [
++        vec![0x82, 1, b'x'],                         // unmasked
++        vec![0xc2, 0x80, 0, 0, 0, 0],                // RSV
++        masked(0x80, b"x"),                          // unexpected continuation
++        masked(0x09, b"x"),                          // fragmented ping
++        vec![0x82, 0xfe, 0, 1, 0, 0, 0, 0, b'x'],    // nonminimal length
++        vec![0x82, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0], // sign bit
++        vec![0x82, 0xfe, 1, 0],                      // > configured frame bound, no body needed
++        masked(0x88, &[3]),                          // invalid close length
++        masked(0x88, &[3, 237]),                     // reserved close status 1005
++    ];
++    for bytes in malformed {
++        let limits = ServerLimits {
++            max_ws_frame_bytes: 125,
++            ..ServerLimits::default()
++        };
++        let server = ServerTransport::new(ServerNetwork::WebSocket(route()), None, limits).unwrap();
++        let (addr, task) = start(server, echo).await;
++        let mut client = TcpStream::connect(addr).await.unwrap();
++        client
++            .write_all(&upgrade("/proxy", "localhost", true))
++            .await
++            .unwrap();
++        head(&mut client).await;
++        client.write_all(&bytes).await.unwrap();
++        assert!(
++            tokio::time::timeout(Duration::from_secs(2), task)
++                .await
++                .unwrap()
++                .unwrap()
++                .is_err()
++        );
++    }
++}
++
++#[tokio::test]
++async fn handshake_timeout_header_bound_and_invalid_limits() {
++    let limits = ServerLimits {
++        handshake_timeout: Duration::from_millis(40),
++        max_header_bytes: 512,
++        ..ServerLimits::default()
++    };
++    let server =
++        ServerTransport::new(ServerNetwork::WebSocket(route()), None, limits.clone()).unwrap();
++    let (addr, task) = start(server, echo).await;
++    let _idle = TcpStream::connect(addr).await.unwrap();
++    assert!(task.await.unwrap().is_err());
++    let server = ServerTransport::new(ServerNetwork::WebSocket(route()), None, limits).unwrap();
++    let (addr, task) = start(server, echo).await;
++    let mut client = TcpStream::connect(addr).await.unwrap();
++    client.write_all(&[b'A'; 513]).await.unwrap();
++    assert!(task.await.unwrap().is_err());
++    assert!(
++        ServerTransport::new(
++            ServerNetwork::Tcp,
++            None,
++            ServerLimits {
++                max_h2_streams: 0,
++                ..ServerLimits::default()
++            }
++        )
++        .is_err()
++    );
++}
++
++fn cert() -> rcgen::CertifiedKey {
++    rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap()
++}
++fn tls_identity(c: &rcgen::CertifiedKey) -> ServerTlsIdentity {
++    ServerTlsIdentity::from_pem(
++        c.cert.pem().as_bytes(),
++        c.key_pair.serialize_pem().as_bytes(),
++    )
++    .unwrap()
++}
++fn connector(c: Option<&rcgen::CertifiedKey>, alpn: &[&str]) -> tokio_rustls::TlsConnector {
++    let mut roots = rustls::RootCertStore::empty();
++    if let Some(c) = c {
++        roots.add(c.cert.der().clone()).unwrap();
++    }
++    let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
++        rustls::crypto::ring::default_provider(),
++    ))
++    .with_safe_default_protocol_versions()
++    .unwrap()
++    .with_root_certificates(roots)
++    .with_no_client_auth();
++    cfg.alpn_protocols = alpn.iter().map(|v| v.as_bytes().to_vec()).collect();
++    tokio_rustls::TlsConnector::from(Arc::new(cfg))
++}
++
++#[tokio::test]
++async fn tls_real_validation_name_trust_key_and_alpn() {
++    let c = cert();
++    let server = ServerTransport::new(
++        ServerNetwork::Tcp,
++        Some(tls_identity(&c)),
++        ServerLimits::default(),
++    )
++    .unwrap();
++    let (addr, task) = start(server, |mut io| async move {
++        let n = io.read_u8().await?;
++        io.write_u8(n).await?;
++        io.shutdown().await?;
++        Ok(())
++    })
++    .await;
++    let mut client = connector(Some(&c), &[])
++        .connect(
++            "localhost".try_into().unwrap(),
++            TcpStream::connect(addr).await.unwrap(),
++        )
++        .await
++        .unwrap();
++    client.write_u8(42).await.unwrap();
++    assert_eq!(client.read_u8().await.unwrap(), 42);
++    task.await.unwrap().unwrap();
++    for (name, trusted) in [("wrong.test", true), ("localhost", false)] {
++        let server = ServerTransport::new(
++            ServerNetwork::Tcp,
++            Some(tls_identity(&c)),
++            ServerLimits::default(),
++        )
++        .unwrap();
++        let (addr, task) = start(server, echo).await;
++        assert!(
++            connector(trusted.then_some(&c), &[])
++                .connect(
++                    name.try_into().unwrap(),
++                    TcpStream::connect(addr).await.unwrap()
++                )
++                .await
++                .is_err()
++        );
++        assert!(task.await.unwrap().is_err());
++    }
++    let other = cert();
++    assert!(
++        ServerTlsIdentity::from_pem(
++            c.cert.pem().as_bytes(),
++            other.key_pair.serialize_pem().as_bytes()
++        )
++        .is_err()
++    );
++    assert!(ServerTlsIdentity::from_pem(b"not a cert", b"not a key").is_err());
++    assert!(
++        ServerTlsIdentity::from_pem(
++            c.cert.pem().as_bytes(),
++            format!(
++                "{}{}",
++                c.key_pair.serialize_pem(),
++                c.key_pair.serialize_pem()
++            )
++            .as_bytes()
++        )
++        .is_err()
++    );
++    let server = ServerTransport::new(
++        ServerNetwork::Http2(route()),
++        Some(tls_identity(&c)),
++        ServerLimits::default(),
++    )
++    .unwrap();
++    let (addr, task) = start(server, echo).await;
++    assert!(
++        connector(Some(&c), &["http/1.1"])
++            .connect(
++                "localhost".try_into().unwrap(),
++                TcpStream::connect(addr).await.unwrap()
++            )
++            .await
++            .is_err()
++    );
++    assert!(task.await.unwrap().is_err());
++}
++
++async fn h2_client(addr: SocketAddr) -> (h2::client::SendRequest<Bytes>, JoinHandle<()>) {
++    let (client, connection) = h2::client::handshake(TcpStream::connect(addr).await.unwrap())
++        .await
++        .unwrap();
++    (
++        client,
++        tokio::spawn(async move {
++            let _ = connection.await;
++        }),
++    )
++}
++fn h2_request(path: &str) -> http::Request<()> {
++    http::Request::builder()
++        .method("PUT")
++        .uri(format!("http://localhost{path}"))
++        .body(())
++        .unwrap()
++}
++
++#[tokio::test]
++async fn http2_multiplex_flow_control_route_and_half_close() {
++    let (addr, server) = start(
++        transport(ServerNetwork::Http2(route().with_method("PUT").unwrap())),
++        |mut io| async move {
++            let mut data = Vec::new();
++            io.read_to_end(&mut data).await?;
++            io.write_all(&data).await?;
++            io.shutdown().await?;
++            Ok(())
++        },
++    )
++    .await;
++    let (mut client, driver) = h2_client(addr).await;
++    let (bad, _) = client.send_request(h2_request("/wrong"), true).unwrap();
++    assert_eq!(bad.await.unwrap().status(), 404);
++    let mut sessions = Vec::new();
++    for number in 0..3 {
++        client = client.ready().await.unwrap();
++        let (response, mut body) = client
++            .send_request(h2_request("/proxy/suffix"), false)
++            .unwrap();
++        let bytes = vec![number; 200_000];
++        body.send_data(Bytes::from(bytes.clone()), true).unwrap();
++        sessions.push(tokio::spawn(async move {
++            let response = response.await.unwrap();
++            assert_eq!(response.status(), 200);
++            let mut body = response.into_body();
++            let mut received = Vec::new();
++            while let Some(data) = body.data().await {
++                let data = data.unwrap();
++                received.extend_from_slice(&data);
++                body.flow_control().release_capacity(data.len()).unwrap();
++            }
++            assert_eq!(received, bytes);
++        }));
++    }
++    for session in sessions {
++        tokio::time::timeout(Duration::from_secs(5), session)
++            .await
++            .unwrap()
++            .unwrap();
++    }
++    drop(client);
++    driver.abort();
++    let _ = driver.await;
++    tokio::time::timeout(Duration::from_secs(2), server)
++        .await
++        .unwrap()
++        .unwrap()
++        .unwrap();
++}
++
++#[tokio::test]
++async fn http2_parent_cancellation_drops_owned_streams() {
++    struct Guard(Arc<AtomicUsize>);
++    impl Drop for Guard {
++        fn drop(&mut self) {
++            self.0.fetch_sub(1, Ordering::SeqCst);
++        }
++    }
++    let count = Arc::new(AtomicUsize::new(0));
++    let active = count.clone();
++    let (addr, server) = start(transport(ServerNetwork::Http2(route())), move |io| {
++        let active = active.clone();
++        async move {
++            let _io = io;
++            active.fetch_add(1, Ordering::SeqCst);
++            let _guard = Guard(active);
++            std::future::pending::<()>().await;
++            Ok(())
++        }
++    })
++    .await;
++    let (mut client, driver) = h2_client(addr).await;
++    let (response, _body) = client.send_request(h2_request("/proxy"), false).unwrap();
++    assert_eq!(response.await.unwrap().status(), 200);
++    tokio::time::timeout(Duration::from_secs(2), async {
++        while count.load(Ordering::SeqCst) != 1 {
++            tokio::task::yield_now().await;
++        }
++    })
++    .await
++    .unwrap();
++    server.abort();
++    let _ = server.await;
++    tokio::time::timeout(Duration::from_secs(2), async {
++        while count.load(Ordering::SeqCst) != 0 {
++            tokio::task::yield_now().await;
++        }
++    })
++    .await
++    .unwrap();
++    drop(client);
++    driver.abort();
++    let _ = driver.await;
++}
++
++#[tokio::test]
++async fn http2_preface_timeout_and_idle_exit() {
++    let limits = ServerLimits {
++        handshake_timeout: Duration::from_millis(60),
++        idle_timeout: Duration::from_millis(60),
++        ..ServerLimits::default()
++    };
++    let (addr, server) = start(
++        ServerTransport::new(ServerNetwork::Http2(route()), None, limits.clone()).unwrap(),
++        echo,
++    )
++    .await;
++    let _client = TcpStream::connect(addr).await.unwrap();
++    assert!(server.await.unwrap().is_err());
++    let (addr, server) = start(
++        ServerTransport::new(ServerNetwork::Http2(route()), None, limits).unwrap(),
++        echo,
++    )
++    .await;
++    let (client, driver) = h2_client(addr).await;
++    tokio::time::timeout(Duration::from_secs(2), server)
++        .await
++        .unwrap()
++        .unwrap()
++        .unwrap();
++    drop(client);
++    driver.abort();
++    let _ = driver.await;
++}
++
++#[tokio::test]
++async fn websocket_fragment_total_limit_and_pending_write_no_duplication() {
++    let limits = ServerLimits {
++        max_ws_frame_bytes: 125,
++        max_ws_message_bytes: 125,
++        ..ServerLimits::default()
++    };
++    let server =
++        ServerTransport::new(ServerNetwork::WebSocket(route()), None, limits.clone()).unwrap();
++    let (addr, task) = start(server, echo).await;
++    let mut client = TcpStream::connect(addr).await.unwrap();
++    client
++        .write_all(&upgrade("/proxy", "localhost", true))
++        .await
++        .unwrap();
++    head(&mut client).await;
++    let mut request = masked(0x02, &[1; 100]);
++    request.extend(masked(0x80, &[2; 100]));
++    client.write_all(&request).await.unwrap();
++    assert!(task.await.unwrap().is_err());
++    // Tiny capacity forces poll_write/Pending for every outgoing frame. Decode
++    // frames independently rather than trusting the legacy WsStream client.
++    let (io, mut reader) = tokio::io::duplex(7);
++    let mut stream = websocket::ServerWebSocket::new(Box::new(io), &limits);
++    let write = tokio::spawn(async move {
++        stream.write_all(&vec![42; 50_000]).await.unwrap();
++        stream.shutdown().await.unwrap();
++    });
++    let mut received = Vec::new();
++    loop {
++        let opcode = reader.read_u8().await.unwrap();
++        let len = reader.read_u8().await.unwrap();
++        assert!(len <= 125);
++        let mut data = vec![0; len as usize];
++        reader.read_exact(&mut data).await.unwrap();
++        if opcode == 0x88 {
++            assert_eq!(data, [3, 232]);
++            break;
++        }
++        assert_eq!(opcode, 0x82);
++        received.extend(data);
++    }
++    assert_eq!(received, vec![42; 50_000]);
++    write.await.unwrap();
++}
++
++#[test]
++fn route_authority_and_percent_path_validation() {
++    for bad in [
++        "",
++        "a@localhost",
++        "host:bad",
++        "[garbage]",
++        "a..b",
++        "bad host",
++        "host:99999",
++    ] {
++        assert!(HttpRoute::new("/proxy", vec![bad.into()]).is_err(), "{bad}");
++    }
++    let route = HttpRoute::new("/proxy/a", vec!["localhost:443".into()]).unwrap();
++    assert!(route.matches("LOCALHOST:443", "/proxy%2Fa?ordinary=query", false));
++    assert!(!route.matches("localhost", "/proxy/a", false));
++    assert!(!route.matches("localhost:443", "/proxy%XX", false));
++    assert!(!route.matches("localhost:443", "/proxy%00", false));
++    assert!(HttpRoute::new("/", vec!["[::1]:443".into()]).is_ok());
++}
++
++#[tokio::test]
++async fn http2_concurrent_stream_bound_is_advertised_and_enforced() {
++    let limits = ServerLimits {
++        max_h2_streams: 1,
++        ..ServerLimits::default()
++    };
++    let count = Arc::new(AtomicUsize::new(0));
++    let live = count.clone();
++    let (addr, server) = start(
++        ServerTransport::new(ServerNetwork::Http2(route()), None, limits).unwrap(),
++        move |io| {
++            let live = live.clone();
++            async move {
++                let _io = io;
++                assert_eq!(live.fetch_add(1, Ordering::SeqCst), 0);
++                std::future::pending::<()>().await;
++                Ok(())
++            }
++        },
++    )
++    .await;
++    let (mut client, driver) = h2_client(addr).await;
++    let (response, _body) = client.send_request(h2_request("/proxy"), false).unwrap();
++    let first_response = response.await.unwrap();
++    assert_eq!(first_response.status(), 200);
++    client = client.ready().await.unwrap();
++    let (second_response, _second_body) = client.send_request(h2_request("/proxy"), false).unwrap();
++    assert!(
++        tokio::time::timeout(Duration::from_millis(40), second_response)
++            .await
++            .is_err()
++    );
++    assert_eq!(count.load(Ordering::SeqCst), 1);
++    server.abort();
++    let _ = server.await;
++    driver.abort();
++    let _ = driver.await;
++}
++
++#[tokio::test]
++async fn http2_managed_goaway_drains_existing_stream_without_forcing() {
++    let scope = vp_core::task_scope::TaskScope::new();
++    let (addr, server) = scope
++        .run(start(
++            transport(ServerNetwork::Http2(route())),
++            |mut io| async move {
++                let mut message = Vec::new();
++                io.read_to_end(&mut message).await?;
++                io.write_all(&message).await?;
++                io.shutdown().await?;
++                Ok(())
++            },
++        ))
++        .await;
++    let (mut client, driver) = h2_client(addr).await;
++    let (response, mut send) = client.send_request(h2_request("/proxy"), false).unwrap();
++    let response = response.await.unwrap();
++    assert_eq!(response.status(), 200);
++    let draining_scope = scope.clone();
++    let shutdown = tokio::spawn(async move {
++        draining_scope
++            .shutdown(Duration::from_secs(2), Duration::from_secs(2))
++            .await
++    });
++    scope.draining().await;
++    send.send_data(Bytes::from_static(b"data-during-drain"), true)
++        .unwrap();
++    let mut receive = response.into_body();
++    let mut output = Vec::new();
++    while let Some(data) = receive.data().await {
++        let data = data.unwrap();
++        output.extend_from_slice(&data);
++        receive.flow_control().release_capacity(data.len()).unwrap();
++    }
++    assert_eq!(output, b"data-during-drain");
++    let report = shutdown.await.unwrap();
++    assert!(report.drained);
++    assert_eq!(report.forced_tasks, 0);
++    assert_eq!(report.remaining_tasks, 0);
++    server.await.unwrap().unwrap();
++    drop(client);
++    driver.abort();
++    let _ = driver.await;
++}
++
++#[tokio::test]
++async fn http2_request_budget_and_oversize_headers_do_not_dispatch_excess() {
++    let calls = Arc::new(AtomicUsize::new(0));
++    let used = calls.clone();
++    let server_config = ServerTransport::new(
++        ServerNetwork::Http2(route()),
++        None,
++        ServerLimits {
++            max_h2_requests: 1,
++            ..ServerLimits::default()
++        },
++    )
++    .unwrap();
++    let (addr, server) = start(server_config, move |mut io| {
++        used.fetch_add(1, Ordering::SeqCst);
++        async move {
++            io.shutdown().await?;
++            Ok(())
++        }
++    })
++    .await;
++    let (mut client, driver) = h2_client(addr).await;
++    let (response, _) = client.send_request(h2_request("/proxy"), true).unwrap();
++    assert_eq!(response.await.unwrap().status(), 200);
++    tokio::time::timeout(Duration::from_secs(2), server)
++        .await
++        .unwrap()
++        .unwrap()
++        .unwrap();
++    assert_eq!(calls.load(Ordering::SeqCst), 1);
++    drop(client);
++    driver.abort();
++    let _ = driver.await;
++    let calls = Arc::new(AtomicUsize::new(0));
++    let used = calls.clone();
++    let (addr, server) = start(transport(ServerNetwork::Http2(route())), move |_| {
++        used.fetch_add(1, Ordering::SeqCst);
++        async { Ok(()) }
++    })
++    .await;
++    let (mut client, driver) = h2_client(addr).await;
++    let request = http::Request::builder()
++        .method("PUT")
++        .uri("http://localhost/proxy")
++        .header("x-overflow", "x".repeat(20_000))
++        .body(())
++        .unwrap();
++    let (response, _) = client.send_request(request, true).unwrap();
++    assert_eq!(response.await.unwrap().status(), 431);
++    assert_eq!(calls.load(Ordering::SeqCst), 0);
++    server.abort();
++    let _ = server.await;
++    driver.abort();
++    let _ = driver.await;
++}
+diff --git a/crates/vp-transport/src/server/websocket.rs b/crates/vp-transport/src/server/websocket.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..db9a6be2e0b6266925a376114f61fe85874405db
+--- /dev/null
++++ b/crates/vp-transport/src/server/websocket.rs
+@@ -0,0 +1,256 @@
++//! Binary RFC 6455 server stream. Extension/subprotocol/early-data negotiation is
++//! intentionally absent. Masking, fragmentation, control frames and lengths are
++//! checked before any payload is exposed. Both read and write buffering is bounded.
++use super::ServerLimits;
++use crate::ProxyStreamBox;
++use bytes::{Buf, BytesMut};
++use std::{
++    io,
++    pin::Pin,
++    task::{Context, Poll},
++};
++use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
++
++pub(super) struct ServerWebSocket {
++    io: ProxyStreamBox,
++    raw: BytesMut,
++    payload: BytesMut,
++    output: BytesMut,
++    frame_limit: usize,
++    message_limit: usize,
++    fragment_bytes: Option<usize>,
++    read_closed: bool,
++    write_closed: bool,
++    close_queued: bool,
++}
++fn invalid(message: &'static str) -> io::Error {
++    io::Error::new(io::ErrorKind::InvalidData, message)
++}
++impl ServerWebSocket {
++    pub(super) fn new(io: ProxyStreamBox, limits: &ServerLimits) -> Self {
++        Self {
++            io,
++            raw: BytesMut::new(),
++            payload: BytesMut::new(),
++            output: BytesMut::new(),
++            frame_limit: limits.max_ws_frame_bytes,
++            message_limit: limits.max_ws_message_bytes,
++            fragment_bytes: None,
++            read_closed: false,
++            write_closed: false,
++            close_queued: false,
++        }
++    }
++    fn queue(&mut self, opcode: u8, data: &[u8]) {
++        self.output.extend_from_slice(&[0x80 | opcode]);
++        if data.len() < 126 {
++            self.output.extend_from_slice(&[data.len() as u8]);
++        } else {
++            self.output.extend_from_slice(&[126]);
++            self.output
++                .extend_from_slice(&(data.len() as u16).to_be_bytes());
++        }
++        self.output.extend_from_slice(data);
++    }
++    fn flush_output(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        while !self.output.is_empty() {
++            let count = std::task::ready!(Pin::new(&mut self.io).poll_write(cx, &self.output))?;
++            if count == 0 {
++                return Poll::Ready(Err(io::Error::new(
++                    io::ErrorKind::WriteZero,
++                    "WebSocket write zero",
++                )));
++            }
++            self.output.advance(count);
++        }
++        std::task::ready!(Pin::new(&mut self.io).poll_flush(cx))?;
++        Poll::Ready(Ok(()))
++    }
++    /// Return true if a complete frame was consumed, false when more IO is needed.
++    fn frame(&mut self) -> io::Result<bool> {
++        if self.raw.len() < 2 {
++            return Ok(false);
++        }
++        let first = self.raw[0];
++        let final_frame = first & 0x80 != 0;
++        let opcode = first & 15;
++        if first & 0x70 != 0 || self.raw[1] & 0x80 == 0 {
++            return Err(invalid("WebSocket RSV/masking violation"));
++        }
++        if !matches!(opcode, 0 | 2 | 8 | 9 | 10) {
++            return Err(invalid("WebSocket binary/control opcode required"));
++        }
++        let mut header = 2;
++        let short = self.raw[1] & 127;
++        let length = match short {
++            126 => {
++                if self.raw.len() < 4 {
++                    return Ok(false);
++                }
++                header = 4;
++                let n = u16::from_be_bytes([self.raw[2], self.raw[3]]) as u64;
++                if n < 126 {
++                    return Err(invalid("nonminimal WebSocket length"));
++                }
++                n
++            }
++            127 => {
++                if self.raw.len() < 10 {
++                    return Ok(false);
++                }
++                header = 10;
++                let n = u64::from_be_bytes(
++                    self.raw[2..10]
++                        .try_into()
++                        .map_err(|_| invalid("WebSocket length"))?,
++                );
++                if n < 65536 || n >> 63 != 0 {
++                    return Err(invalid("invalid WebSocket 64-bit length"));
++                }
++                n
++            }
++            n => n as u64,
++        };
++        if length > self.frame_limit as u64 {
++            return Err(invalid("WebSocket frame limit exceeded"));
++        }
++        if opcode >= 8 && (!final_frame || length > 125) {
++            return Err(invalid("invalid WebSocket control frame"));
++        }
++        let length = length as usize;
++        if self.raw.len() < header + 4 + length {
++            return Ok(false);
++        }
++        let mask: [u8; 4] = self.raw[header..header + 4]
++            .try_into()
++            .map_err(|_| invalid("WebSocket mask"))?;
++        self.raw.advance(header + 4);
++        let mut data = self.raw.split_to(length);
++        for (index, byte) in data.iter_mut().enumerate() {
++            *byte ^= mask[index % 4];
++        }
++        match opcode {
++            0 | 2 => {
++                let total = if opcode == 0 {
++                    self.fragment_bytes
++                        .ok_or_else(|| invalid("unexpected WebSocket continuation"))?
++                        .checked_add(length)
++                        .ok_or_else(|| invalid("WebSocket message overflow"))?
++                } else {
++                    if self.fragment_bytes.is_some() {
++                        return Err(invalid("interleaved WebSocket data messages"));
++                    }
++                    length
++                };
++                if total > self.message_limit {
++                    return Err(invalid("WebSocket message limit exceeded"));
++                }
++                self.fragment_bytes = if final_frame { None } else { Some(total) };
++                self.payload = data;
++            }
++            8 => {
++                if data.len() == 1 {
++                    return Err(invalid("WebSocket close length"));
++                }
++                if data.len() >= 2 {
++                    let code = u16::from_be_bytes([data[0], data[1]]);
++                    if !(matches!(code, 1000..=1003 | 1007..=1014) || (3000..=4999).contains(&code))
++                        || std::str::from_utf8(&data[2..]).is_err()
++                    {
++                        return Err(invalid("WebSocket close code/reason"));
++                    }
++                }
++                if !self.close_queued {
++                    self.queue(8, &data);
++                    self.close_queued = true;
++                }
++                self.read_closed = true;
++                self.write_closed = true;
++            }
++            9 => self.queue(10, &data), // Pong MUST echo the ping application data.
++            10 => {}
++            _ => unreachable!(),
++        }
++        Ok(true)
++    }
++}
++impl AsyncRead for ServerWebSocket {
++    fn poll_read(
++        mut self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        buf: &mut ReadBuf<'_>,
++    ) -> Poll<io::Result<()>> {
++        if buf.remaining() == 0 {
++            return Poll::Ready(Ok(()));
++        }
++        for _ in 0..32 {
++            std::task::ready!(self.flush_output(cx))?;
++            if !self.payload.is_empty() {
++                let count = self.payload.len().min(buf.remaining());
++                buf.put_slice(&self.payload[..count]);
++                self.payload.advance(count);
++                return Poll::Ready(Ok(()));
++            }
++            if self.read_closed {
++                return Poll::Ready(Ok(()));
++            }
++            if self.frame()? {
++                continue;
++            }
++            let available = (self.frame_limit + 14)
++                .saturating_sub(self.raw.len())
++                .min(4096);
++            if available == 0 {
++                return Poll::Ready(Err(invalid("WebSocket read buffer limit")));
++            }
++            let mut temp = [0u8; 4096];
++            let mut read = ReadBuf::new(&mut temp[..available]);
++            std::task::ready!(Pin::new(&mut self.io).poll_read(cx, &mut read))?;
++            if read.filled().is_empty() {
++                return Poll::Ready(Err(io::Error::new(
++                    io::ErrorKind::UnexpectedEof,
++                    "WebSocket closed without close frame",
++                )));
++            }
++            self.raw.extend_from_slice(read.filled());
++        }
++        cx.waker().wake_by_ref();
++        Poll::Pending
++    }
++}
++impl AsyncWrite for ServerWebSocket {
++    fn poll_write(
++        mut self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        buf: &[u8],
++    ) -> Poll<io::Result<usize>> {
++        if self.write_closed {
++            return Poll::Ready(Err(io::Error::new(
++                io::ErrorKind::BrokenPipe,
++                "WebSocket closed",
++            )));
++        }
++        if buf.is_empty() {
++            return Poll::Ready(Ok(0));
++        }
++        std::task::ready!(self.flush_output(cx))?;
++        let count = buf.len().min(16384).min(self.frame_limit);
++        self.queue(2, &buf[..count]);
++        // Ownership transferred once. Returning Pending after queuing would let
++        // AsyncWriteExt retry the same bytes and duplicate protocol payload.
++        Poll::Ready(Ok(count))
++    }
++    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        self.flush_output(cx)
++    }
++    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        if !self.close_queued {
++            std::task::ready!(self.flush_output(cx))?;
++            self.queue(8, &[3, 232]);
++            self.close_queued = true;
++            self.write_closed = true;
++        }
++        std::task::ready!(self.flush_output(cx))?;
++        Pin::new(&mut self.io).poll_shutdown(cx)
++    }
++}

@@ -1,0 +1,91 @@
+From 5cacc516c5647b57fca4d460481abebfaf635cfb Mon Sep 17 00:00:00 2001
+From: VP product engineering <vp-engineering@example.invalid>
+Date: Fri, 30 Oct 2026 14:01:27 +0900
+Subject: [PATCH] Parse credential UUID bytes without UTF-8 slicing or secret
+ errors
+
+---
+ crates/vp-crypto/src/vmess_kdf.rs | 59 +++++++++++++++++++++++++++----
+ 1 file changed, 52 insertions(+), 7 deletions(-)
+
+diff --git a/crates/vp-crypto/src/vmess_kdf.rs b/crates/vp-crypto/src/vmess_kdf.rs
+index a08b23f..2b43cc4 100644
+--- a/crates/vp-crypto/src/vmess_kdf.rs
++++ b/crates/vp-crypto/src/vmess_kdf.rs
+@@ -227,14 +227,27 @@ type Md5 = md5::Md5;
+ 
+ /// 解析 UUID 字符串为 16 字节
+ pub fn parse_uuid(s: &str) -> Result<[u8; 16]> {
+-    let clean: String = s.chars().filter(|c| *c != '-').collect();
+-    if clean.len() != 32 {
+-        return Err(Error::Config(format!("UUID 非法: {s:?}")));
+-    }
++    // Parse ASCII bytes, never slice potentially non-ASCII UTF-8 at a byte
++    // offset. UUIDs are credentials: errors must not echo the supplied value.
++    // Preserve the historical acceptance of hyphen-separated hex digits.
++    let invalid = || Error::Config("invalid UUID encoding".into());
+     let mut out = [0u8; 16];
+-    for (i, v) in out.iter_mut().enumerate() {
+-        *v = u8::from_str_radix(&clean[i * 2..i * 2 + 2], 16)
+-            .map_err(|_| Error::Config(format!("UUID 非法: {s:?}")))?;
++    let mut digits = 0;
++    for byte in s.bytes().filter(|byte| *byte != b'-') {
++        if digits == 32 {
++            return Err(invalid());
++        }
++        let nibble = match byte {
++            b'0'..=b'9' => byte - b'0',
++            b'a'..=b'f' => byte - b'a' + 10,
++            b'A'..=b'F' => byte - b'A' + 10,
++            _ => return Err(invalid()),
++        };
++        out[digits / 2] = (out[digits / 2] << 4) | nibble;
++        digits += 1;
++    }
++    if digits != 32 {
++        return Err(invalid());
+     }
+     Ok(out)
+ }
+@@ -325,6 +338,38 @@ mod tests {
+         assert!(parse_uuid("xyz").is_err());
+     }
+ 
++    #[test]
++    fn uuid_parse_ascii_forms_and_unicode_are_bounded_and_redacted() {
++        let canonical = "b831381d-6324-4d53-ad4f-8cda48b30811";
++        let expected = parse_uuid(canonical).unwrap();
++        assert_eq!(parse_uuid(&canonical.replace('-', "")).unwrap(), expected);
++        assert_eq!(
++            parse_uuid(&canonical.to_ascii_uppercase()).unwrap(),
++            expected
++        );
++        let unicode = "a€".repeat(8); // Exactly 32 bytes; old slicing panicked.
++        assert_eq!(unicode.len(), 32);
++        for input in [
++            unicode.as_str(),
++            "",
++            "secret-not-a-uuid",
++            "0000000000000000000000000000000g",
++            "00000000000000000000000000000000000",
++        ] {
++            let result = std::panic::catch_unwind(|| parse_uuid(input));
++            let error = result
++                .expect("untrusted UUID must never panic")
++                .unwrap_err();
++            assert_eq!(
++                error.to_string(),
++                Error::Config("invalid UUID encoding".into()).to_string()
++            );
++            if !input.is_empty() {
++                assert!(!error.to_string().contains(input));
++            }
++        }
++    }
++
+     #[test]
+     fn auth_id_roundtrip() {
+         let cmd = [5u8; 16];
+-- 
+2.52.0
+

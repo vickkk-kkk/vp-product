@@ -1,0 +1,23 @@
+name: vp_features
+description: VP product features boundary.
+version: 0.1.0
+publish_to: none
+environment:
+  sdk: ">=3.10.0 <4.0.0"
+  flutter: ">=3.38.0"
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_riverpod: 3.3.2
+  go_router: 17.5.0
+  vp_contracts:
+    path: ../vp_contracts
+  vp_design_system:
+    path: ../vp_design_system
+  vp_runtime_platform:
+    path: ../vp_runtime_platform
+  vp_api_client:
+    path: ../vp_api_client
+dev_dependencies:
+  flutter_test:
+    sdk: flutter

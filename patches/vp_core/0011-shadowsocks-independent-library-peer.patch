@@ -1,0 +1,837 @@
+diff --git a/crates/vp-protocol/tests/SS_VERIFICATION.md b/crates/vp-protocol/tests/SS_VERIFICATION.md
+index 90c8be8..7894b49 100644
+--- a/crates/vp-protocol/tests/SS_VERIFICATION.md
++++ b/crates/vp-protocol/tests/SS_VERIFICATION.md
+@@ -1,8 +1,9 @@
+ # Shadowsocks standards repair / verification tranche
+ 
+ Scope: four legacy AEAD methods and the three SIP022 methods. This tranche is
+-protocol implementation plus same-implementation regression evidence, **not a
+-release certification or independent full-program interop pass**.
++protocol implementation, local regressions and executed independent official
++protocol-library interop. It is **not a full sing-box CLI integration pass or
++whole-product/native-platform release certification**.
+ 
+ Primary sources checked on 2026-10-30:
+ - https://shadowsocks.org/doc/aead.html
+@@ -31,23 +32,29 @@ connection work now use its task scope. UDP response work is separately tracked;
+ listener-owned JoinSets await handles rather than aborting in-flight replies when
+ ingress stops.
+ 
+-## Executed locally, Rust 1.88.0, on P09 baseline
++## Executed locally, Rust 1.88.0, on the current integrated baseline
+ 
+-Baseline `73d1bc8d5073168572c0306937da154c3a6e00c9`. The only standalone lock
+-change is adding the existing locked `socket2` dependency edge to `vp-protocol`;
+-no crate version or checksum changes. The one-line manifest edge is coordinated
+-with the core integration owner.
++Final independent run baseline: `cae3875ad41e3bcd1c22dca765ad0e5805c098b1`,
++including the already integrated SS source `f90155a6` and the later restricted
++UDP destination guard. This independent-peer patch changes only test files and
++verification notes; production code, Rust manifests and Cargo.lock are untouched.
++The earlier SS implementation tranche added the existing locked socket2 edge,
++with no crate version or checksum changes.
+ 
+ ```
+ cargo +1.88.0 test -p vp-crypto --lib --locked
+-cargo +1.88.0 test -p vp-protocol --test ss_standard --test ss_managed --test ss_library_interop --locked
++cargo +1.88.0 test -p vp-core --lib --locked
++VP_SS_REFERENCE=/absolute/path/reference-ss cargo +1.88.0 test -p vp-protocol --test ss_standard --test ss_managed --test ss_library_interop --locked -- --include-ignored
+ cargo +1.88.0 test -p vp-protocol --test udp ss_udp_loopback --locked
+ cargo +1.88.0 test -p vp-protocol --lib ss::tests::ss_ --locked
+ cargo +1.88.0 test -p vp-protocol --lib snell::tests --locked
+ ```
+ 
++Aggregate: **68 passed, 0 failed, 2 ignored** (only the pre-existing captured
++VMess fixtures), across the exact command set above.
++
+ - Crypto: 24 passed; 2 existing captured-VMess-fixture tests ignored.
+-- P09 core lifecycle/relay regression baseline: 18 passed.
++- Integrated core lifecycle/relay/policy regressions: 20 passed.
+ - `ss_standard`: ten passed. Includes seven-method TCP 180KB+half-close and UDP
+   sizes 0/128/4096; wrong-key/type/timestamp/padding/replay target absence; corrupted
+   UDP target absence; SS2022 session mobility; response association; invalid
+@@ -61,10 +68,28 @@ cargo +1.88.0 test -p vp-protocol --lib snell::tests --locked
+   not mislabeled as a naturally drained UDP session.
+ - Existing SS UDP regression: one passed. Existing SS TCP regressions: two passed.
+ - Snell shared-codec regressions: six passed.
+-- `ss_library_interop`: Rust harness compiles; **two tests intentionally ignored**.
+-  Go module download, dependency integrity verification, build and execution are
+-  pending the separately requested authorization. There is no generated go.sum
+-  and no invented hash or successful reference result.
++- `ss_library_interop`: **two independent matrix tests executed and passed** with
++  `--include-ignored`, after explicit Go/library-harness authorization. All seven methods
++  pass TCP and UDP in both directions, including wrong-key TCP/UDP target absence.
++  TCP payloads are 240,000 bytes (official client -> vp server) and 180,000 bytes
++  (reverse); one UDP session alternates IPv4/IPv6 with sizes 1/128/4096/4096/128/1,
++  retaining its source port and validating returned source addresses.
++- Captured opaque official-library TCP requests are replayed; UDP ciphertext is
++  replayed and corrupted;
++  both are rejected without target packets for all seven methods. For all three
++  SIP022 methods, a client transport source-port change retains the session, a
++  reflected server-direction datagram is rejected, and official clients configured
++  with -60/+60 second clocks cannot reach TCP or UDP targets.
++- After each independent official client run, managed vp_core shutdown leaves zero
++  tasks, empty connection tables and rebindable TCP/UDP/relay ports. The reverse
++  matrix also verifies cancellation of a pending receive does not break the next
++  authenticated exchange.
++- Compiler: checksum-verified official Go 1.26.10. `go mod verify` succeeded. All
++  six modules actually compiled into the test peer have exact version + h1 matches
++  against official sing-box v1.14.4 `go.sum`; actual `go.sum`, binary/source hashes
++  and logs are retained under `docs/implementation/evidence/ss/`. The fixture remains
++  ignored by default because it requires this explicitly built external test peer;
++  that default does not negate the recorded successful explicit execution.
+ 
+ ## Remaining release gates / explicit limits
+ 
+@@ -73,10 +98,10 @@ cargo +1.88.0 test -p vp-protocol --lib snell::tests --locked
+    a cipher failure or pass. No network-policy bypass is attempted. The prepared
+    test-only official-library peer is a distinct evidence tier, never a production
+    replacement engine.
+-2. Run both directions of the seven-cipher TCP/UDP matrix and wrong-key target
+-   absence after authorized official Go setup; retain the exact resolved go.sum,
+-   compiler/build identities and actual logs. Unsupported reference behavior is
+-   a gap, never a pass.
++2. The seven-cipher TCP/UDP independent protocol-library matrix is now passed in
++   both directions; the full CLI remains unverified. The test peer's protocol and
++   crypto code is unmodified upstream, with only a loopback transport/echo adapter.
++   It is neither linked into nor available as a fallback engine for the product.
+ 3. Mixed-family UDP is now implemented with one explicit dual-stack socket and
+    verified against live IPv4/IPv6 loopback targets for all seven methods, including
+    one shared source port and mapped-address canonicalization. On hosts without
+diff --git a/crates/vp-protocol/tests/reference_ss/README.md b/crates/vp-protocol/tests/reference_ss/README.md
+index b2ffef5..03835e5 100644
+--- a/crates/vp-protocol/tests/reference_ss/README.md
++++ b/crates/vp-protocol/tests/reference_ss/README.md
+@@ -15,11 +15,29 @@ The Go module is a test dependency, never a production engine or runtime fallbac
+ Build only after authorization for the official Go compiler and library fixture:
+ 
+ ```
+-go mod tidy
++go mod download
+ go mod verify
+-go build -trimpath -o reference-ss .
++CGO_ENABLED=0 go build -mod=readonly -trimpath -buildvcs=false -o reference-ss .
+ VP_SS_REFERENCE=/absolute/path/reference-ss cargo test --locked -p vp-protocol --test ss_library_interop -- --ignored --nocapture
+ ```
+ 
+ Preserve actual `go.sum`, compiler version and binary/dependency hashes in evidence.
+ The Rust matrix tests both directions, seven ciphers and TCP/UDP independently.
++
++Executed acceptance now includes mixed IPv4/IPv6 destinations, stable session
++source port, packet replay/tamper rejection, SS2022 transport-address mobility,
++reflected-direction rejection, timestamp and wrong-key negatives, canceled-read
++recovery, and managed vp_core cleanup after independent traffic. The packet
++capture wrapper only records/replays/corrupts opaque bytes from the official
++library; it contains no cipher, KDF, header or protocol implementation.
++
++The reference server's plaintext loopback adapter binds one socket per address
++family at the same port, rather than opening a wildcard interface. This is test
++routing plumbing, not the product's socket implementation. vp_core itself uses
++one explicit dual-stack socket per session, separately checked in its source and
++local tests. This test-only Go module is never a Cargo or production dependency.
++
++Actual compiled module versions (including x/crypto and cpuid) are pinned to the
++official release and verified against its go.sum, in addition to Go sumdb checking.
++Default Cargo runs leave these tests ignored; explicit runs with the verified peer
++have passed. See ../SS_VERIFICATION.md and the durable project evidence directory.
+diff --git a/crates/vp-protocol/tests/reference_ss/go.mod b/crates/vp-protocol/tests/reference_ss/go.mod
+index 4ae6e51..c92678d 100644
+--- a/crates/vp-protocol/tests/reference_ss/go.mod
++++ b/crates/vp-protocol/tests/reference_ss/go.mod
+@@ -3,6 +3,13 @@ module vp-product.test/reference-ss
+ go 1.25.5
+ 
+ require (
+- github.com/sagernet/sing-shadowsocks v0.2.9-0.20260929204512-65740e0f0e3e
+- github.com/sagernet/sing v0.9.7-0.20261023115459-5dc452e537bf
++	github.com/sagernet/sing v0.9.7-0.20261023115459-5dc452e537bf
++	github.com/sagernet/sing-shadowsocks v0.2.9-0.20260929204512-65740e0f0e3e
++)
++
++require (
++	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
++	golang.org/x/crypto v0.54.0 // indirect
++	golang.org/x/sys v0.47.0 // indirect
++	lukechampine.com/blake3 v1.3.0 // indirect
+ )
+diff --git a/crates/vp-protocol/tests/reference_ss/go.sum b/crates/vp-protocol/tests/reference_ss/go.sum
+new file mode 100644
+index 0000000..e818b0f
+--- /dev/null
++++ b/crates/vp-protocol/tests/reference_ss/go.sum
+@@ -0,0 +1,20 @@
++github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
++github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
++github.com/klauspost/cpuid/v2 v2.3.0 h1:S4CRMLnYUhGeDFDqkGriYKdfoFlDnMtqTiI/sFzhA9Y=
++github.com/klauspost/cpuid/v2 v2.3.0/go.mod h1:hqwkgyIinND0mEev00jJYCxPNVRVXFQeu1XKlok6oO0=
++github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
++github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
++github.com/sagernet/sing v0.9.7-0.20261023115459-5dc452e537bf h1:qWlGERjsI0F1I9e1W5Z/ARk/9KEN7xIas6e2QHEypUM=
++github.com/sagernet/sing v0.9.7-0.20261023115459-5dc452e537bf/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
++github.com/sagernet/sing-shadowsocks v0.2.9-0.20260929204512-65740e0f0e3e h1:LKgE/uuqp/D2kgxYViOz8vf4slaCUfpFywXjtuwD5gU=
++github.com/sagernet/sing-shadowsocks v0.2.9-0.20260929204512-65740e0f0e3e/go.mod h1:lo7TWEMDcN5/h5B8S0ew+r78ZODn6SwVaFhvB6H+PTI=
++github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
++github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
++golang.org/x/crypto v0.54.0 h1:YLIA59K4fiNzHzjnZt2tUJQjQtUWfWbeHBqKtk3eScw=
++golang.org/x/crypto v0.54.0/go.mod h1:KWL8ny2AZdGR2cWmzeHrp2azQPGogOv+HeQaVEXC2dk=
++golang.org/x/sys v0.47.0 h1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=
++golang.org/x/sys v0.47.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
++gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
++gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
++lukechampine.com/blake3 v1.3.0 h1:sJ3XhFINmHSrYCgl958hscfIa3bw8x4DqMP3u1YvoYE=
++lukechampine.com/blake3 v1.3.0/go.mod h1:0OFRp7fBtAylGVCO40o87sbupkyIGgbpv1+M1k1LM6k=
+diff --git a/crates/vp-protocol/tests/reference_ss/main.go b/crates/vp-protocol/tests/reference_ss/main.go
+index 8819a10..1afc4e1 100644
+--- a/crates/vp-protocol/tests/reference_ss/main.go
++++ b/crates/vp-protocol/tests/reference_ss/main.go
+@@ -2,112 +2,411 @@
+ package main
+ 
+ import (
+- "bytes"
+- "context"
+- "encoding/json"
+- "errors"
+- "fmt"
+- "io"
+- "net"
+- "os"
+- "strings"
+- "time"
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"os"
++	"strings"
++	"time"
+ 
+- SS "github.com/sagernet/sing-shadowsocks"
+- "github.com/sagernet/sing-shadowsocks/shadowaead"
+- SS22 "github.com/sagernet/sing-shadowsocks/shadowaead_2022"
+- "github.com/sagernet/sing/common/buf"
+- M "github.com/sagernet/sing/common/metadata"
+- N "github.com/sagernet/sing/common/network"
++	SS "github.com/sagernet/sing-shadowsocks"
++	"github.com/sagernet/sing-shadowsocks/shadowaead"
++	SS22 "github.com/sagernet/sing-shadowsocks/shadowaead_2022"
++	"github.com/sagernet/sing/common/buf"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
+ )
+ 
+-type input struct { Method, Password, Mode string; Port uint16; Negative bool }
+-func deadline()time.Time{return time.Now().Add(5*time.Second)}
+-func method(c input)(SS.Method,error){
+- if strings.HasPrefix(c.Method,"2022-"){return SS22.NewWithPassword(c.Method,c.Password,nil)}
+- return shadowaead.New(c.Method,nil,c.Password)
++type input struct {
++	Method, Password, Mode string
++	Port                   uint16
++	Negative               bool
++	TimeOffsetSeconds      int64 `json:"time_offset_seconds"`
+ }
+-func runClient(c input)error{
+- if c.Port==0{return errors.New("missing loopback server port")}
+- m,err:=method(c);if err!=nil{return err}
+- target,err:=net.ListenTCP("tcp4",&net.TCPAddr{IP:net.IPv4(127,0,0,1)});if err!=nil{return err};defer target.Close()
+- udpTarget,err:=net.ListenUDP("udp4",&net.UDPAddr{IP:net.IPv4(127,0,0,1)});if err!=nil{return err};defer udpTarget.Close()
+- server:=fmt.Sprintf("127.0.0.1:%d",c.Port)
+- raw,err:=net.DialTimeout("tcp4",server,3*time.Second);if err!=nil{return err};defer raw.Close();raw.SetDeadline(deadline())
+- conn,err:=m.DialConn(raw,M.SocksaddrFromNet(target.Addr()));if err!=nil&&!c.Negative{return fmt.Errorf("TCP handshake: %w",err)}
+- if c.Negative {
+-  if err==nil{defer conn.Close();conn.Write([]byte("must-not-arrive"))}
+-  wire,e:=net.DialTimeout("udp4",server,3*time.Second);if e!=nil{return e};defer wire.Close()
+-  packet:=m.DialPacketConn(wire);packet.SetDeadline(deadline());packet.WriteTo([]byte("must-not-arrive"),udpTarget.LocalAddr())
+-  target.SetDeadline(time.Now().Add(200*time.Millisecond));if remote,e:=target.Accept();e==nil{remote.Close();return errors.New("invalid credentials reached TCP target")}
+-  udpTarget.SetReadDeadline(time.Now().Add(200*time.Millisecond));if _,_,e:=udpTarget.ReadFrom(make([]byte,100));e==nil{return errors.New("invalid credentials reached UDP target")}
+-  return json.NewEncoder(os.Stdout).Encode(map[string]any{"ok":true,"kind":"official-protocol-library","method":c.Method,"negative":true})
+- }
+- defer conn.Close()
+- go func(){remote,e:=target.AcceptTCP();if e==nil{defer remote.Close();remote.SetDeadline(deadline());io.Copy(remote,remote)}}()
+- body:=bytes.Repeat([]byte("independent-reference-tcp"),2000)
+- if _,err=conn.Write(body);err!=nil{return fmt.Errorf("TCP write: %w",err)}
+- got:=make([]byte,len(body));if _,err=io.ReadFull(conn,got);err!=nil{return fmt.Errorf("TCP read: %w",err)}
+- if !bytes.Equal(got,body){return errors.New("TCP payload mismatch")}
+- wire,err:=net.DialTimeout("udp4",server,3*time.Second);if err!=nil{return err};defer wire.Close()
+- packet:=m.DialPacketConn(wire);defer packet.Close();packet.SetDeadline(deadline())
+- previous:=""
+- for _,size:=range []int{1,128,4096}{
+-  body=bytes.Repeat([]byte{0x53},size);udpTarget.SetDeadline(deadline())
+-  if _,err=packet.WriteTo(body,udpTarget.LocalAddr());err!=nil{return fmt.Errorf("UDP write: %w",err)}
+-  received:=make([]byte,65535);n,source,e:=udpTarget.ReadFrom(received);if e!=nil{return fmt.Errorf("UDP target: %w",e)}
+-  if !bytes.Equal(body,received[:n]){return errors.New("UDP target payload mismatch")}
+-  if previous!=""&&previous!=source.String(){return errors.New("UDP session outgoing source changed")};previous=source.String()
+-  if _,e=udpTarget.WriteTo(received[:n],source);e!=nil{return e}
+-  n,source,e=packet.ReadFrom(received);if e!=nil{return fmt.Errorf("UDP reply: %w",e)}
+-  if !bytes.Equal(body,received[:n])||source.String()!=udpTarget.LocalAddr().String(){return errors.New("UDP reply payload/address mismatch")}
+- }
+- return json.NewEncoder(os.Stdout).Encode(map[string]any{"ok":true,"kind":"official-protocol-library","method":c.Method,"tcp":true,"udp_sizes":[]int{1,128,4096},"udp_source_stable":true})
++
++func deadline() time.Time { return time.Now().Add(5 * time.Second) }
++func method(c input) (SS.Method, error) {
++	if strings.HasPrefix(c.Method, "2022-") {
++		return SS22.NewWithPassword(c.Method, c.Password, func() time.Time { return time.Now().Add(time.Duration(c.TimeOffsetSeconds) * time.Second) })
++	}
++	return shadowaead.New(c.Method, nil, c.Password)
++}
++
++// Capture only opaque wire bytes produced/consumed by the official protocol
++// library. Replays, corruption, direction reflection and a transport source-port
++// change do not add or reimplement any Shadowsocks processing.
++type captureConn struct {
++	net.Conn
++	sent, received, first []byte
++}
++
++func (c *captureConn) Write(p []byte) (int, error) {
++	if c.first == nil {
++		c.first = append([]byte(nil), p...)
++	}
++	c.sent = append(c.sent[:0], p...)
++	return c.Conn.Write(p)
++}
++func (c *captureConn) Read(p []byte) (int, error) {
++	n, e := c.Conn.Read(p)
++	if n > 0 {
++		c.received = append(c.received[:0], p[:n]...)
++	}
++	return n, e
++}
++
++func runClient(c input) error {
++	if c.Port == 0 {
++		return errors.New("missing loopback server port")
++	}
++	m, err := method(c)
++	if err != nil {
++		return err
++	}
++	target, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
++	if err != nil {
++		return err
++	}
++	defer target.Close()
++	udpTarget, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
++	if err != nil {
++		return err
++	}
++	defer udpTarget.Close()
++	server := fmt.Sprintf("127.0.0.1:%d", c.Port)
++	raw, err := net.DialTimeout("tcp4", server, 3*time.Second)
++	if err != nil {
++		return err
++	}
++	defer raw.Close()
++	raw.SetDeadline(deadline())
++	tcpCapture := &captureConn{Conn: raw}
++	conn, err := m.DialConn(tcpCapture, M.SocksaddrFromNet(target.Addr()))
++	if err != nil && !c.Negative {
++		return fmt.Errorf("TCP handshake: %w", err)
++	}
++	if c.Negative {
++		if err == nil {
++			defer conn.Close()
++			conn.Write([]byte("must-not-arrive"))
++		}
++		wire, e := net.DialTimeout("udp4", server, 3*time.Second)
++		if e != nil {
++			return e
++		}
++		defer wire.Close()
++		packet := m.DialPacketConn(wire)
++		packet.SetDeadline(deadline())
++		packet.WriteTo([]byte("must-not-arrive"), udpTarget.LocalAddr())
++		target.SetDeadline(time.Now().Add(200 * time.Millisecond))
++		if remote, e := target.Accept(); e == nil {
++			remote.Close()
++			return errors.New("invalid credentials reached TCP target")
++		}
++		udpTarget.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
++		if _, _, e := udpTarget.ReadFrom(make([]byte, 100)); e == nil {
++			return errors.New("invalid credentials reached UDP target")
++		}
++		return json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "kind": "official-protocol-library", "method": c.Method, "negative": true, "time_offset_seconds": c.TimeOffsetSeconds})
++	}
++	defer conn.Close()
++	go func() {
++		remote, e := target.AcceptTCP()
++		if e == nil {
++			defer remote.Close()
++			remote.SetDeadline(deadline())
++			io.Copy(remote, remote)
++		}
++	}()
++	body := bytes.Repeat([]byte("independent-reference-tcp"), 10000)
++	if _, err = conn.Write(body); err != nil {
++		return fmt.Errorf("TCP write: %w", err)
++	}
++	got := make([]byte, len(body))
++	if _, err = io.ReadFull(conn, got); err != nil {
++		return fmt.Errorf("TCP read: %w", err)
++	}
++	if !bytes.Equal(got, body) {
++		return errors.New("TCP payload mismatch")
++	}
++	conn.Close()
++	replay, e := net.DialTimeout("tcp4", server, 3*time.Second)
++	if e != nil {
++		return e
++	}
++	replay.SetDeadline(deadline())
++	_, e = replay.Write(tcpCapture.first)
++	if e != nil {
++		replay.Close()
++		return e
++	}
++	target.SetDeadline(time.Now().Add(120 * time.Millisecond))
++	if forwarded, e := target.Accept(); e == nil {
++		forwarded.Close()
++		replay.Close()
++		return errors.New("replayed official TCP request reached target")
++	}
++	replay.Close()
++	wire, err := net.DialTimeout("udp4", server, 3*time.Second)
++	if err != nil {
++		return err
++	}
++	defer wire.Close()
++	captured := &captureConn{Conn: wire}
++	packet := m.DialPacketConn(captured)
++	defer packet.Close()
++	packet.SetDeadline(deadline())
++	udpTarget6, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback})
++	if err != nil {
++		return fmt.Errorf("IPv6 loopback unavailable (not an interop pass): %w", err)
++	}
++	defer udpTarget6.Close()
++	previous := 0
++	for index, size := range []int{1, 128, 4096, 4096, 128, 1} {
++		if index == 3 && strings.HasPrefix(c.Method, "2022-") {
++			// Same official session object; only the client's UDP source changes.
++			next, e := net.DialTimeout("udp4", server, 3*time.Second)
++			if e != nil {
++				return e
++			}
++			defer next.Close()
++			next.SetDeadline(deadline())
++			captured.Conn = next
++		}
++		destination := udpTarget
++		if index%2 == 1 {
++			destination = udpTarget6
++		}
++		body = bytes.Repeat([]byte{0x53}, size)
++		destination.SetDeadline(deadline())
++		if _, err = packet.WriteTo(body, destination.LocalAddr()); err != nil {
++			return fmt.Errorf("UDP write: %w", err)
++		}
++		received := make([]byte, 65535)
++		n, source, e := destination.ReadFrom(received)
++		if e != nil {
++			return fmt.Errorf("UDP target: %w", e)
++		}
++		if !bytes.Equal(body, received[:n]) {
++			return errors.New("UDP target payload mismatch")
++		}
++		port := source.(*net.UDPAddr).Port
++		if previous != 0 && previous != port {
++			return errors.New("UDP session outgoing source port changed across families")
++		}
++		previous = port
++		if _, e = destination.WriteTo(received[:n], source); e != nil {
++			return e
++		}
++		n, source, e = packet.ReadFrom(received)
++		if e != nil {
++			return fmt.Errorf("UDP reply: %w", e)
++		}
++		if !bytes.Equal(body, received[:n]) || source.String() != destination.LocalAddr().String() {
++			return errors.New("UDP reply payload/address mismatch")
++		}
++	}
++
++	for _, wirePacket := range [][]byte{append([]byte(nil), captured.sent...), func() []byte { p := append([]byte(nil), captured.sent...); p[len(p)-1] ^= 1; return p }()} {
++		if _, err = captured.Conn.Write(wirePacket); err != nil {
++			return err
++		}
++		udpTarget6.SetReadDeadline(time.Now().Add(120 * time.Millisecond))
++		if _, _, e := udpTarget6.ReadFrom(make([]byte, 65535)); e == nil {
++			return errors.New("replayed or corrupted UDP reached plaintext target")
++		}
++	}
++	if strings.HasPrefix(c.Method, "2022-") {
++		if _, err = captured.Conn.Write(captured.received); err != nil {
++			return err
++		}
++		udpTarget6.SetReadDeadline(time.Now().Add(120 * time.Millisecond))
++		if _, _, e := udpTarget6.ReadFrom(make([]byte, 65535)); e == nil {
++			return errors.New("reflected server-direction UDP reached target")
++		}
++	}
++
++	return json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "kind": "official-protocol-library", "method": c.Method, "tcp": true, "udp_sizes": []int{1, 128, 4096, 4096, 128, 1}, "udp_mixed_ipv4_ipv6": true, "udp_source_port_stable": true, "udp_relay_source_port": previous, "tcp_bytes": 240000, "tcp_replay_rejected": true, "udp_replay_rejected": true, "udp_tamper_rejected": true, "ss2022_mobility_and_direction_check": strings.HasPrefix(c.Method, "2022-")})
+ }
+ 
+ type handler struct{}
+-func(handler)NewError(_ context.Context,e error){fmt.Fprintln(os.Stderr,"reference handler:",e)}
+-func(handler)NewConnection(_ context.Context,conn net.Conn,metadata M.Metadata)error{
+- defer conn.Close()
+- if !metadata.Destination.Addr.IsLoopback(){return errors.New("non-loopback destination refused")}
+- target,err:=net.DialTimeout("tcp",metadata.Destination.String(),3*time.Second);if err!=nil{return err};defer target.Close()
+- conn.SetDeadline(deadline());target.SetDeadline(deadline())
+- done:=make(chan struct{});go func(){io.Copy(target,conn);if tcp,ok:=target.(*net.TCPConn);ok{tcp.CloseWrite()};close(done)}()
+- _,err=io.Copy(conn,target);conn.Close();<-done;return err
++
++func (handler) NewError(_ context.Context, e error) { fmt.Fprintln(os.Stderr, "reference handler:", e) }
++func (handler) NewConnection(_ context.Context, conn net.Conn, metadata M.Metadata) error {
++	defer conn.Close()
++	if !metadata.Destination.Addr.IsLoopback() {
++		return errors.New("non-loopback destination refused")
++	}
++	target, err := net.DialTimeout("tcp", metadata.Destination.String(), 3*time.Second)
++	if err != nil {
++		return err
++	}
++	defer target.Close()
++	conn.SetDeadline(deadline())
++	target.SetDeadline(deadline())
++	done := make(chan struct{})
++	go func() {
++		io.Copy(target, conn)
++		if tcp, ok := target.(*net.TCPConn); ok {
++			tcp.CloseWrite()
++		}
++		close(done)
++	}()
++	_, err = io.Copy(conn, target)
++	conn.Close()
++	<-done
++	return err
+ }
+-func(handler)NewPacketConnection(_ context.Context,conn N.PacketConn,_ M.Metadata)error{
+- defer conn.Close()
+- target,err:=net.ListenUDP("udp4",&net.UDPAddr{IP:net.IPv4(127,0,0,1)});if err!=nil{return err};defer target.Close()
+- for {
+-  incoming:=buf.NewPacket();destination,e:=conn.ReadPacket(incoming);if e!=nil{incoming.Release();return e}
+-  if !destination.Addr.IsLoopback(){incoming.Release();return errors.New("non-loopback UDP target refused")}
+-  target.SetDeadline(deadline());_,e=target.WriteToUDP(incoming.Bytes(),destination.UDPAddr());incoming.Release();if e!=nil{return e}
+-  response:=buf.NewSize(65535);response.Resize(1024,0)
+-  n,source,e:=target.ReadFromUDP(response.FreeBytes());if e!=nil{response.Release();return e};response.Truncate(n)
+-  if e=conn.WritePacket(response,M.SocksaddrFromNet(source));e!=nil{return e}
+- }
++func (handler) NewPacketConnection(_ context.Context, conn N.PacketConn, _ M.Metadata) error {
++	defer conn.Close()
++	// The adapter owns only plaintext loopback target forwarding. Keep the same
++	// observable port in both families without binding a wildcard interface.
++	target4, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
++	if err != nil {
++		return err
++	}
++	defer target4.Close()
++	target6, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback, Port: target4.LocalAddr().(*net.UDPAddr).Port})
++	if err != nil {
++		return err
++	}
++	defer target6.Close()
++
++	for {
++		incoming := buf.NewPacket()
++		destination, e := conn.ReadPacket(incoming)
++		if e != nil {
++			incoming.Release()
++			return e
++		}
++		if !destination.Addr.Unmap().IsLoopback() {
++			incoming.Release()
++			return errors.New("non-loopback UDP target refused")
++		}
++		target := target4
++		if destination.Addr.Unmap().Is6() {
++			target = target6
++		}
++		target.SetDeadline(deadline())
++		_, e = target.WriteToUDP(incoming.Bytes(), destination.UDPAddr())
++		incoming.Release()
++		if e != nil {
++			return e
++		}
++		response := buf.NewSize(65535)
++		response.Resize(1024, 0)
++		n, source, e := target.ReadFromUDP(response.FreeBytes())
++		if e != nil {
++			response.Release()
++			return e
++		}
++		response.Truncate(n)
++		if e = conn.WritePacket(response, M.SocksaddrFromNet(source)); e != nil {
++			return e
++		}
++	}
++}
++
++type wirePacket struct{ *net.UDPConn }
++
++func (w wirePacket) ReadPacket(b *buf.Buffer) (M.Socksaddr, error) {
++	_, from, e := b.ReadPacketFrom(w.UDPConn)
++	if e != nil {
++		return M.Socksaddr{}, e
++	}
++	return M.SocksaddrFromNet(from), nil
+ }
+-type wirePacket struct{*net.UDPConn}
+-func(w wirePacket)ReadPacket(b *buf.Buffer)(M.Socksaddr,error){_,from,e:=b.ReadPacketFrom(w.UDPConn);if e!=nil{return M.Socksaddr{},e};return M.SocksaddrFromNet(from),nil}
+-func(w wirePacket)WritePacket(b *buf.Buffer,destination M.Socksaddr)error{
+- defer b.Release();if !destination.Addr.IsLoopback(){return errors.New("non-loopback UDP recipient refused")}
+- _,err:=w.WriteToUDP(b.Bytes(),destination.UDPAddr());return err
++func (w wirePacket) WritePacket(b *buf.Buffer, destination M.Socksaddr) error {
++	defer b.Release()
++	if !destination.Addr.IsLoopback() {
++		return errors.New("non-loopback UDP recipient refused")
++	}
++	_, err := w.WriteToUDP(b.Bytes(), destination.UDPAddr())
++	return err
+ }
+-func runServer(c input)error{
+- tcp,err:=net.ListenTCP("tcp4",&net.TCPAddr{IP:net.IPv4(127,0,0,1)});if err!=nil{return err};defer tcp.Close()
+- udp,err:=net.ListenUDP("udp4",&net.UDPAddr{IP:net.IPv4(127,0,0,1),Port:tcp.Addr().(*net.TCPAddr).Port});if err!=nil{return err};defer udp.Close()
+- var service SS.Service
+- if strings.HasPrefix(c.Method,"2022-"){service,err=SS22.NewServiceWithPassword(c.Method,c.Password,300,handler{},nil)}else{service,err=shadowaead.NewService(c.Method,nil,c.Password,300,handler{})};if err!=nil{return err}
+- ctx,cancel:=context.WithTimeout(context.Background(),20*time.Second);defer cancel()
+- go func(){for{conn,e:=tcp.Accept();if e!=nil{return};go func(){conn.SetDeadline(deadline());if e:=service.NewConnection(ctx,conn,M.Metadata{Source:M.SocksaddrFromNet(conn.RemoteAddr())});e!=nil{conn.Close()}}()}}()
+- go func(){for{packet:=buf.NewPacket();_,from,e:=packet.ReadPacketFrom(udp);if e!=nil{packet.Release();return};if e=service.NewPacket(ctx,wirePacket{udp},packet,M.Metadata{Source:M.SocksaddrFromNet(from)});e!=nil{packet.Release()}}}()
+- if err=json.NewEncoder(os.Stdout).Encode(map[string]any{"ready":tcp.Addr().(*net.TCPAddr).Port,"kind":"official-protocol-library"});err!=nil{return err}
+- // Parent keeps stdin open during tests; closing it terminates this isolated peer.
+- done:=make(chan struct{});go func(){io.Copy(io.Discard,os.Stdin);close(done)}()
+- select{case <-done:return nil;case <-ctx.Done():return ctx.Err()}
++func runServer(c input) error {
++	tcp, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
++	if err != nil {
++		return err
++	}
++	defer tcp.Close()
++	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: tcp.Addr().(*net.TCPAddr).Port})
++	if err != nil {
++		return err
++	}
++	defer udp.Close()
++	var service SS.Service
++	if strings.HasPrefix(c.Method, "2022-") {
++		service, err = SS22.NewServiceWithPassword(c.Method, c.Password, 300, handler{}, nil)
++	} else {
++		service, err = shadowaead.NewService(c.Method, nil, c.Password, 300, handler{})
++	}
++	if err != nil {
++		return err
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
++	defer cancel()
++	go func() {
++		for {
++			conn, e := tcp.Accept()
++			if e != nil {
++				return
++			}
++			go func() {
++				conn.SetDeadline(deadline())
++				if e := service.NewConnection(ctx, conn, M.Metadata{Source: M.SocksaddrFromNet(conn.RemoteAddr())}); e != nil {
++					conn.Close()
++				}
++			}()
++		}
++	}()
++	go func() {
++		for {
++			packet := buf.NewPacket()
++			_, from, e := packet.ReadPacketFrom(udp)
++			if e != nil {
++				packet.Release()
++				return
++			}
++			if e = service.NewPacket(ctx, wirePacket{udp}, packet, M.Metadata{Source: M.SocksaddrFromNet(from)}); e != nil {
++				packet.Release()
++			}
++		}
++	}()
++	if err = json.NewEncoder(os.Stdout).Encode(map[string]any{"ready": tcp.Addr().(*net.TCPAddr).Port, "kind": "official-protocol-library"}); err != nil {
++		return err
++	}
++	// Parent keeps stdin open during tests; closing it terminates this isolated peer.
++	done := make(chan struct{})
++	go func() { io.Copy(io.Discard, os.Stdin); close(done) }()
++	select {
++	case <-done:
++		return nil
++	case <-ctx.Done():
++		return ctx.Err()
++	}
+ }
+-func main(){
+- var c input;if err:=json.NewDecoder(io.LimitReader(os.Stdin,16384)).Decode(&c);err!=nil{fmt.Fprintln(os.Stderr,err);os.Exit(1)}
+- var err error;switch c.Mode{case "client":err=runClient(c);case "server":err=runServer(c);default:err=errors.New("invalid fixture mode")}
+- if err!=nil{fmt.Fprintln(os.Stderr,"reference-ss:",err);os.Exit(1)}
++func main() {
++	var c input
++	if err := json.NewDecoder(io.LimitReader(os.Stdin, 16384)).Decode(&c); err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		os.Exit(1)
++	}
++	var err error
++	switch c.Mode {
++	case "client":
++		err = runClient(c)
++	case "server":
++		err = runServer(c)
++	default:
++		err = errors.New("invalid fixture mode")
++	}
++	if err != nil {
++		fmt.Fprintln(os.Stderr, "reference-ss:", err)
++		os.Exit(1)
++	}
+ }
+diff --git a/crates/vp-protocol/tests/ss_library_interop.rs b/crates/vp-protocol/tests/ss_library_interop.rs
+index e60dba3..ec4ce76 100644
+--- a/crates/vp-protocol/tests/ss_library_interop.rs
++++ b/crates/vp-protocol/tests/ss_library_interop.rs
+@@ -123,29 +123,62 @@ async fn official_client_to_vp_server_all_seven_methods_tcp_udp_and_wrong_key()
+         let server = Arc::new(
+             vp_protocol::ss::SsInbound::new("127.0.0.1", 0, "ss-reference", method, &key).unwrap(),
+         );
+-        let port = server.start(context()).await.unwrap();
+-        for negative in [false, true] {
+-            let credential = if negative {
++        let scope = vp_core::task_scope::TaskScope::new();
++        let ctx = context();
++        let port = scope.run(server.start(ctx.clone())).await.unwrap();
++        let mut relay_port = None;
++        let cases: &[(bool, i64)] = if method.starts_with("2022-") {
++            &[(false, 0), (true, 0), (true, -60), (true, 60)]
++        } else {
++            &[(false, 0), (true, 0)]
++        };
++        for &(negative, time_offset) in cases {
++            let credential = if negative && time_offset == 0 {
+                 password(method)
+             } else {
+                 key.clone()
+             };
+-            let mut child=peer(serde_json::json!({"method":method,"password":credential,"mode":"client","port":port,"negative":negative})).await;
++            let mut child=peer(serde_json::json!({"method":method,"password":credential,"mode":"client","port":port,"negative":negative,"time_offset_seconds":time_offset})).await;
+             child.stdin.take();
+             let output = finish(child).await;
+             assert!(
+                 output.status.success(),
+-                "{method} negative={negative}: {}",
++                "{method} negative={negative} time_offset={time_offset}: {}",
+                 String::from_utf8_lossy(&output.stderr)
+             );
+             let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+             assert_eq!(result["ok"], true);
+             assert_eq!(result["kind"], "official-protocol-library");
++            if !negative {
++                assert_eq!(result["udp_mixed_ipv4_ipv6"], true);
++                assert_eq!(result["udp_source_port_stable"], true);
++                assert_eq!(result["tcp_replay_rejected"], true);
++                assert_eq!(result["udp_replay_rejected"], true);
++                assert_eq!(result["udp_tamper_rejected"], true);
++                assert_eq!(
++                    result["ss2022_mobility_and_direction_check"],
++                    method.starts_with("2022-")
++                );
++                relay_port = Some(result["udp_relay_source_port"].as_u64().unwrap() as u16);
++            }
+             eprintln!(
+-                "PASS official SS client -> vp server {method} negative={negative}: {}",
++                "PASS official SS client -> vp server {method} negative={negative} time_offset={time_offset}: {}",
+                 String::from_utf8_lossy(&output.stdout).trim()
+             );
+         }
++        let report = scope
++            .shutdown(Duration::from_millis(30), Duration::from_secs(1))
++            .await;
++        assert_eq!(report.remaining_tasks, 0);
++        assert_eq!(report.panics, 0);
++        assert!(ctx.conns.is_empty());
++        assert_eq!(scope.snapshot().task_count(), 0);
++        let _tcp = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
++        let _udp = UdpSocket::bind(("127.0.0.1", port)).await.unwrap();
++        let _relay = UdpSocket::bind(("::", relay_port.unwrap())).await.unwrap();
++        eprintln!(
++            "PASS managed cancellation after official client {method}: remaining=0, TCP/UDP/relay ports rebound"
++        );
+     }
+ }
+ 
+@@ -199,7 +232,7 @@ async fn vp_client_to_official_server_all_seven_methods_tcp_udp_and_wrong_key()
+             .connect_stream(&Session::new_tcp("test".into(), None, dst.clone()), &dst)
+             .await
+             .unwrap();
+-        let body = vec![0x39; 48000];
++        let body = vec![0x39; 180000];
+         timeout(Duration::from_secs(5), async {
+             stream.write_all(&body).await.unwrap();
+             stream.flush().await.unwrap();
+@@ -214,13 +247,21 @@ async fn vp_client_to_official_server_all_seven_methods_tcp_udp_and_wrong_key()
+         echo_task.abort();
+         let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+         let addr = target.local_addr().unwrap();
++        let target6 = UdpSocket::bind("[::1]:0")
++            .await
++            .expect("IPv6 loopback unavailable, not an interop pass");
+         let dst = DstAddr::ip(addr.ip(), addr.port());
+         let mut packet = out
+             .connect_packet(&Session::new_tcp("test".into(), None, dst.clone()), &dst)
+             .await
+             .unwrap();
+         let mut original = None;
+-        for size in [1, 128, 4096] {
++        assert!(timeout(Duration::from_millis(20), packet.recv())
++            .await
++            .is_err());
++        for (index, size) in [1, 128, 4096, 4096, 128, 1].into_iter().enumerate() {
++            let target = if index % 2 == 0 { &target } else { &target6 };
++            let addr = target.local_addr().unwrap();
+             timeout(Duration::from_secs(5), async {
+                 let body = vec![0x56; size];
+                 packet
+@@ -235,9 +276,9 @@ async fn vp_client_to_official_server_all_seven_methods_tcp_udp_and_wrong_key()
+                 let (n, from) = target.recv_from(&mut buf).await.unwrap();
+                 assert_eq!(&buf[..n], &body);
+                 if let Some(previous) = original {
+-                    assert_eq!(from, previous)
++                    assert_eq!(from.port(), previous)
+                 } else {
+-                    original = Some(from)
++                    original = Some(from.port())
+                 };
+                 target.send_to(&buf[..n], from).await.unwrap();
+                 let response = packet.recv().await.unwrap();
+@@ -262,11 +303,9 @@ async fn vp_client_to_official_server_all_seven_methods_tcp_udp_and_wrong_key()
+             let _ = bad.write_all(b"must-not-arrive").await;
+             let _ = bad.flush().await;
+         }
+-        assert!(
+-            timeout(Duration::from_millis(100), forbidden.accept())
+-                .await
+-                .is_err()
+-        );
++        assert!(timeout(Duration::from_millis(100), forbidden.accept())
++            .await
++            .is_err());
+         let badpacket = badout
+             .connect_packet(&Session::new_tcp("test".into(), None, dst.clone()), &dst)
+             .await
+@@ -292,7 +331,7 @@ async fn vp_client_to_official_server_all_seven_methods_tcp_udp_and_wrong_key()
+             String::from_utf8_lossy(&output.stderr)
+         );
+         eprintln!(
+-            "PASS vp SS client -> official server {method}: TCP 48000 bytes, UDP [1,128,4096], stable source, wrong-key target absence"
++            "PASS vp SS client -> official server {method}: TCP 180000 bytes, UDP [1,128,4096,4096,128,1] alternating IPv4/IPv6, stable source port, canceled receive recovery, wrong-key target absence"
+         );
+     }
+ }

@@ -1,0 +1,421 @@
+diff --git a/crates/vp-app/src/lib.rs b/crates/vp-app/src/lib.rs
+index 6fefa64b63e4c2f0093618e1e1041df8cdc97c4d..5c784bba235a63dea7f35ed1b893a1db4ca07d35 100644
+--- a/crates/vp-app/src/lib.rs
++++ b/crates/vp-app/src/lib.rs
+@@ -245,6 +245,16 @@ impl App {
+                 errs.join("\n  - ")
+             )));
+         }
++        // Construct every declared protocol listener before global tuning, downloads,
++        // providers or binds. Invalid credentials must not produce a partial start.
++        let bind = if cfg.allow_lan {
++            if cfg.bind_address == "*" { "0.0.0.0".to_string() } else { cfg.bind_address.clone() }
++        } else {
++            "127.0.0.1".to_string()
++        };
++        let prepared_listeners = cfg.listeners.iter()
++            .map(|listener| build_listener(listener, &bind))
++            .collect::<Result<Vec<_>>>()?;
+         let t_validate = t_start.elapsed();
+ 
+         if let Some(tuning) = &cfg.tuning {
+@@ -505,15 +515,6 @@ impl App {
+         let mut listen_ports = Vec::new();
+         let mut tun_route_guard = None;
+         if start_listeners {
+-            let bind = if cfg.allow_lan {
+-                if cfg.bind_address == "*" {
+-                    "0.0.0.0".to_string()
+-                } else {
+-                    cfg.bind_address.clone()
+-                }
+-            } else {
+-                "127.0.0.1".to_string()
+-            };
+             let inb_ctx = InboundCtx {
+                 router: router_handle.clone(),
+                 stats: stats.clone(),
+@@ -532,40 +533,21 @@ impl App {
+                 }
+             }
+ 
+-            // redir/tproxy（仅 Linux；非 Linux 明确报错但不阻断启动）
++            // A requested redir/tproxy failure is fatal, including unsupported OS.
+             for (port, tag) in [(cfg.redir_port, "redir"), (cfg.tproxy_port, "tproxy")] {
+                 if let Some(p) = port {
+                     let inb: Arc<dyn vp_core::Inbound> =
+                         Arc::new(vp_protocol::redir::RedirInbound::new(&bind, p, tag));
+-                    match inb.clone().start(inb_ctx.clone()).await {
+-                        Ok(bound) => {
+-                            info!("{tag} 监听 {bind}:{bound}");
+-                            listen_ports.push((tag.to_string(), bound));
+-                        }
+-                        Err(e) => {
+-                            warn!("{tag} 未启用: {e}");
+-                        }
+-                    }
++                    let bound = inb.start(inb_ctx.clone()).await?;
++                    listen_ports.push((tag.to_string(), bound));
+                 }
+             }
+ 
+-            // 协议服务端入站（listeners）
+-            for l in &cfg.listeners {
+-                let inb: Arc<dyn vp_core::Inbound> = match build_listener(l) {
+-                    Ok(i) => i,
+-                    Err(e) => {
+-                        warn!("listener {:?} 构建失败: {e}", l.name);
+-                        continue;
+-                    }
+-                };
+-                match inb.clone().start(inb_ctx.clone()).await {
+-                    Ok(bound) => {
+-                        info!("listener {} [{}] 监听 {bind}:{bound}", l.name, l.kind);
+-                        listen_ports.push((l.name.clone(), bound));
+-                    }
+-                    Err(e) => warn!("listener {:?} 启动失败: {e}", l.name),
+-                }
+-            }
++            // Never return an App whose declared listener failed construction/bind.
++            // Inbound still lacks cancellation: a later failure can leave earlier
++            // spawned tasks alive until the owning runtime exits. P09 is required
++            // before adapter runtime activation; do not claim atomic startup here.
++            listen_ports.extend(start_protocol_listeners(prepared_listeners, inb_ctx.clone()).await?);
+ 
+             // TUN 模式
+             if let Some(tun_cfg) = &cfg.tun {
+@@ -763,8 +745,26 @@ impl App {
+     }
+ }
+ 
++/// Successful return means every requested start returned a bound port, not that
++/// protocol handshakes, task liveness, stop/drain or interoperability are certified.
++async fn start_protocol_listeners(
++    listeners: Vec<Arc<dyn vp_core::Inbound>>,
++    ctx: InboundCtx,
++) -> Result<Vec<(String, u16)>> {
++    let mut bound = Vec::with_capacity(listeners.len());
++    for listener in listeners {
++        let tag = listener.tag().to_string();
++        let port = listener.start(ctx.clone()).await?;
++        bound.push((tag, port));
++    }
++    Ok(bound)
++}
++
++#[cfg(test)]
++mod listener_startup_tests;
++
+ /// 构建 listeners 段的服务端入站（trojan/vmess/vless/ss）
+-fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound>> {
++fn build_listener(l: &vp_config::ListenerCfg, bind: &str) -> Result<Arc<dyn vp_core::Inbound>> {
+     let tag = l.name.as_str();
+     match l.kind.as_str() {
+         "trojan" => {
+@@ -772,7 +772,7 @@ fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound
+                 return Err(Error::Config("trojan listener 需要 users（密码）".into()));
+             }
+             Ok(Arc::new(vp_protocol::trojan::TrojanInbound::new(
+-                "0.0.0.0", l.port, tag, &l.users,
++                bind, l.port, tag, &l.users,
+             )?))
+         }
+         "vmess" => {
+@@ -780,7 +780,7 @@ fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound
+                 return Err(Error::Config("vmess listener 需要 users（uuid）".into()));
+             }
+             Ok(Arc::new(vp_protocol::vmess::VmessInbound::new(
+-                "0.0.0.0", l.port, tag, &l.users,
++                bind, l.port, tag, &l.users,
+             )?))
+         }
+         "vless" => {
+@@ -788,7 +788,7 @@ fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound
+                 return Err(Error::Config("vless listener 需要 users（uuid）".into()));
+             }
+             Ok(Arc::new(vp_protocol::vless::VlessInbound::new(
+-                "0.0.0.0", l.port, tag, &l.users,
++                bind, l.port, tag, &l.users,
+             )?))
+         }
+         "anytls" => {
+@@ -796,7 +796,7 @@ fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound
+                 return Err(Error::Config("anytls listener 需要 users（密码）".into()));
+             }
+             Ok(Arc::new(vp_protocol::anytls::AnytlsInbound::new(
+-                "0.0.0.0", l.port, tag, &l.users,
++                bind, l.port, tag, &l.users,
+             )?))
+         }
+         "mieru" => {
+@@ -806,7 +806,7 @@ fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound
+                 ));
+             }
+             Ok(Arc::new(vp_protocol::mieru::MieruInbound::new(
+-                "0.0.0.0", l.port, tag, &l.users,
++                bind, l.port, tag, &l.users,
+             )?))
+         }
+         "brook" => {
+@@ -814,7 +814,7 @@ fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound
+                 return Err(Error::Config("brook listener 需要 users（密码）".into()));
+             }
+             Ok(Arc::new(vp_protocol::brook::BrookInbound::new(
+-                "0.0.0.0", l.port, tag, &l.users,
++                bind, l.port, tag, &l.users,
+             )?))
+         }
+         "snell" => {
+@@ -824,7 +824,7 @@ fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound
+                 ));
+             }
+             Ok(Arc::new(vp_protocol::snell::SnellInbound::new(
+-                "0.0.0.0",
++                bind,
+                 l.port,
+                 tag,
+                 &l.users,
+@@ -838,7 +838,7 @@ fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound
+                 ));
+             }
+             Ok(Arc::new(vp_protocol::naive::NaiveInbound::new(
+-                "0.0.0.0", l.port, tag, &l.users,
++                bind, l.port, tag, &l.users,
+             )?))
+         }
+         "ss" => {
+@@ -865,7 +865,7 @@ fn build_listener(l: &vp_config::ListenerCfg) -> Result<Arc<dyn vp_core::Inbound
+                 None => None,
+             };
+             Ok(Arc::new(vp_protocol::ss::SsInbound::new_with_shadow_tls(
+-                "0.0.0.0", l.port, tag, cipher, password, stls,
++                bind, l.port, tag, cipher, password, stls,
+             )?))
+         }
+         other => Err(Error::Unsupported(format!(
+diff --git a/crates/vp-app/src/listener_startup_tests.rs b/crates/vp-app/src/listener_startup_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..a4b223874275e4aa6a7fff0df25bff53c83a5d72
+--- /dev/null
++++ b/crates/vp-app/src/listener_startup_tests.rs
+@@ -0,0 +1,113 @@
++//! P01 source tests. Not executed until the toolchain/core execution gate is granted.
++use super::*;
++use std::sync::atomic::{AtomicUsize, Ordering};
++
++fn parse_listener(extra: &str) -> vp_config::Config {
++    vp_config::parse(
++        &format!("listeners:\n  - name: test\n    type: vless\n    port: 0\n    users: [00000000-0000-0000-0000-000000000001]\n{extra}"),
++        Format::Yaml,
++    ).unwrap()
++}
++
++#[test]
++fn ignored_security_and_transport_fields_are_rejected() {
++    for field in ["transport: ws", "network: h2", "reality: {}", "unknown-flag: true"] {
++        let text = format!("listeners:\n  - name: test\n    type: vless\n    port: 443\n    users: [secret-placeholder]\n    {field}\n");
++        assert!(vp_config::parse(&text, Format::Yaml).is_err(), "{field}");
++    }
++}
++
++#[test]
++fn listener_port_does_not_use_lossy_number_conversion() {
++    for port in ["-1", "65536", "4.5", "not-a-port", "null"] {
++        let text = format!("listeners:\n  - name: test\n    type: vless\n    port: {port}\n    users: [placeholder]\n");
++        assert!(vp_config::parse(&text, Format::Yaml).is_err(), "{port}");
++    }
++}
++
++#[test]
++fn tls_cannot_be_accepted_then_silently_discarded() {
++    for extra in ["    cert: cert.pem\n", "    key: key.pem\n", "    cert: cert.pem\n    key: key.pem\n"] {
++        let cfg = parse_listener(extra);
++        let errors = vp_config::validate::validate(&cfg).unwrap_err();
++        assert!(errors.iter().any(|e| e.contains("cert/key")));
++    }
++}
++
++#[test]
++fn unsupported_type_empty_credentials_and_irrelevant_cipher_fail() {
++    let mut cfg = parse_listener("");
++    cfg.listeners[0].kind = "tuic".to_string();
++    assert!(vp_config::validate::validate(&cfg).is_err());
++    cfg.listeners[0].kind = "vless".to_string();
++    cfg.listeners[0].users = vec![String::new()];
++    assert!(vp_config::validate::validate(&cfg).is_err());
++    cfg.listeners[0].users = vec!["00000000-0000-0000-0000-000000000001".to_string()];
++    cfg.listeners[0].cipher = Some("aes-128-gcm".to_string());
++    assert!(vp_config::validate::validate(&cfg).is_err());
++}
++
++#[test]
++fn duplicate_names_and_top_level_port_conflicts_fail() {
++    let mut cfg = parse_listener("");
++    cfg.listeners.push(cfg.listeners[0].clone());
++    assert!(vp_config::validate::validate(&cfg).is_err());
++    cfg.listeners.pop();
++    cfg.listeners[0].port = 30001;
++    cfg.mixed_port = Some(30001);
++    assert!(vp_config::validate::validate(&cfg).is_err());
++}
++
++#[test]
++fn malformed_uuid_fails_construction_without_bind() {
++    let mut cfg = parse_listener("");
++    cfg.listeners[0].users = vec!["not-a-uuid".to_string()];
++    assert!(build_listener(&cfg.listeners[0], "127.0.0.1").is_err());
++}
++
++struct NoForward;
++#[async_trait]
++impl Router for NoForward {
++    async fn pick(&self, _session: &Session) -> Resolution {
++        panic!("negative startup tests must not forward traffic")
++    }
++}
++fn context() -> InboundCtx {
++    InboundCtx {
++        router: Arc::new(NoForward),
++        stats: Arc::new(Stats::default()),
++        conns: Arc::new(ConnTable::new()),
++    }
++}
++
++#[tokio::test]
++async fn occupied_loopback_port_does_not_report_success() {
++    let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let mut cfg = parse_listener("");
++    cfg.listeners[0].port = occupied.local_addr().unwrap().port();
++    let listener = build_listener(&cfg.listeners[0], "127.0.0.1").unwrap();
++    assert!(start_protocol_listeners(vec![listener], context()).await.is_err());
++}
++
++struct ScriptedInbound {
++    calls: Arc<AtomicUsize>,
++    fail: bool,
++}
++#[async_trait]
++impl vp_core::Inbound for ScriptedInbound {
++    fn tag(&self) -> &str { "scripted" }
++    async fn start(self: Arc<Self>, _ctx: InboundCtx) -> Result<u16> {
++        self.calls.fetch_add(1, Ordering::SeqCst);
++        if self.fail { Err(Error::Unsupported("injected startup failure".into())) } else { Ok(1234) }
++    }
++}
++#[tokio::test]
++async fn partial_start_is_an_error_and_later_listeners_are_not_started() {
++    let calls = Arc::new(AtomicUsize::new(0));
++    let listeners: Vec<Arc<dyn vp_core::Inbound>> = [false, true, false].iter().map(|fail| {
++        Arc::new(ScriptedInbound { calls: calls.clone(), fail: *fail }) as Arc<dyn vp_core::Inbound>
++    }).collect();
++    assert!(start_protocol_listeners(listeners, context()).await.is_err());
++    assert_eq!(calls.load(Ordering::SeqCst), 2);
++    // Intentionally does NOT assert rollback: Inbound has no cancellation handle yet.
++}
+diff --git a/crates/vp-config/src/model.rs b/crates/vp-config/src/model.rs
+index 30db3220e87cb5f5c613a2e45b8b5ad89078f5ea..468076b4b7bed9800c12442860e9ddfbaf174ae9 100644
+--- a/crates/vp-config/src/model.rs
++++ b/crates/vp-config/src/model.rs
+@@ -234,15 +234,14 @@ pub struct TuningConfig {
+     pub tcp_keepalive_secs: Option<u64>,
+ }
+ 
+-/// 服务端入站定义（M1：trojan/vmess/vless/ss，TLS 证书项随 M3 补）
++/// 服务端入站定义。未实现的安全/传输选项必须明确拒绝，不能忽略。
+ #[derive(Debug, Clone, Deserialize)]
++#[serde(deny_unknown_fields)]
+ pub struct ListenerCfg {
+     pub name: String,
+     /// trojan / vmess / vless / ss
+     #[serde(rename = "type")]
+     pub kind: String,
+-    #[serde(default)]
+-    #[serde(deserialize_with = "de_u16_lenient")]
+     pub port: u16,
+     /// trojan: 密码列表；vmess/vless: uuid 列表；ss: 单密码
+     #[serde(default)]
+@@ -250,7 +249,7 @@ pub struct ListenerCfg {
+     /// ss 加密方式
+     #[serde(default)]
+     pub cipher: Option<String>,
+-    /// TLS 证书 PEM 路径（可选；提供则套 TLS）
++    /// 保留字段：当前工厂未接 TLS，配置后校验明确失败。
+     #[serde(default)]
+     pub cert: Option<String>,
+     #[serde(default)]
+@@ -263,7 +262,17 @@ pub struct ListenerCfg {
+         alias = "shadow_tls_opts",
+         default
+     )]
+-    pub shadow_tls: Option<ShadowTlsCfg>,
++    pub shadow_tls: Option<ListenerShadowTlsCfg>,
++}
++
++/// Listener-only strict schema; outbound ShadowTlsCfg compatibility is unchanged.
++#[derive(Debug, Clone, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct ListenerShadowTlsCfg {
++    pub host: Option<String>,
++    pub password: Option<String>,
++    pub port: Option<u16>,
++    pub version: Option<u32>,
+ }
+ 
+ /// TUN 配置段（Clash 风格）
+diff --git a/crates/vp-config/src/validate.rs b/crates/vp-config/src/validate.rs
+index aee5083f48f59d4f675dafff6d7d2d68d4707d8d..9d074b3364d524332b00dee6af5a5b675a00bb58 100644
+--- a/crates/vp-config/src/validate.rs
++++ b/crates/vp-config/src/validate.rs
+@@ -25,6 +25,52 @@ pub fn validate(cfg: &Config) -> Result<(), Vec<String>> {
+         }
+     }
+ 
++    // Listener validation runs before App can perform IO or start any listener.
++    // This is a source-reachable capability gate, NOT interoperability certification.
++    let mut listener_names: HashSet<&str> = HashSet::new();
++    for (i, listener) in cfg.listeners.iter().enumerate() {
++        let field = format!("listeners[{i}]");
++        if listener.name.trim().is_empty() || !listener_names.insert(&listener.name) {
++            errs.push(format!("{field}.name must be non-empty and unique"));
++        }
++        if matches!(listener.name.as_str(), "mixed" | "http" | "socks5" | "redir" | "tproxy" | "tun") {
++            errs.push(format!("{field}.name is reserved for a built-in inbound"));
++        }
++        if !matches!(listener.kind.as_str(), "trojan" | "vmess" | "vless" | "anytls" | "mieru" | "brook" | "snell" | "naive" | "ss") {
++            errs.push(format!("{field}.type is unsupported by this listener factory"));
++        }
++        // Port 0 remains explicitly supported for isolated ephemeral-port tests.
++        if listener.port != 0 {
++            if ports.iter().any(|(port, _)| *port == listener.port) {
++                errs.push(format!("{field}.port conflicts with another inbound"));
++            }
++            ports.push((listener.port, &listener.name));
++        }
++        if listener.users.is_empty() || listener.users.iter().any(|user| user.trim().is_empty()) {
++            errs.push(format!("{field}.users must contain non-empty credentials"));
++        }
++        if listener.kind == "ss" && listener.users.len() != 1 {
++            errs.push(format!("{field}.users: ss supports exactly one credential"));
++        }
++        if listener.cert.is_some() || listener.key.is_some() {
++            errs.push(format!("{field}: cert/key are unsupported; TLS must not be silently omitted"));
++        }
++        if listener.kind != "ss" && (listener.cipher.is_some() || listener.shadow_tls.is_some()) {
++            errs.push(format!("{field}: cipher/shadow_tls are only supported on ss listeners"));
++        }
++        if let Some(shadow) = &listener.shadow_tls {
++            if shadow.version.is_some_and(|v| v != 3) {
++                errs.push(format!("{field}.shadow_tls.version: only version 3 is implemented"));
++            }
++            if shadow.host.as_deref().is_none_or(|v| v.trim().is_empty())
++                || shadow.password.as_deref().is_none_or(|v| v.trim().is_empty())
++                || shadow.port == Some(0)
++            {
++                errs.push(format!("{field}.shadow_tls requires host/password and a nonzero port"));
++            }
++        }
++    }
++
+     // 2. 节点命名
+     let mut names: HashSet<&str> = HashSet::new();
+     for (i, p) in cfg.proxies.iter().enumerate() {

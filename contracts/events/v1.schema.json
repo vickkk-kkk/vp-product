@@ -1,0 +1,6 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.vp.invalid/events/v1.schema.json",
+  "title": "VP runtime event v1",
+  "$ref": "../schema/v1.schema.json#/$defs/RuntimeEvent"
+}

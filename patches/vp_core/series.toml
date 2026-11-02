@@ -1,0 +1,242 @@
+schema_version = 1
+upstream_repository = "https://github.com/mateo-ki/vp_core.git"
+
+[[patch]]
+id = "P01-fail-closed-listener-startup"
+path = "patches/vp_core/0001-fail-closed-listener-startup.patch"
+origin = "Independently authored product integration patch; not copied from benchmark installer"
+reason = "Reject unsupported/ignored listener fields and propagate construction/bind failures rather than silently report successful partial configuration"
+work_packages = ["WP02", "P01"]
+acceptance_ids = ["ACC-UPG-002", "ACC-COR-003"]
+source_tests = ["vp-app::listener_startup_tests", "vp-config::validate::tests"]
+execution_status = "Rust 1.88.0 final merged App26 passed, including strict listener8 and ManagedApp5; not independent certification"
+remove_when = "Pinned upstream has equivalent fail-closed parsing, preflight and startup failure behavior; independently rerun negative tests before removing"
+limitations = ["No runtime readiness/health certification", "No new TLS/transport/QUIC/REALITY protocol support", "No independent protocol interoperability evidence"]
+
+[[patch]]
+id = "P09-managed-async-lifecycle"
+path = "patches/vp_core/0002-managed-async-lifecycle.patch"
+origin = "Independently authored product lifecycle integration"
+reason = "Own listener/background/connection tasks; stop ingress, bound drain and cancellation; cleanup partial starts; observe accept task lifetime rather than infer readiness from App existence"
+work_packages = ["WP02", "P09"]
+acceptance_ids = ["ACC-UPG-002", "ACC-TXN-005"]
+source_tests = ["vp-core::task_scope::tests", "vp-core::tunnel::tests", "vp-app::managed::tests"]
+execution_status = "Rust 1.88.0 final merged core20 and App26 passed; root adapter9+real worker13 passed; no protocol/OS certification"
+remove_when = "Upstream supplies equivalent scoped lifecycle plus cancel-safe/flush-correct relay and passes lifecycle+independent protocol regression suites"
+limitations = ["Legacy unmanaged App callers retain legacy lifetime; product uses ManagedApp", "Blocking/library tasks require owning worker process exit as final containment", "TUIC/Hy2 wrapper adoption is a separate protocol-worker patch", "Readiness is bound+live accept tasks, not forwarding/authentication certification", "TUN is compile-only and current worker config forbids TUN/system settings"]
+
+[[patch]]
+id = "P10-quic-authentication-and-lifecycle"
+path = "patches/vp_core/0003-quic-authentication-and-lifecycle.patch"
+origin = "Independently authored TUIC/Hy2 security worker d45c0a8948997770c31e9195ff492c77ce78cf74"
+reason = "Authenticate before destination IO; bound parser/session/UDP resources; repair framing; own connection/task cleanup with managed graceful drain"
+work_packages = ["WP04", "P03", "P09"]
+acceptance_ids = ["ACC-SEC-001", "ACC-COR-003", "ACC-COR-004"]
+source_tests = ["vp-protocol::quic_auth_negative", "vp-protocol::tuic::tests", "vp-protocol::hysteria2::tests"]
+execution_status = "8deb merged auth/lifecycle18 passed; b739 TUIC6 and official-library19 pass via patches8/16; full reference CLI remains netlink blocked"
+remove_when = "Pinned upstream supplies equivalent auth/resource/lifecycle gates and independently passes raw negative plus reference interop regressions"
+limitations = ["Independent library evidence is recorded by patch8; full CLI remains blocked", "No factory enablement or certification implied", "Obfuscation/custom QUIC policies and mixed-family association-port identity remain explicit gaps", "Existing DirectOutbound routing behavior unchanged"]
+
+[[patch]]
+id = "P04-shadowsocks-standards-and-session-lifecycle"
+path = "patches/vp_core/0004-shadowsocks-wire-and-managed-sessions.patch"
+origin = "Independent SS worker f90155a65afab22973396149f67b78759dce8771"
+reason = "Repair all seven cipher codecs, anti-replay and mixed-family UDP session identity; own bounded server tasks"
+work_packages = ["WP04", "P04", "P09"]
+acceptance_ids = ["ACC-COR-003", "ACC-COR-004"]
+source_tests = ["vp-protocol::ss_standard", "vp-protocol::ss_managed", "vp-crypto::ss::tests"]
+execution_status = "8deb merged standard10, managed3 and independent all7-cipher matrix2 pass; author final68 pass/2 unrelated fixture ignores recorded by patch11"
+remove_when = "Upstream passes seven-cipher independent TCP/UDP plus replay/security/lifecycle regression matrix"
+limitations = ["Self tests are not independent certification", "Idle UDP work is forcibly canceled at configured drain deadline"]
+
+[[patch]]
+id = "P05-reality-boundary-and-vision-rejection"
+path = "patches/vp_core/0005-reality-boundary-and-vision-fail-closed.patch"
+origin = "Independent REALITY worker commits 1c24e3d and 8ce4fd8"
+reason = "Reject unimplemented Vision rather than silently using incompatible encoding; establish test-only authenticated REALITY rustls boundary"
+work_packages = ["WP04", "P05"]
+acceptance_ids = ["ACC-COR-003"]
+source_tests = ["vp-protocol::vless_vision::tests", "vp-transport::reality_rustls_boundary"]
+execution_status = "Final merged test-only REALITY boundary10 passed; no production REALITY acceptance"
+remove_when = "Pinned upstream has full interoperable REALITY and Vision implementation and independent negative/positive evidence"
+limitations = ["No production REALITY server enabled", "No target-flight camouflage or Vision bypass", "All mandatory REALITY/Vision presets remain blocked, not removed"]
+
+[[patch]]
+id = "P02-server-stream-transports"
+path = "patches/vp_core/0006-server-stream-transports.patch"
+origin = "Independent transport worker 920db136d5e40a0dc2195ddb4db933f2d6d66a4e; Cargo.lock context rebased over SS edge without dependency changes"
+reason = "Compose bounded TLS, WebSocket, HTTPUpgrade and H2 server streams with authenticated protocol handlers and managed drain"
+work_packages = ["WP04", "P02", "P09"]
+acceptance_ids = ["ACC-COR-003", "ACC-COR-004"]
+source_tests = ["vp-transport::server_transports", "vp-protocol::server_transport_composition"]
+execution_status = "Final merged server transports14 and composed protocol8 passed; no independent peer certification"
+remove_when = "Upstream supplies equivalent bounded server carriers and full independent positive/negative transport matrix"
+limitations = ["App factory/product compiler wiring is separate", "No plain HTTP, QUIC, gRPC or REALITY network aliases", "Same-codec VMess vectors are not independent interoperability proof"]
+
+[[patch]]
+id = "P09-managed-destination-authority"
+path = "patches/vp_core/0007-managed-loopback-destination-authority.patch"
+origin = "Independent integration hardening; raw protocol DirectOutbound bypasses generic routing"
+reason = "Enforce explicit managed task-scope destination authority before DNS/socket IO; worker permits loopback IPs only; deny domains and nonloopback IPs even on direct protocol paths"
+work_packages = ["WP02", "P09"]
+acceptance_ids = ["ACC-SEC-001", "ACC-COR-003"]
+source_tests = ["vp-core::task_scope::destination_tests", "vp-product-core-adapter::authenticated_vless_cannot_bypass_worker_destination_policy"]
+execution_status = "Final merged core20 and root worker13 passed, including authenticated VLESS destination-policy regression"
+remove_when = "Upstream supplies explicit per-generation egress policy enforced across all inbound TCP/UDP implementations before DNS or socket action"
+limitations = ["Legacy unmanaged callers default unrestricted", "Current worker intentionally rejects all domain destinations including localhost", "This is a constrained loopback execution authority, not complete product routing implementation"]
+
+[[patch]]
+id = "P10-quic-reference-library-explicit-trust"
+path = "patches/vp_core/0008-quic-reference-library-and-explicit-trust.patch"
+origin = "Independent QUIC worker 41f39d2ecb19f1f653d98a2fc84e20cedc867a4b atop cae3875"
+reason = "Add per-instance custom trust roots without insecure fallback and bidirectional pinned official protocol-library peer tests"
+work_packages = ["WP04", "P03"]
+acceptance_ids = ["ACC-COR-003", "ACC-COR-004", "ACC-SEC-001"]
+source_tests = ["vp-protocol::quic_library_interop", "vp-protocol::quic_auth_negative"]
+execution_status = "Merged b739 all19 independent-library trust/auth/bidirectional cases pass; full CLI remains netlink blocked"
+remove_when = "Upstream supplies equivalent explicit trust-root API and full bidirectional independent positive/negative interoperability evidence"
+limitations = ["Go reference is test-only, absent from production dependencies/artifacts", "Official library evidence is not full sing-box CLI evidence", "All public release capabilities remain blocked pending complete acceptance"]
+
+[[patch]]
+id = "P05-utls-inner-plaintext-correction"
+path = "patches/vp_core/0009-utls-inner-plaintext-padding.patch"
+origin = "Independent REALITY worker 4907383f1e8bfd7ee45e47dafca3480ee4772452"
+reason = "Parse TLSInnerPlaintext content/type/trailing padding without corrupting legitimate trailing zero payload or close_notify"
+work_packages = ["WP04", "P05"]
+acceptance_ids = ["ACC-COR-003"]
+source_tests = ["vp-transport::utls::tests"]
+execution_status = "Author two focused vectors and8deb merged transport49 plus experimental10 pass; no current full transport rerun after unrelated patches14-16"
+remove_when = "Upstream preserves trailing zero payload and validates inner content type according to RFC8446 with equivalent regression vectors"
+limitations = ["Record correctness does not establish full REALITY/Vision interoperability"]
+
+[[patch]]
+id = "P05-experimental-authenticated-reality-boundary"
+path = "patches/vp_core/0010-experimental-authenticated-reality-server.patch"
+origin = "Independent REALITY worker bffdf280b7335689813966d915eaf08697a0a961; lib.rs context rebased over server module export"
+reason = "Provide default-disabled bounded authenticated-only REALITY TLS experiment while keeping camouflage/Vision presets explicitly unavailable"
+work_packages = ["WP04", "P05"]
+acceptance_ids = ["ACC-COR-003", "ACC-SEC-001"]
+source_tests = ["vp-transport::reality_server::tests", "vp-transport::reality_experimental_server", "vp-transport::reality_rustls_boundary"]
+execution_status = "Author selected35 unit, experimental10 and boundary10 pass;8deb merged transport49/experimental10/boundary10 pass; production feature remains default-disabled"
+remove_when = "Upstream has equivalent bounded authentication implementation and complete independently tested camouflage and Vision support"
+limitations = ["Feature experimental-reality-server disabled by default", "No App factory or product compiler activation", "No fallback target/camouflage or Vision bypass", "Root optional dependency feature graph awaits separate validation", "No full REALITY preset certification"]
+
+[[patch]]
+id = "P04-shadowsocks-independent-library-peer"
+path = "patches/vp_core/0011-shadowsocks-independent-library-peer.patch"
+origin = "Independent SS worker 2a15e3fe0ee4870a1036f78adf5efd96e01ceda7 atop cae3875; exactly six test/doc files"
+reason = "Exercise seven-cipher bidirectional TCP/UDP interoperability against pinned unmodified official protocol libraries rather than same-codec echo alone"
+work_packages = ["WP04", "P04"]
+acceptance_ids = ["ACC-COR-003", "ACC-COR-004", "ACC-SEC-001"]
+source_tests = ["vp-protocol::ss_library_interop", "vp-protocol::ss_standard", "vp-protocol::ss_managed"]
+execution_status = "Author68 passed/2 unrelated historical VMess fixture ignores;8deb merged independent2(all7 cipher bidirectional matrices), standard10 and managed3 pass"
+remove_when = "Upstream independently passes all seven cipher TCP/UDP positive, tamper, replay, timestamp, mobility and lifecycle regressions"
+limitations = ["Reference Go code is test-only and absent from production dependencies/artifacts", "Official protocol-library results do not certify full sing-box CLI startup", "No release/public capability certification inferred from this bounded matrix"]
+
+[[patch]]
+id = "P11-mobile-host-network-and-tun-ownership"
+path = "patches/vp_core/0012-mobile-host-network-and-tun-ownership.patch"
+origin = "Preliminary mobile owner 288465da28931ea347ad771a7432ca53c8236f25 plus f4d3abd UDP byte observations atop cae3875; QUIC dial hunks rebased preserving patch8 explicit trust and SNI"
+reason = "Introduce per-generation protected socket authority, explicit mobile DNS and TUN ownership APIs; reject configured SOCKS authentication downgrade"
+work_packages = ["WP11", "P09"]
+acceptance_ids = ["ACC-SEC-001", "ACC-TXN-005"]
+source_tests = ["vp-core::host_network::tests", "vp-product-core-adapter mobile ABI tests"]
+execution_status = "8deb core24 includes protected-host3; b739 mobile20, contracts9, managed worker13, mobile-only contracts9 pass; host C ABI and Android crossbuild pass, actual guest acceptance pending"
+remove_when = "Upstream provides equivalent per-generation protected sockets, explicit mobile DNS, owned TUN startup/cleanup and actual platform lifecycle proof"
+limitations = ["Android packet/protect/revoke/FD and all protocol socket paths need actual platform verification", "No readiness inferred from possession of TUN FD", "Mobile FFI/host integration owned by separate product adapter modules"]
+
+[[patch]]
+id = "P09-reject-chained-udp-route-bypass"
+path = "patches/vp_core/0013-reject-unsupported-chained-udp.patch"
+origin = "Independent stream UDP worker 2f89852 atop 74f4c88"
+reason = "ChainedOutbound previously delegated UDP directly to inner and silently bypassed configured dialer; reject until a genuine packet-over-dialer interface is implemented"
+work_packages = ["WP04", "P09"]
+acceptance_ids = ["ACC-SEC-001", "ACC-COR-003"]
+source_tests = ["vp-core::outbound::tests::chained_udp_is_rejected_without_invoking_inner_or_dialer"]
+execution_status = "8deb merged core24 includes chained UDP no-delegation regression; current b739 adapter/runtime compilation pass"
+remove_when = "Upstream provides real chained packet transport and proves neither hop is silently bypassed with independent TCP/UDP route tests"
+limitations = ["Chained UDP is explicitly unsupported, not certified or silently approximated"]
+
+[[patch]]
+id = "P04-stream-framing-and-partial-io-corrections"
+path = "patches/vp_core/0014-stream-framing-and-partial-io-corrections.patch"
+origin = "Independent stream protocol worker 850d4d52bc6b1ef0d2478d3f198e1a3c2bbd8035"
+reason = "Correct VMess request/security-none/response/chunk framing, replay and nonce exhaustion; preserve VLESS/VMess partial IO rather than duplicate or drop bytes"
+work_packages = ["WP04"]
+acceptance_ids = ["ACC-COR-003", "ACC-COR-004", "ACC-SEC-001"]
+source_tests = ["vp-protocol::vless::tests", "vp-protocol::vmess::tests", "vp-protocol::stream_library_interop"]
+execution_status = "Final combined author tree with next patch passed24 focused/composition,4local,2independent matrix; intermediate framing-only commit not separately compiled; merged execution pending"
+remove_when = "Upstream independently passes canonical VMess/VLESS framing, partial IO, replay and stream-carrier regressions with exact reference identities"
+limitations = ["No legacy alterId/authenticated-length/mux/Vision approximation", "No public capability promotion or complete routing-policy claim"]
+
+[[patch]]
+id = "P04-bounded-stream-protocol-udp"
+path = "patches/vp_core/0015-stream-protocol-udp-and-independent-peer.patch"
+origin = "Independent stream protocol worker aa800267b51e0870bde831162f2b7ef3427b059c"
+reason = "Implement bounded authenticated VLESS/VMess/Trojan command-UDP over configured proxy streams, protected socket/DNS authority and independent official-library peer matrices"
+work_packages = ["WP04", "WP11", "P09"]
+acceptance_ids = ["ACC-COR-003", "ACC-COR-004", "ACC-SEC-001"]
+source_tests = ["vp-protocol::stream_udp", "vp-protocol::stream_library_interop", "vp-protocol::stream_inbound::tests"]
+execution_status = "Author final combined tree24focused/composition+4local+2independent matrix passed; exact static merged tree equals author tree; b739 root adapter20+contracts9+worker13 pass; current merged affected stream suites and actual platform acceptance pending"
+remove_when = "Upstream provides bounded owned packet sessions and independently passes bidirectional TCP/UDP security, lifecycle and carrier regression matrices"
+limitations = ["Go peer is test-only, never production dependency/artifact", "Official VMess UDP independent acceptance bounded to15000bytes; larger same-engine tests are not independent proof", "No XUDP/packetaddr/mux or REALITY/Vision claim", "Raw server backend still bypasses generic Router but checks explicit task-scope destination authority before DNS/socket", "Full carrier/Android packet acceptance remains separate"]
+
+[[patch]]
+id = "P11-protect-tuic-reply-domain-dns"
+path = "patches/vp_core/0016-protect-tuic-reply-domain-dns.patch"
+origin = "Mobile host owner 6c3840a6e4b16b0d0cd11f4c0f95fbef298d8245; exact exported patch"
+reason = "Peer-supplied TUIC UDP reply domain must use scoped protected DNS rather than operating-system lookup"
+work_packages = ["WP02", "P11"]
+acceptance_ids = ["ACC-SEC-001", "ACC-UPG-002"]
+source_tests = ["vp-protocol::tuic::tests::udp_reply_domain_uses_protected_dns_and_denial_sends_nothing", "vp-protocol::quic_library_interop"]
+execution_status = "Merged b739844 TUIC6 including protected DNS denial and all19 independent QUIC-library trust/auth/interoperability cases pass; platform relink pending"
+remove_when = "Upstream routes this client-reachable helper through equivalent host DNS authority with denial-before-send regression"
+limitations = ["Socket protection is not proof of DNS privacy or user-DNS routing policy", "No public capability or platform certification implied"]
+
+[[patch]]
+id = "P11-proxy-user-dns-endpoint-bootstrap"
+path = "patches/vp_core/0017-proxy-user-dns-and-endpoint-bootstrap.patch"
+origin = "DNS worker ddf05a3a464b9891afd0d62f70f652ed14371e0d; exact exported patch"
+reason = "Separate configured endpoint bootstrap from selected-proxy TCP/UDP user DNS with bounded correlated replies and no direct fallback"
+work_packages = ["WP02", "P11"]
+acceptance_ids = ["ACC-SEC-001", "ACC-UPG-002"]
+source_tests = ["vp-tun::user_dns::tests", "vp-tun::proxy_dns", "vp-dns::bootstrap_policy_tests", "vp-core::host_network::dns_policy_tests"]
+execution_status = "Author candidate named tests passed; integrated source/binary freshness and atomic DNS2 consumer gate pending"
+remove_when = "Upstream supplies equivalent endpoint-only bootstrap, no-direct user-DNS policy, bounded wire correlation, and full protocol/native regression"
+limitations = ["Underlying ipstack ingress queues remain unbounded", "4096-byte and128-record DNS bounds", "Bootstrap hostname query currently A-only", "No full platform or release certification inferred"]
+
+[[patch]]
+id = "P09-router-selected-server-egress"
+path = "patches/vp_core/0018-router-selected-server-egress.patch"
+origin = "Routing owner a3067f7d8469989b85917f4f61f5c32f2e40b562; exact exported patch"
+reason = "Honor actual Router policy for authenticated raw TCP/UDP server traffic with bounded route-aware associations and no silent direct fallback"
+work_packages = ["WP02", "P09"]
+acceptance_ids = ["ACC-SEC-001", "ACC-COR-003", "ACC-COR-004"]
+source_tests = ["vp-protocol::server_route::tests", "vp-protocol::server_routing", "vp-router::tests", "vp-protocol::quic_library_interop", "vp-protocol::ss_library_interop", "vp-protocol::stream_library_interop"]
+execution_status = "Exact author source/binaries before-after matched;236 passed/2 deliberate external probes ignored; integrated combined pin pending"
+remove_when = "Upstream routes all supported server paths through equivalent selected outbound, metadata and bounded lifecycle semantics and passes independent regressions"
+limitations = ["Server UDP domain resolution follows Router selection locally; not proxy-side destination DNS privacy", "Existing connections retain connect-time TCP decision", "Raw reserved UoT marker is rejected explicitly; no unsupported bridge approximation", "Public capability and full platform acceptance remain separate"]
+
+[[patch]]
+id = "P01-uuid-byte-parsing-error-redaction"
+path = "patches/vp_core/0019-uuid-byte-parsing-and-error-redaction.patch"
+origin = "Integration owner5cacc516c5647b57fca4d460481abebfaf635cfb; exact exported patch"
+reason = "Reject non-ASCII credential UUID bytes without UTF-8 slicing panic or credential echo in errors"
+work_packages = ["WP02", "P01"]
+acceptance_ids = ["ACC-SEC-001", "ACC-UPG-002"]
+source_tests = ["vp-crypto::vmess_kdf::tests::uuid_parse", "vp-crypto::vmess_kdf::tests::uuid_parse_ascii_forms_and_unicode_are_bounded_and_redacted"]
+execution_status = "Fresh isolated exact source2 named UUID tests passed with binary/source hashes before-after; integrated candidate pending"
+remove_when = "Upstream has equivalent panic-free ASCII parsing and redacted errors with the Unicode regression"
+limitations = ["Retains upstream acceptance of hyphens interspersed with32hex digits", "Mobile canonical/compact format validation is additionally stricter"]
+
+[[patch]]
+id = "P09-authenticated-shadowsocks-uot-routing"
+path = "patches/vp_core/0020-authenticated-shadowsocks-uot-routing.patch"
+origin = "Integration owner 6a900b99bf96babe34b758c06bc9320ab4497535; exact private tested source patch"
+reason = "Restore real authenticated SS UoT v1 with per-datagram Router policy; fix silently ignored kebab flag and retain positive App gate"
+work_packages = ["WP02", "P09"]
+acceptance_ids = ["ACC-SEC-001", "ACC-COR-003", "ACC-COR-004"]
+source_tests = ["vp-app::tests::uot_ss_e2e", "vp-app::tests::rule_provider_online_fetch_and_refresh", "vp-config::tests::udp_over_tcp_kebab_and_underscore_are_not_silently_ignored", "vp-protocol::server_routing", "vp-protocol::uot::tests"]
+execution_status = "Final private routing6/UoT6 passed with exact source/binary before-after; full generated pin rerun pending"
+remove_when = "Upstream has authenticated bounded SS UoT with equivalent per-target policy/metadata, reserved-name handling and positive real encapsulation tests"
+limitations = ["UoT v1 only; v2 rejected", "Only SS raw ingress gains this bridge; other raw ingress still rejects reserved control names", "ASCII case normalization follows existing SOCKS decoder; trailing-root variants are reserved but not accepted as v1", "Same-engine UoT regression is not independent UoT certification", "Server target-domain DNS after selection remains local, not proxy-side DNS privacy"]

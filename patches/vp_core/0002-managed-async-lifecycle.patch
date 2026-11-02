@@ -1,0 +1,2489 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 2e6047d05c9e7f05c85c7f4c8ca92d4165b8c013..0f38731085b6b101e2670afb9ac820aa12e03e3c 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2724,6 +2724,7 @@ dependencies = [
+  "tracing",
+  "vp-common",
+  "vp-config",
++ "vp-core",
+  "vp-rule",
+  "webpki-roots 0.26.11",
+ ]
+diff --git a/crates/vp-app/src/api.rs b/crates/vp-app/src/api.rs
+index 0b60e47488bac5d378997b043e38c7fc00a10b47..fe7e75d473e12436b49b35ebb8052dc0ffc814b2 100644
+--- a/crates/vp-app/src/api.rs
++++ b/crates/vp-app/src/api.rs
+@@ -21,7 +21,7 @@ pub struct ApiState {
+ 
+ /// 监听已建立的 controller：启动 accept 循环（同步返回，切断类型环）
+ pub fn spawn_on(listener: TcpListener, state: Arc<ApiState>) {
+-    tokio::spawn(accept_loop(listener, state));
++    vp_core::task_scope::spawn(accept_loop(listener, state));
+ }
+ 
+ async fn accept_loop(listener: TcpListener, st: Arc<ApiState>) {
+@@ -29,7 +29,7 @@ async fn accept_loop(listener: TcpListener, st: Arc<ApiState>) {
+         match listener.accept().await {
+             Ok((stream, _)) => {
+                 let st = st.clone();
+-                tokio::spawn(async move {
++                vp_core::task_scope::spawn(async move {
+                     if let Err(e) = serve(stream, &st).await {
+                         let _ = e;
+                     }
+diff --git a/crates/vp-app/src/lib.rs b/crates/vp-app/src/lib.rs
+index 5c784bba235a63dea7f35ed1b893a1db4ca07d35..afea1ed35941d399ee13abab4bc358f4d202d68a 100644
+--- a/crates/vp-app/src/lib.rs
++++ b/crates/vp-app/src/lib.rs
+@@ -1,6 +1,7 @@
+ //! vp-app：应用组装层。配置 → 运行时（出站/组/规则/路由/入站/控制器 API）。
+ 
+ pub mod api;
++pub mod managed;
+ 
+ use std::collections::HashMap;
+ use std::path::{Path, PathBuf};
+@@ -248,11 +249,17 @@ impl App {
+         // Construct every declared protocol listener before global tuning, downloads,
+         // providers or binds. Invalid credentials must not produce a partial start.
+         let bind = if cfg.allow_lan {
+-            if cfg.bind_address == "*" { "0.0.0.0".to_string() } else { cfg.bind_address.clone() }
++            if cfg.bind_address == "*" {
++                "0.0.0.0".to_string()
++            } else {
++                cfg.bind_address.clone()
++            }
+         } else {
+             "127.0.0.1".to_string()
+         };
+-        let prepared_listeners = cfg.listeners.iter()
++        let prepared_listeners = cfg
++            .listeners
++            .iter()
+             .map(|listener| build_listener(listener, &bind))
+             .collect::<Result<Vec<_>>>()?;
+         let t_validate = t_start.elapsed();
+@@ -427,7 +434,7 @@ impl App {
+                         let geoip = geoip.clone();
+                         let asn = asn.clone();
+ 
+-                        tokio::spawn(async move {
++                        vp_core::task_scope::spawn_background(async move {
+                             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                                 interval.max(1),
+                             ));
+@@ -547,7 +554,8 @@ impl App {
+             // Inbound still lacks cancellation: a later failure can leave earlier
+             // spawned tasks alive until the owning runtime exits. P09 is required
+             // before adapter runtime activation; do not claim atomic startup here.
+-            listen_ports.extend(start_protocol_listeners(prepared_listeners, inb_ctx.clone()).await?);
++            listen_ports
++                .extend(start_protocol_listeners(prepared_listeners, inb_ctx.clone()).await?);
+ 
+             // TUN 模式
+             if let Some(tun_cfg) = &cfg.tun {
+@@ -687,7 +695,7 @@ impl App {
+                         });
+                     let app_weak = app_weak.clone();
+ 
+-                    tokio::spawn(async move {
++                    vp_core::task_scope::spawn_background(async move {
+                         let mut ticker =
+                             tokio::time::interval(std::time::Duration::from_secs(interval.max(1)));
+                         ticker.tick().await; // 消耗初始即刻 tick
+@@ -1199,7 +1207,7 @@ rules:
+         // 经 mixed 端口做一次 socks5 CONNECT（目标 127.0.0.1 的临时 echo）
+         let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let echo_port = echo.local_addr().unwrap().port();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn_background(async move {
+             use tokio::io::{AsyncReadExt, AsyncWriteExt};
+             let (mut s, _) = echo.accept().await.unwrap();
+             let mut b = [0u8; 64];
+@@ -1232,7 +1240,7 @@ rules:
+         async fn one_echo() -> u16 {
+             let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+             let p = echo.local_addr().unwrap().port();
+-            tokio::spawn(async move {
++            vp_core::task_scope::spawn_background(async move {
+                 let (mut s, _) = echo.accept().await.unwrap();
+                 let mut b = [0u8; 256];
+                 loop {
+@@ -1336,7 +1344,7 @@ rules:
+         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+         let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let echo_port = echo.local_addr().unwrap().port();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn_background(async move {
+             let (mut s, _) = echo.accept().await.unwrap();
+             let mut b = [0u8; 256];
+             loop {
+@@ -1402,7 +1410,7 @@ rules:
+         // echo
+         let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let echo_port = echo.local_addr().unwrap().port();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn_background(async move {
+             let (mut s, _) = echo.accept().await.unwrap();
+             let mut b = [0u8; 256];
+             loop {
+@@ -1471,7 +1479,7 @@ rules: ['MATCH,DIRECT']
+         // echo 源站
+         let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let echo_port = echo.local_addr().unwrap().port();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn_background(async move {
+             let (mut s, _) = echo.accept().await.unwrap();
+             let mut b = [0u8; 256];
+             loop {
+@@ -1486,7 +1494,7 @@ rules: ['MATCH,DIRECT']
+         // 伪装站 stub：读 ClientHello → 回 TLS1.3 ServerHello + 1 帧伪 appdata
+         let cam = TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let cam_port = cam.local_addr().unwrap().port();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn_background(async move {
+             let (mut s, _) = cam.accept().await.unwrap();
+             let mut hdr = [0u8; 5];
+             s.read_exact(&mut hdr).await.unwrap();
+@@ -1582,7 +1590,7 @@ rules: ['MATCH,DIRECT']
+         // UDP echo 源站
+         let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+         let echo_port = echo.local_addr().unwrap().port();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn_background(async move {
+             let mut b = [0u8; 2048];
+             loop {
+                 if let Ok((n, from)) = echo.recv_from(&mut b).await {
+@@ -1731,13 +1739,13 @@ rules: ['MATCH,PROXY']
+         // 简易 HTTP 服务器：第 1 次返回仅含 google.com；第 2 次返回含 youtube.com
+         let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+         let cc = call_count.clone();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn_background(async move {
+             loop {
+                 let Ok((mut s, _)) = srv.accept().await else {
+                     break;
+                 };
+                 let count = cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+-                tokio::spawn(async move {
++                vp_core::task_scope::spawn_background(async move {
+                     let mut b = [0u8; 1024];
+                     let _ = s.read(&mut b).await;
+                     let body = if count == 0 {
+@@ -1823,13 +1831,13 @@ rules:
+         // 简易 HTTP 订阅服务器：第 1 次返回 HK-01 与 US-01；第 2 次返回 HK-01 与 HK-02
+         let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+         let cc = call_count.clone();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn_background(async move {
+             loop {
+                 let Ok((mut s, _)) = srv.accept().await else {
+                     break;
+                 };
+                 let count = cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+-                tokio::spawn(async move {
++                vp_core::task_scope::spawn_background(async move {
+                     let mut b = [0u8; 1024];
+                     let _ = s.read(&mut b).await;
+                     let body = if count == 0 {
+diff --git a/crates/vp-app/src/managed.rs b/crates/vp-app/src/managed.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..bc3e92a805e2af12edf5e54a4f645e19f2634bc1
+--- /dev/null
++++ b/crates/vp-app/src/managed.rs
+@@ -0,0 +1,239 @@
++//! Managed app startup/stop: all scoped ingress, work and background tasks are
++//! owned by one application generation. Readiness here means bound + live accept
++//! tasks only, not authentication/forwarding/OS tunnel certification.
++use crate::App;
++use std::path::Path;
++use std::sync::Arc;
++use std::time::Duration;
++use vp_common::{Error, Result};
++use vp_core::task_scope::{ShutdownReport, Snapshot, TaskScope};
++
++pub struct ManagedApp {
++    app: Arc<App>,
++    scope: Arc<TaskScope>,
++}
++struct StartupGuard {
++    scope: Arc<TaskScope>,
++    armed: bool,
++}
++impl Drop for StartupGuard {
++    fn drop(&mut self) {
++        if self.armed {
++            self.scope.cancel_all();
++        }
++    }
++}
++impl ManagedApp {
++    pub async fn start(
++        text: &str,
++        format: vp_config::Format,
++        base_dir: &Path,
++        startup_timeout: Duration,
++        cleanup_timeout: Duration,
++    ) -> Result<Self> {
++        Self::start_operation(
++            App::start(text, format, base_dir, true),
++            startup_timeout,
++            cleanup_timeout,
++        )
++        .await
++    }
++    async fn start_operation<F: std::future::Future<Output = Result<Arc<App>>>>(
++        operation: F,
++        startup_timeout: Duration,
++        cleanup_timeout: Duration,
++    ) -> Result<Self> {
++        let scope = TaskScope::new();
++        let mut guard = StartupGuard {
++            scope: scope.clone(),
++            armed: true,
++        };
++        let result = scope
++            .run(tokio::time::timeout(startup_timeout, operation))
++            .await;
++        let app = match result {
++            Ok(Ok(app)) => app,
++            result => {
++                let cleanup = scope.shutdown(Duration::ZERO, cleanup_timeout).await;
++                if cleanup.remaining_tasks != 0 {
++                    return Err(Error::Other("managed startup cleanup timed out".into()));
++                }
++                return match result {
++                    Ok(Err(error)) => Err(error),
++                    _ => Err(Error::Other("managed startup timed out".into())),
++                };
++            }
++        };
++        // Let immediately failing accept tasks publish their exit before ready.
++        tokio::task::yield_now().await;
++        let managed = Self { app, scope };
++        if !managed.listeners_ready() {
++            let _ = managed.shutdown(Duration::ZERO, cleanup_timeout).await;
++            return Err(Error::Other(
++                "declared listener has no live managed accept task".into(),
++            ));
++        }
++        guard.armed = false;
++        Ok(managed)
++    }
++    pub fn app(&self) -> &Arc<App> {
++        &self.app
++    }
++    pub fn task_snapshot(&self) -> Snapshot {
++        self.scope.snapshot()
++    }
++    pub fn listeners_ready(&self) -> bool {
++        let observed = self.scope.snapshot();
++        observed.healthy()
++            && !self.app.listen_ports.is_empty()
++            && self
++                .app
++                .listen_ports
++                .iter()
++                .all(|(tag, _)| observed.listeners.contains(tag))
++    }
++    pub async fn shutdown(
++        &self,
++        drain_timeout: Duration,
++        cleanup_timeout: Duration,
++    ) -> ShutdownReport {
++        self.scope.shutdown(drain_timeout, cleanup_timeout).await
++    }
++}
++impl Drop for ManagedApp {
++    fn drop(&mut self) {
++        self.scope.cancel_all();
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use tokio::io::{AsyncReadExt, AsyncWriteExt};
++    fn config(port: u16) -> String {
++        format!("mixed-port: {port}\nallow-lan: false\nrules: ['MATCH,DIRECT']\n")
++    }
++    async fn start(config: &str) -> Result<ManagedApp> {
++        ManagedApp::start(
++            config,
++            vp_config::Format::Yaml,
++            &std::env::temp_dir(),
++            Duration::from_secs(2),
++            Duration::from_secs(1),
++        )
++        .await
++    }
++    #[tokio::test]
++    async fn ready_then_stop_releases_listening_port() {
++        let app = start(&config(0)).await.unwrap();
++        assert!(app.listeners_ready());
++        let port = app.app().listen_ports[0].1;
++        let report = app
++            .shutdown(Duration::from_millis(50), Duration::from_secs(1))
++            .await;
++        assert_eq!(report.remaining_tasks, 0);
++        assert!(!app.listeners_ready());
++        let _rebound = tokio::net::TcpListener::bind(("127.0.0.1", port))
++            .await
++            .unwrap();
++    }
++    #[tokio::test]
++    async fn partial_bind_failure_cleans_already_started_listener() {
++        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let first = probe.local_addr().unwrap().port();
++        drop(probe);
++        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let config = format!(
++            "mixed-port: {first}\nlisteners:\n - name: failed\n   type: vless\n   port: {}\n   users: [00000000-0000-0000-0000-000000000001]\n",
++            occupied.local_addr().unwrap().port()
++        );
++        assert!(start(&config).await.is_err());
++        let _rebound = tokio::net::TcpListener::bind(("127.0.0.1", first))
++            .await
++            .unwrap();
++    }
++    #[tokio::test]
++    async fn idle_handshake_is_forcibly_closed_after_drain_deadline() {
++        let app = start(&config(0)).await.unwrap();
++        let port = app.app().listen_ports[0].1;
++        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
++            .await
++            .unwrap();
++        client.write_all(&[5]).await.unwrap();
++        // Ensure the accepted connection is registered rather than racing shutdown.
++        tokio::time::timeout(Duration::from_secs(1), async {
++            while app.task_snapshot().work == 0 {
++                tokio::task::yield_now().await;
++            }
++        })
++        .await
++        .unwrap();
++        let report = app
++            .shutdown(Duration::from_millis(10), Duration::from_secs(1))
++            .await;
++        assert!(!report.drained);
++        assert_eq!(report.remaining_tasks, 0);
++        let mut byte = [0];
++        let result = tokio::time::timeout(Duration::from_secs(1), client.read(&mut byte))
++            .await
++            .unwrap();
++        assert!(matches!(result, Ok(0) | Err(_)));
++    }
++    #[tokio::test]
++    async fn drop_aborts_listener_without_explicit_stop() {
++        let app = start(&config(0)).await.unwrap();
++        let port = app.app().listen_ports[0].1;
++        drop(app);
++        tokio::time::timeout(Duration::from_secs(1), async {
++            loop {
++                if tokio::net::TcpListener::bind(("127.0.0.1", port))
++                    .await
++                    .is_ok()
++                {
++                    break;
++                }
++                tokio::task::yield_now().await;
++            }
++        })
++        .await
++        .unwrap();
++    }
++    #[tokio::test]
++    async fn canceled_start_future_releases_already_bound_listener() {
++        let (bound, observed) = tokio::sync::oneshot::channel();
++        let start = tokio::spawn(async move {
++            let operation = async {
++                let app = App::start(
++                    &config(0),
++                    vp_config::Format::Yaml,
++                    &std::env::temp_dir(),
++                    true,
++                )
++                .await?;
++                bound.send(app.listen_ports[0].1).unwrap();
++                // Test-only delayed post-bind initialization under the exact same
++                // production StartupGuard, not a fake running proxy.
++                std::future::pending::<()>().await;
++                Ok(app)
++            };
++            ManagedApp::start_operation(operation, Duration::from_secs(30), Duration::from_secs(1))
++                .await
++        });
++        let port = observed.await.unwrap();
++        start.abort();
++        assert!(matches!(start.await, Err(error) if error.is_cancelled()));
++        tokio::time::timeout(Duration::from_secs(1), async {
++            loop {
++                if tokio::net::TcpListener::bind(("127.0.0.1", port))
++                    .await
++                    .is_ok()
++                {
++                    break;
++                }
++                tokio::task::yield_now().await;
++            }
++        })
++        .await
++        .unwrap();
++    }
++}
+diff --git a/crates/vp-core/src/lib.rs b/crates/vp-core/src/lib.rs
+index 87629f31270a79523be3959b249a446c9c559b0e..ab328fbc9e76cb92c7618bbe7ee259f9184d7a3a 100644
+--- a/crates/vp-core/src/lib.rs
++++ b/crates/vp-core/src/lib.rs
+@@ -10,6 +10,7 @@ pub mod router;
+ pub mod session;
+ pub mod sniff;
+ pub mod stream;
++pub mod task_scope;
+ pub mod tunnel;
+ 
+ pub use conn_table::{ConnMeta, ConnSnapshot, ConnTable};
+diff --git a/crates/vp-core/src/outbound.rs b/crates/vp-core/src/outbound.rs
+index b85a3e36339f732066744e249bf9b923540d7980..bea7b5251f8066df6b8d79dbc1bc44915ab09790 100644
+--- a/crates/vp-core/src/outbound.rs
++++ b/crates/vp-core/src/outbound.rs
+@@ -131,7 +131,7 @@ mod tests {
+             _dst: &DstAddr,
+         ) -> Result<Box<dyn ProxyStream>> {
+             let (mut a, b) = tokio::io::duplex(1024);
+-            tokio::spawn(async move {
++            crate::task_scope::spawn(async move {
+                 let mut buf = [0u8; 4];
+                 a.read_exact(&mut buf).await.unwrap();
+                 a.write_all(b"pong").await.unwrap();
+diff --git a/crates/vp-core/src/sniff.rs b/crates/vp-core/src/sniff.rs
+index 436c39e978211fee42ecd28a112ccf03dbf08a72..7a883d6b23a8665de0c119aff7f7e5dd83f9b09d 100644
+--- a/crates/vp-core/src/sniff.rs
++++ b/crates/vp-core/src/sniff.rs
+@@ -235,7 +235,7 @@ mod tests {
+     #[tokio::test]
+     async fn test_peeked_stream_lossless() {
+         let (mut client, server) = tokio::io::duplex(1024);
+-        let write_task = tokio::spawn(async move {
++        let write_task = crate::task_scope::spawn(async move {
+             client
+                 .write_all(b"GET / HTTP/1.1\r\nHost: example.org\r\n\r\nrest-data")
+                 .await
+diff --git a/crates/vp-core/src/task_scope.rs b/crates/vp-core/src/task_scope.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..ca07a65627af6ca60b60b08e9fbf485fc47f9d7c
+--- /dev/null
++++ b/crates/vp-core/src/task_scope.rs
+@@ -0,0 +1,477 @@
++//! Owned async task lifetime for a managed application generation.
++//!
++//! No global singleton: task-local inheritance follows only tracked spawn calls.
++//! Unmanaged legacy callers retain normal Tokio behavior. External runtime/library
++//! tasks still require their owning runtime to be shut down at the host boundary.
++use std::collections::HashMap;
++use std::future::Future;
++use std::sync::{Arc, Mutex, MutexGuard};
++use std::time::Duration;
++use tokio::sync::Notify;
++use tokio::task::{AbortHandle, JoinHandle};
++
++tokio::task_local! { static CURRENT: Arc<TaskScope>; }
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Phase {
++    Running,
++    Draining,
++    Canceling,
++    Stopped,
++}
++#[derive(Clone, Debug, PartialEq, Eq)]
++enum Role {
++    Listener(String),
++    Work,
++    Background,
++}
++struct Entry {
++    role: Role,
++    abort: AbortHandle,
++}
++struct State {
++    phase: Phase,
++    next: u64,
++    tasks: HashMap<u64, Entry>,
++    panics: u64,
++    unexpected_listener_exits: u64,
++    refused_tasks: u64,
++}
++#[derive(Clone, Debug)]
++pub struct Snapshot {
++    pub phase: Phase,
++    pub listeners: Vec<String>,
++    pub work: usize,
++    pub background: usize,
++    pub panics: u64,
++    pub unexpected_listener_exits: u64,
++    pub refused_tasks: u64,
++}
++impl Snapshot {
++    pub fn task_count(&self) -> usize {
++        self.listeners.len() + self.work + self.background
++    }
++    pub fn healthy(&self) -> bool {
++        self.phase == Phase::Running
++            && self.panics == 0
++            && self.unexpected_listener_exits == 0
++            && self.refused_tasks == 0
++    }
++}
++#[derive(Clone, Debug)]
++pub struct ShutdownReport {
++    pub drained: bool,
++    pub forced_tasks: usize,
++    pub remaining_tasks: usize,
++    pub panics: u64,
++}
++
++pub struct TaskScope {
++    state: Mutex<State>,
++    changed: Notify,
++}
++impl TaskScope {
++    pub fn new() -> Arc<Self> {
++        Arc::new(Self {
++            state: Mutex::new(State {
++                phase: Phase::Running,
++                next: 0,
++                tasks: HashMap::new(),
++                panics: 0,
++                unexpected_listener_exits: 0,
++                refused_tasks: 0,
++            }),
++            changed: Notify::new(),
++        })
++    }
++    fn lock(&self) -> MutexGuard<'_, State> {
++        self.state.lock().unwrap_or_else(|error| error.into_inner())
++    }
++    pub async fn run<F: Future>(self: &Arc<Self>, future: F) -> F::Output {
++        CURRENT.scope(self.clone(), future).await
++    }
++    pub fn snapshot(&self) -> Snapshot {
++        let state = self.lock();
++        let mut snapshot = Snapshot {
++            phase: state.phase,
++            listeners: Vec::new(),
++            work: 0,
++            background: 0,
++            panics: state.panics,
++            unexpected_listener_exits: state.unexpected_listener_exits,
++            refused_tasks: state.refused_tasks,
++        };
++        for entry in state.tasks.values() {
++            match &entry.role {
++                Role::Listener(tag) => snapshot.listeners.push(tag.clone()),
++                Role::Work => snapshot.work += 1,
++                Role::Background => snapshot.background += 1,
++            }
++        }
++        snapshot.listeners.sort();
++        snapshot
++    }
++    fn spawn<F>(self: &Arc<Self>, role: Role, future: F) -> JoinHandle<F::Output>
++    where
++        F: Future + Send + 'static,
++        F::Output: Send + 'static,
++    {
++        let mut state = self.lock();
++        let allowed =
++            state.phase == Phase::Running || (state.phase == Phase::Draining && role == Role::Work);
++        if !allowed || state.next == u64::MAX || state.tasks.len() >= 65_536 {
++            state.refused_tasks = state.refused_tasks.saturating_add(1);
++            // Never poll a refused future, including when a worker runs immediately.
++            let handle = tokio::spawn(async move {
++                drop(future);
++                std::future::pending::<F::Output>().await
++            });
++            handle.abort();
++            return handle;
++        }
++        let id = state.next;
++        state.next += 1;
++        let guard = TaskGuard {
++            scope: self.clone(),
++            id,
++            role: role.clone(),
++        };
++        let scope = self.clone();
++        let handle = tokio::spawn(async move {
++            let _guard = guard; // captured even if canceled before first poll
++            scope.run(future).await
++        });
++        // Keep the lock through registration: completion/cancel cannot race insertion.
++        state.tasks.insert(
++            id,
++            Entry {
++                role,
++                abort: handle.abort_handle(),
++            },
++        );
++        handle
++    }
++    fn spawn_in<F>(
++        self: &Arc<Self>,
++        tasks: &mut tokio::task::JoinSet<F::Output>,
++        future: F,
++    ) -> AbortHandle
++    where
++        F: Future + Send + 'static,
++        F::Output: Send + 'static,
++    {
++        let mut state = self.lock();
++        if !matches!(state.phase, Phase::Running | Phase::Draining)
++            || state.next == u64::MAX
++            || state.tasks.len() >= 65_536
++        {
++            state.refused_tasks = state.refused_tasks.saturating_add(1);
++            let abort = tasks.spawn(async move {
++                drop(future);
++                std::future::pending::<F::Output>().await
++            });
++            abort.abort();
++            return abort;
++        }
++        let id = state.next;
++        state.next += 1;
++        let guard = TaskGuard {
++            scope: self.clone(),
++            id,
++            role: Role::Work,
++        };
++        let scope = self.clone();
++        let abort = tasks.spawn(async move {
++            let _guard = guard;
++            scope.run(future).await
++        });
++        state.tasks.insert(
++            id,
++            Entry {
++                role: Role::Work,
++                abort: abort.clone(),
++            },
++        );
++        abort
++    }
++    pub fn cancel_all(&self) {
++        let mut state = self.lock();
++        if state.phase != Phase::Stopped {
++            state.phase = Phase::Canceling;
++        }
++        for entry in state.tasks.values() {
++            entry.abort.abort();
++        }
++        self.changed.notify_waiters();
++    }
++    fn stop_ingress(&self) {
++        let mut state = self.lock();
++        if state.phase == Phase::Running {
++            state.phase = Phase::Draining;
++        }
++        for entry in state.tasks.values() {
++            if entry.role != Role::Work {
++                entry.abort.abort();
++            }
++        }
++        drop(state);
++        self.changed.notify_waiters();
++    }
++    /// Notify protocol drivers (for example HTTP/2 GOAWAY) before waiting for
++    /// established work to drain. Cancellation also satisfies this notification.
++    pub async fn draining(&self) {
++        loop {
++            let changed = self.changed.notified();
++            tokio::pin!(changed);
++            changed.as_mut().enable();
++            if self.lock().phase != Phase::Running {
++                return;
++            }
++            changed.await;
++        }
++    }
++    async fn wait_empty(&self, timeout: Duration) -> bool {
++        let wait = async {
++            loop {
++                // Register before checking, avoiding completion between check/wait.
++                let changed = self.changed.notified();
++                tokio::pin!(changed);
++                changed.as_mut().enable();
++                if self.lock().tasks.is_empty() {
++                    return;
++                }
++                changed.await;
++            }
++        };
++        tokio::time::timeout(timeout, wait).await.is_ok()
++    }
++    /// Stop accept/background tasks first, give established work a bounded drain,
++    /// then abort remaining tasks and await their destructors within cleanup_timeout.
++    pub async fn shutdown(
++        &self,
++        drain_timeout: Duration,
++        cleanup_timeout: Duration,
++    ) -> ShutdownReport {
++        self.stop_ingress();
++        let drained = self.wait_empty(drain_timeout).await;
++        let forced_tasks = if drained {
++            0
++        } else {
++            self.snapshot().task_count()
++        };
++        self.cancel_all();
++        let _ = self.wait_empty(cleanup_timeout).await;
++        let mut state = self.lock();
++        let remaining_tasks = state.tasks.len();
++        if remaining_tasks == 0 {
++            state.phase = Phase::Stopped;
++        }
++        ShutdownReport {
++            drained,
++            forced_tasks,
++            remaining_tasks,
++            panics: state.panics,
++        }
++    }
++}
++struct TaskGuard {
++    scope: Arc<TaskScope>,
++    id: u64,
++    role: Role,
++}
++impl Drop for TaskGuard {
++    fn drop(&mut self) {
++        let mut state = self.scope.lock();
++        state.tasks.remove(&self.id);
++        if std::thread::panicking() {
++            state.panics = state.panics.saturating_add(1);
++        }
++        if matches!(&self.role, Role::Listener(_)) && state.phase == Phase::Running {
++            state.unexpected_listener_exits = state.unexpected_listener_exits.saturating_add(1);
++        }
++        drop(state);
++        self.scope.changed.notify_waiters();
++    }
++}
++fn spawn_role<F>(role: Role, future: F) -> JoinHandle<F::Output>
++where
++    F: Future + Send + 'static,
++    F::Output: Send + 'static,
++{
++    match CURRENT.try_with(Arc::clone) {
++        Ok(scope) => scope.spawn(role, future),
++        Err(_) => tokio::spawn(future),
++    }
++}
++/// Read-only lifecycle context for protocol-specific graceful shutdown.
++pub fn current_scope() -> Option<Arc<TaskScope>> {
++    CURRENT.try_with(Arc::clone).ok()
++}
++/// Capture at future creation, so JoinSet/custom executors can preserve scope.
++pub fn inherit<F: Future>(future: F) -> impl Future<Output = F::Output> {
++    let scope = CURRENT.try_with(Arc::clone).ok();
++    async move {
++        match scope {
++            Some(scope) => scope.run(future).await,
++            None => future.await,
++        }
++    }
++}
++pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
++where
++    F: Future + Send + 'static,
++    F::Output: Send + 'static,
++{
++    spawn_role(Role::Work, future)
++}
++/// JoinSet ownership plus scope tracking: shutdown observes actual child future
++/// destruction instead of assuming JoinSet::drop has already finished cleanup.
++pub fn spawn_in<F>(tasks: &mut tokio::task::JoinSet<F::Output>, future: F) -> AbortHandle
++where
++    F: Future + Send + 'static,
++    F::Output: Send + 'static,
++{
++    match CURRENT.try_with(Arc::clone) {
++        Ok(scope) => scope.spawn_in(tasks, future),
++        Err(_) => tasks.spawn(future),
++    }
++}
++pub fn spawn_listener<F>(tag: impl Into<String>, future: F) -> JoinHandle<F::Output>
++where
++    F: Future + Send + 'static,
++    F::Output: Send + 'static,
++{
++    spawn_role(Role::Listener(tag.into()), future)
++}
++pub fn spawn_background<F>(future: F) -> JoinHandle<F::Output>
++where
++    F: Future + Send + 'static,
++    F::Output: Send + 'static,
++{
++    spawn_role(Role::Background, future)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::sync::atomic::{AtomicBool, Ordering};
++    #[tokio::test]
++    async fn nested_spawn_inherits_scope_and_is_canceled() {
++        let scope = TaskScope::new();
++        let child_started = Arc::new(Notify::new());
++        let started = child_started.clone();
++        scope
++            .run(async {
++                spawn(async move {
++                    spawn(std::future::pending::<()>());
++                    started.notify_one();
++                    std::future::pending::<()>().await
++                });
++            })
++            .await;
++        child_started.notified().await;
++        assert_eq!(scope.snapshot().work, 2);
++        let result = scope.shutdown(Duration::ZERO, Duration::from_secs(1)).await;
++        assert_eq!(result.remaining_tasks, 0);
++        assert!(result.forced_tasks > 0);
++    }
++    #[tokio::test]
++    async fn canceled_before_first_poll_does_not_leak_registration() {
++        let scope = TaskScope::new();
++        scope
++            .run(async {
++                let handle = spawn(std::future::pending::<()>());
++                handle.abort();
++            })
++            .await;
++        let result = scope.shutdown(Duration::ZERO, Duration::from_secs(1)).await;
++        assert_eq!(result.remaining_tasks, 0);
++    }
++    #[tokio::test]
++    async fn refused_task_is_never_polled() {
++        let scope = TaskScope::new();
++        scope.cancel_all();
++        let polled = Arc::new(AtomicBool::new(false));
++        let flag = polled.clone();
++        let task = scope
++            .run(async {
++                spawn(async move {
++                    flag.store(true, Ordering::SeqCst);
++                })
++            })
++            .await;
++        assert!(task.await.unwrap_err().is_cancelled());
++        assert!(!polled.load(Ordering::SeqCst));
++    }
++    #[tokio::test]
++    async fn drain_allows_existing_work_to_complete() {
++        let scope = TaskScope::new();
++        scope
++            .run(async {
++                spawn(async { tokio::time::sleep(Duration::from_millis(10)).await });
++            })
++            .await;
++        let result = scope
++            .shutdown(Duration::from_secs(1), Duration::from_secs(1))
++            .await;
++        assert!(result.drained);
++        assert_eq!(result.forced_tasks, 0);
++        assert_eq!(result.remaining_tasks, 0);
++    }
++    #[tokio::test]
++    async fn unexpected_listener_exit_is_not_healthy() {
++        let scope = TaskScope::new();
++        scope
++            .run(async {
++                spawn_listener("test", async {}).await.unwrap();
++            })
++            .await;
++        assert!(!scope.snapshot().healthy());
++        assert_eq!(scope.snapshot().unexpected_listener_exits, 1);
++    }
++    #[tokio::test]
++    async fn panicking_task_is_observed_and_registry_is_cleaned() {
++        let scope = TaskScope::new();
++        scope
++            .run(async {
++                assert!(spawn(async { panic!("injected panic") }).await.is_err());
++            })
++            .await;
++        assert_eq!(scope.snapshot().panics, 1);
++        assert_eq!(scope.snapshot().task_count(), 0);
++    }
++    #[tokio::test]
++    async fn joinset_child_cleanup_is_tracked_until_future_drop() {
++        let scope = TaskScope::new();
++        scope
++            .run(async {
++                let mut tasks = tokio::task::JoinSet::new();
++                spawn_in(&mut tasks, std::future::pending::<()>());
++                assert_eq!(scope.snapshot().work, 1);
++                drop(tasks);
++            })
++            .await;
++        let report = scope.shutdown(Duration::ZERO, Duration::from_secs(1)).await;
++        assert_eq!(report.remaining_tasks, 0);
++    }
++    #[tokio::test]
++    async fn protocol_driver_receives_drain_before_forced_cancellation() {
++        let scope = TaskScope::new();
++        scope
++            .run(async {
++                let captured = current_scope().unwrap();
++                spawn(async move {
++                    captured.draining().await;
++                });
++            })
++            .await;
++        let report = scope
++            .shutdown(Duration::from_secs(1), Duration::from_secs(1))
++            .await;
++        assert!(report.drained);
++        assert_eq!(report.forced_tasks, 0);
++        assert_eq!(report.remaining_tasks, 0);
++        // Also returns immediately for a listener registering after drain begins.
++        scope.draining().await;
++    }
++}
+diff --git a/crates/vp-core/src/tunnel.rs b/crates/vp-core/src/tunnel.rs
+index 2125013859c9bf7f59539f99e63bfc1456232afa..95d97a96b64f49aa9bff8a503de1509198942262 100644
+--- a/crates/vp-core/src/tunnel.rs
++++ b/crates/vp-core/src/tunnel.rs
+@@ -21,6 +21,30 @@ pub struct RelayHook {
+     pub stats: Option<Arc<Stats>>,
+ }
+ 
++/// Canceling a relay must cancel its detached pumps and release connection
++/// accounting even when the relay future never reaches its normal epilogue.
++struct RelayCleanup {
++    table: Option<Arc<ConnTable>>,
++    id: Option<u64>,
++    stats: Option<Arc<Stats>>,
++    pumps: Vec<tokio::task::AbortHandle>,
++}
++impl Drop for RelayCleanup {
++    fn drop(&mut self) {
++        for pump in &self.pumps {
++            pump.abort();
++        }
++        if let (Some(table), Some(id)) = (&self.table, self.id) {
++            table.remove(id);
++        }
++        if self.id.is_some() {
++            if let Some(stats) = &self.stats {
++                stats.conn_close();
++            }
++        }
++    }
++}
++
+ enum Dir {
+     Up,
+     Down,
+@@ -51,12 +75,21 @@ pub async fn relay(
+         ),
+     };
+ 
++    let mut cleanup = RelayCleanup {
++        table: hook.table.clone(),
++        id,
++        stats: hook.stats.clone(),
++        pumps: Vec::new(),
++    };
+     let (lr, lw) = tokio::io::split(left);
+     let (rr, rw) = tokio::io::split(right);
+ 
+     let stats = hook.stats.clone();
+-    let t1: JoinHandle<()> = tokio::spawn(pump(lr, rw, up.clone(), stats.clone(), Dir::Up));
+-    let t2: JoinHandle<()> = tokio::spawn(pump(rr, lw, down.clone(), stats, Dir::Down));
++    let t1: JoinHandle<()> =
++        crate::task_scope::spawn(pump(lr, rw, up.clone(), stats.clone(), Dir::Up));
++    cleanup.pumps.push(t1.abort_handle());
++    let t2: JoinHandle<()> = crate::task_scope::spawn(pump(rr, lw, down.clone(), stats, Dir::Down));
++    cleanup.pumps.push(t2.abort_handle());
+ 
+     if let (Some(t), Some(id)) = (&hook.table, id) {
+         t.attach_aborts(id, vec![t1.abort_handle(), t2.abort_handle()]);
+@@ -64,14 +97,6 @@ pub async fn relay(
+ 
+     let _ = tokio::join!(t1, t2);
+ 
+-    if let (Some(t), Some(id)) = (&hook.table, id) {
+-        t.remove(id);
+-    }
+-    if registered.is_some() {
+-        if let Some(s) = &hook.stats {
+-            s.conn_close();
+-        }
+-    }
+     (up.load(Ordering::Relaxed), down.load(Ordering::Relaxed))
+ }
+ 
+@@ -93,7 +118,7 @@ async fn pump<R, W>(
+             Ok(0) => break,
+             Ok(n) => {
+                 buf.set_len(n);
+-                if w.write_all(buf.as_slice()).await.is_err() {
++                if w.write_all(buf.as_slice()).await.is_err() || w.flush().await.is_err() {
+                     break;
+                 }
+                 counter.fetch_add(n as u64, Ordering::Relaxed);
+@@ -122,15 +147,16 @@ mod tests {
+         let (a1, mut a2) = duplex(4096);
+         let (b1, mut b2) = duplex(4096);
+ 
+-        let handle = tokio::spawn(relay(Box::new(a1), Box::new(b1), RelayHook::default()));
++        let handle =
++            crate::task_scope::spawn(relay(Box::new(a1), Box::new(b1), RelayHook::default()));
+ 
+-        tokio::spawn(async move {
++        crate::task_scope::spawn(async move {
+             a2.write_all(b"hello-right").await.unwrap();
+             let mut buf = [0u8; 11];
+             a2.read_exact(&mut buf).await.unwrap();
+             assert_eq!(&buf, b"hello-left!");
+         });
+-        tokio::spawn(async move {
++        crate::task_scope::spawn(async move {
+             b2.write_all(b"hello-left!").await.unwrap();
+             let mut buf = [0u8; 11];
+             b2.read_exact(&mut buf).await.unwrap();
+@@ -146,7 +172,8 @@ mod tests {
+     async fn half_close_propagates() {
+         let (a1, mut a2) = duplex(4096);
+         let (b1, mut b2) = duplex(4096);
+-        let handle = tokio::spawn(relay(Box::new(a1), Box::new(b1), RelayHook::default()));
++        let handle =
++            crate::task_scope::spawn(relay(Box::new(a1), Box::new(b1), RelayHook::default()));
+ 
+         // 客户端写完即关
+         a2.write_all(b"ping").await.unwrap();
+@@ -182,7 +209,7 @@ mod tests {
+         let (a1, mut a2) = duplex(4096);
+         let (b1, mut b2) = duplex(4096);
+         let t = table.clone();
+-        let handle = tokio::spawn(async move {
++        let handle = crate::task_scope::spawn(async move {
+             let h = RelayHook {
+                 table: Some(t),
+                 meta: Some(meta),
+@@ -201,4 +228,69 @@ mod tests {
+         assert_eq!(down, 0);
+         assert!(table.is_empty());
+     }
++    #[tokio::test]
++    async fn canceled_relay_closes_pumps_and_accounting() {
++        let table = Arc::new(ConnTable::new());
++        let stats = Arc::new(Stats::default());
++        let (a1, mut a2) = duplex(4096);
++        let (b1, mut b2) = duplex(4096);
++        let hook = RelayHook {
++            table: Some(table.clone()),
++            stats: Some(stats.clone()),
++            meta: Some(ConnMeta {
++                id: 991,
++                inbound: "test".into(),
++                network: "tcp",
++                host: "127.0.0.1".into(),
++                dst_port: 1,
++                src: None,
++                process: None,
++                rule: None,
++                chain: None,
++                start: 0,
++            }),
++        };
++        let task = tokio::spawn(relay(Box::new(a1), Box::new(b1), hook));
++        a2.write_all(b"x").await.unwrap();
++        let mut byte = [0];
++        b2.read_exact(&mut byte).await.unwrap();
++        task.abort();
++        let _ = task.await;
++        assert!(table.is_empty());
++        assert_eq!(stats.connections.load(Ordering::Relaxed), 0);
++        assert_eq!(
++            tokio::time::timeout(std::time::Duration::from_secs(1), a2.read(&mut byte))
++                .await
++                .unwrap()
++                .unwrap(),
++            0
++        );
++        assert_eq!(
++            tokio::time::timeout(std::time::Duration::from_secs(1), b2.read(&mut byte))
++                .await
++                .unwrap()
++                .unwrap(),
++            0
++        );
++    }
++
++    #[tokio::test]
++    async fn buffered_protocol_writer_is_flushed_without_peer_eof() {
++        let (a1, mut a2) = duplex(4096);
++        let (b1, mut b2) = duplex(4096);
++        let task = tokio::spawn(relay(
++            Box::new(a1),
++            Box::new(tokio::io::BufStream::new(b1)),
++            RelayHook::default(),
++        ));
++        a2.write_all(b"flush-me").await.unwrap();
++        let mut bytes = [0; 8];
++        tokio::time::timeout(std::time::Duration::from_secs(1), b2.read_exact(&mut bytes))
++            .await
++            .unwrap()
++            .unwrap();
++        assert_eq!(&bytes, b"flush-me");
++        task.abort();
++        let _ = task.await;
++    }
+ }
+diff --git a/crates/vp-dns/Cargo.toml b/crates/vp-dns/Cargo.toml
+index 2f33acead7860bad4a75347ea1e6019752a37676..b3ad7c5f5a2f9cb0a1b5201d09b864a13028e661 100644
+--- a/crates/vp-dns/Cargo.toml
++++ b/crates/vp-dns/Cargo.toml
+@@ -7,6 +7,7 @@ rust-version.workspace = true
+ license.workspace = true
+ 
+ [dependencies]
++vp-core.workspace = true
+ vp-common.workspace = true
+ vp-rule.workspace = true
+ vp-config.workspace = true
+diff --git a/crates/vp-dns/src/lib.rs b/crates/vp-dns/src/lib.rs
+index 4144e7e733e8c66aa81f0ef394daff3d0ca6c4b3..c7e88f0c00780d1caa091341df8b0fc1b65caa1d 100644
+--- a/crates/vp-dns/src/lib.rs
++++ b/crates/vp-dns/src/lib.rs
+@@ -984,13 +984,13 @@ mod tests {
+ 
+         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let port = listener.local_addr().unwrap().port();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             loop {
+                 let Ok((tcp, _)) = listener.accept().await else {
+                     break;
+                 };
+                 let acceptor = acceptor.clone();
+-                tokio::spawn(async move {
++                vp_core::task_scope::spawn(async move {
+                     let Ok(mut tls) = acceptor.accept(tcp).await else {
+                         return;
+                     };
+@@ -1113,7 +1113,7 @@ mod tests {
+     async fn cname_only_server_following() {
+         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+         let addr = sock.local_addr().unwrap();
+-        let _h = tokio::spawn(async move {
++        let _h = vp_core::task_scope::spawn(async move {
+             let mut buf = [0u8; 512];
+             loop {
+                 let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+@@ -1154,7 +1154,7 @@ mod tests {
+     async fn spawn_mock_dns(ip: [u8; 4]) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+         let addr = sock.local_addr().unwrap();
+-        let handle = tokio::spawn(async move {
++        let handle = vp_core::task_scope::spawn(async move {
+             let mut buf = [0u8; 512];
+             loop {
+                 let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+diff --git a/crates/vp-dns/src/server.rs b/crates/vp-dns/src/server.rs
+index fd1af8a5e03b56c6da0d14b43c0c6302f1716732..c76fca23d40c45a23ff7ad7d19beeeeb9f630453 100644
+--- a/crates/vp-dns/src/server.rs
++++ b/crates/vp-dns/src/server.rs
+@@ -52,7 +52,7 @@ impl DnsServer {
+         let bound = sock.local_addr()?;
+         let this = Arc::new(self);
+         let resolver = this.resolver.clone();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             let mut buf = vec![0u8; 1500];
+             loop {
+                 match sock.recv_from(&mut buf).await {
+@@ -61,7 +61,7 @@ impl DnsServer {
+                         let this = this.clone();
+                         let sock = sock.clone();
+                         let resolver = resolver.clone();
+-                        tokio::spawn(async move {
++                        vp_core::task_scope::spawn(async move {
+                             if let Err(e) = this.handle(&sock, &pkt, from, &resolver).await {
+                                 warn!("dns 查询处理失败: {e}");
+                             }
+diff --git a/crates/vp-protocol/src/anytls.rs b/crates/vp-protocol/src/anytls.rs
+index 1b1ad2f72634d76dbaf8e326c4b4296121792c15..1bbedccc2360f01bc4d29a10ebcfc5d9d4711de3 100644
+--- a/crates/vp-protocol/src/anytls.rs
++++ b/crates/vp-protocol/src/anytls.rs
+@@ -774,7 +774,7 @@ impl AnytlsInbound {
+                             let rest = buf[used..].to_vec();
+                             let (tx, rx) = mpsc::channel(64);
+                             *state = StreamState::Open(tx);
+-                            tokio::spawn(pump_stream(
++                            vp_core::task_scope::spawn(pump_stream(
+                                 self.direct.clone(),
+                                 self.tag.clone(),
+                                 src,
+@@ -934,14 +934,14 @@ impl Inbound for AnytlsInbound {
+         let listener = tokio::net::TcpListener::bind((self.bind.as_str(), self.port)).await?;
+         let bound = listener.local_addr()?.port();
+         let this = self.clone();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn_listener(self.tag().to_string(), async move {
+             loop {
+                 match listener.accept().await {
+                     Ok((stream, src)) => {
+                         transport::tune(&stream);
+                         let this = this.clone();
+                         let ctx = ctx.clone();
+-                        tokio::spawn(async move {
++                        vp_core::task_scope::spawn(async move {
+                             if let Err(e) = this.serve(stream, src, &ctx).await {
+                                 tracing::warn!("anytls 入站会话结束: {e}");
+                             }
+@@ -982,12 +982,12 @@ mod tests {
+     async fn echo_server() -> std::sync::Arc<tokio::net::TcpListener> {
+         let l = std::sync::Arc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+         let l2 = l.clone();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             loop {
+                 let Ok((mut s, _)) = l2.accept().await else {
+                     break;
+                 };
+-                tokio::spawn(async move {
++                vp_core::task_scope::spawn(async move {
+                     let mut b = vec![0u8; 65536];
+                     loop {
+                         match s.read(&mut b).await {
+@@ -1086,7 +1086,7 @@ mod tests {
+         let mut rb = vec![0u8; big.len()];
+         let (mut rr, mut rw) = tokio::io::split(s);
+         let big2 = big.clone();
+-        let wtask = tokio::spawn(async move {
++        let wtask = vp_core::task_scope::spawn(async move {
+             rw.write_all(&big2).await.unwrap();
+             rw.flush().await.unwrap();
+         });
+diff --git a/crates/vp-protocol/src/basic_out.rs b/crates/vp-protocol/src/basic_out.rs
+index 6e44501c6123cc926533fcd6050e7d1adaf0d9b0..43c4bad09f252a75bef2b021184adb93c5e6c734 100644
+--- a/crates/vp-protocol/src/basic_out.rs
++++ b/crates/vp-protocol/src/basic_out.rs
+@@ -280,7 +280,7 @@ mod tests {
+         // 本地起一个假 HTTP 代理（接受 CONNECT 并透传）
+         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let addr = listener.local_addr().unwrap();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             use tokio::io::{AsyncReadExt, AsyncWriteExt};
+             let (mut s, _) = listener.accept().await.unwrap();
+             let mut buf = vec![0u8; 1024];
+diff --git a/crates/vp-protocol/src/brook.rs b/crates/vp-protocol/src/brook.rs
+index 8a9c8e8e00890a0dc6b042c894171cc9356dcb38..395c8e0d0e431424e840aebdda0b8cf07717f3f4 100644
+--- a/crates/vp-protocol/src/brook.rs
++++ b/crates/vp-protocol/src/brook.rs
+@@ -653,7 +653,7 @@ impl BrookInbound {
+                 let mut remote = self.direct.connect_stream(&sess, &dst).await?;
+                 // 读任务：客户端记录 → 通道；写任务：通道明文 → 加密记录
+                 let (rec_tx, mut rec_rx) = mpsc::channel::<Vec<u8>>(64);
+-                let reader = tokio::spawn(async move {
++                let reader = vp_core::task_scope::spawn(async move {
+                     while let Ok(Some(data)) = try_read_record(&mut rh, &mut tx).await {
+                         if rec_tx.send(data).await.is_err() {
+                             break;
+@@ -661,7 +661,7 @@ impl BrookInbound {
+                     }
+                 });
+                 let (chunk_tx, mut chunk_rx) = mpsc::channel::<Vec<u8>>(64);
+-                let writer = tokio::spawn(async move {
++                let writer = vp_core::task_scope::spawn(async move {
+                     let mut rx = rx;
+                     while let Some(c) = chunk_rx.recv().await {
+                         let mut rest: &[u8] = &c;
+@@ -730,7 +730,7 @@ impl BrookInbound {
+         let sock = std::sync::Arc::new(sock);
+         let writer = {
+             let sock = sock.clone();
+-            tokio::spawn(async move {
++            vp_core::task_scope::spawn(async move {
+                 let mut b = vec![0u8; 65535];
+                 loop {
+                     match sock.recv(&mut b).await {
+@@ -764,14 +764,14 @@ impl Inbound for BrookInbound {
+         let listener = tokio::net::TcpListener::bind((self.bind.as_str(), self.port)).await?;
+         let bound = listener.local_addr()?.port();
+         let this = self.clone();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn_listener(self.tag().to_string(), async move {
+             loop {
+                 match listener.accept().await {
+                     Ok((stream, src)) => {
+                         transport::tune(&stream);
+                         let this = this.clone();
+                         let ctx = ctx.clone();
+-                        tokio::spawn(async move {
++                        vp_core::task_scope::spawn(async move {
+                             if let Err(e) = this.serve(stream, src, &ctx).await {
+                                 tracing::warn!("brook 入站会话结束: {e}");
+                             }
+@@ -806,12 +806,12 @@ mod tests {
+     async fn echo_server() -> std::sync::Arc<tokio::net::TcpListener> {
+         let l = std::sync::Arc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+         let l2 = l.clone();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             loop {
+                 let Ok((mut s, _)) = l2.accept().await else {
+                     break;
+                 };
+-                tokio::spawn(async move {
++                vp_core::task_scope::spawn(async move {
+                     let mut b = vec![0u8; 65536];
+                     loop {
+                         match s.read(&mut b).await {
+@@ -923,7 +923,7 @@ mod tests {
+         let mut rb = vec![0u8; big.len()];
+         let (mut rr, mut rw) = tokio::io::split(s);
+         let big2 = big.clone();
+-        let wtask = tokio::spawn(async move {
++        let wtask = vp_core::task_scope::spawn(async move {
+             rw.write_all(&big2).await.unwrap();
+             rw.flush().await.unwrap();
+         });
+@@ -965,7 +965,7 @@ mod tests {
+         let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let port = server.local_addr().unwrap().port();
+         let pw = b"pw123";
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             let (mut s, _) = server.accept().await.unwrap();
+             let mut cn = [0u8; 12];
+             s.read_exact(&mut cn).await.unwrap();
+@@ -1010,7 +1010,7 @@ mod tests {
+         // 真实 UDP 回显服务
+         let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+         let udp_port = udp.local_addr().unwrap().port();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             let mut b = vec![0u8; 65536];
+             while let Ok((n, from)) = udp.recv_from(&mut b).await {
+                 if udp.send_to(&b[..n], from).await.is_err() {
+diff --git a/crates/vp-protocol/src/h3_min.rs b/crates/vp-protocol/src/h3_min.rs
+index fcb57544948abfcfd48e38a43b0dde09617a86a6..9a7924d762595e94fc48db662ea1080b5263635d 100644
+--- a/crates/vp-protocol/src/h3_min.rs
++++ b/crates/vp-protocol/src/h3_min.rs
+@@ -415,7 +415,7 @@ pub struct H3CriticalStreams {
+ }
+ 
+ /// 打开 H3 必需的 uni 流（控制流发空 SETTINGS；QPACK 流保持打开）
+-async fn open_h3_streams(conn: &quinn::Connection) -> Result<H3CriticalStreams> {
++pub(crate) async fn open_h3_streams(conn: &quinn::Connection) -> Result<H3CriticalStreams> {
+     // 控制流 (0x00)
+     let mut ctl = conn.open_uni().await.map_err(quic_io_err)?;
+     let mut buf = Vec::new();
+@@ -449,9 +449,9 @@ fn quic_io_err(e: impl std::fmt::Debug) -> Error {
+ 
+ /// 后台自动接收并消耗对端（服务端）主动建立的单向流（如对端控制流 / SETTINGS）
+ pub fn spawn_uni_drainer(conn: quinn::Connection) {
+-    tokio::spawn(async move {
++    vp_core::task_scope::spawn(async move {
+         while let Ok(mut recv) = conn.accept_uni().await {
+-            tokio::spawn(async move {
++            vp_core::task_scope::spawn(async move {
+                 let mut buf = [0u8; 1024];
+                 while let Ok(Some(_)) = recv.read(&mut buf).await {}
+             });
+diff --git a/crates/vp-protocol/src/hysteria.rs b/crates/vp-protocol/src/hysteria.rs
+index ad45aa5926731079c2b99208158aa71b185c1d94..c539c64f855681a3f4dc65c10fabc70b4ec8b627 100644
+--- a/crates/vp-protocol/src/hysteria.rs
++++ b/crates/vp-protocol/src/hysteria.rs
+@@ -305,7 +305,7 @@ impl Hysteria1Outbound {
+         {
+             let demux = udp_demux.clone();
+             let c = conn.clone();
+-            tokio::spawn(async move { demux_task(c, demux).await });
++            vp_core::task_scope::spawn(async move { demux_task(c, demux).await });
+         }
+         let s = Arc::new(Hy1Session {
+             conn,
+@@ -451,7 +451,7 @@ impl Drop for Hy1UdpConn {
+     fn drop(&mut self) {
+         let demux = self.demux.clone();
+         let session = self.session_id;
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             demux.unregister(session).await;
+         });
+     }
+@@ -777,9 +777,9 @@ mod tests {
+         // echo 源站（TCP）
+         let tcp_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let echo_tcp_port = tcp_l.local_addr().unwrap().port();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             while let Ok((mut s, _)) = tcp_l.accept().await {
+-                tokio::spawn(async move {
++                vp_core::task_scope::spawn(async move {
+                     let mut b = [0u8; 1024];
+                     while let Ok(n) = s.read(&mut b).await {
+                         if n == 0 || s.write_all(&b[..n]).await.is_err() {
+@@ -793,7 +793,7 @@ mod tests {
+         // echo 源站（UDP）
+         let udp = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+         let udp_addr = udp.local_addr().unwrap();
+-        tokio::spawn({
++        vp_core::task_scope::spawn({
+             let udp = udp.clone();
+             async move {
+                 let mut b = [0u8; 2048];
+@@ -827,12 +827,12 @@ mod tests {
+         let endpoint = quinn::Endpoint::server(scfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+         let port = endpoint.local_addr().unwrap().port();
+ 
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             let udp_sessions = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+             while let Some(incoming) = endpoint.accept().await {
+                 let Ok(conn) = incoming.await else { continue };
+                 let udp_sessions = udp_sessions.clone();
+-                tokio::spawn(async move {
++                vp_core::task_scope::spawn(async move {
+                     // 控制流：版本 + clientHello <- serverHello
+                     let Ok(mut ctl) = conn.accept_bi().await else {
+                         return;
+@@ -887,7 +887,7 @@ mod tests {
+                             };
+                             let (mut or, mut ow) = origin.into_split();
+                             // 双向搬运各起独立任务，accept 循环立即返回受理下一条流
+-                            tokio::spawn(async move {
++                            vp_core::task_scope::spawn(async move {
+                                 let mut b = [0u8; 4096];
+                                 loop {
+                                     match or.read(&mut b).await {
+@@ -900,7 +900,7 @@ mod tests {
+                                     }
+                                 }
+                             });
+-                            tokio::spawn(async move {
++                            vp_core::task_scope::spawn(async move {
+                                 let mut b = [0u8; 4096];
+                                 loop {
+                                     match recv.read(&mut b).await {
+@@ -928,7 +928,7 @@ mod tests {
+                             let _ = send.flush().await;
+                             // 会话维持：读数据报并回显
+                             let c = conn.clone();
+-                            tokio::spawn(async move {
++                            vp_core::task_scope::spawn(async move {
+                                 while let Ok(buf) = c.read_datagram().await {
+                                     let Some((_s, host, port, _mid, _fid, _fc, data)) =
+                                         parse_udp_message(&buf)
+diff --git a/crates/vp-protocol/src/inbound/http_in.rs b/crates/vp-protocol/src/inbound/http_in.rs
+index 16e17c7578432b6ca3eee4f5a3ba5b590742aef4..69ddfe6694c74b00f788ba3a5ed5181d4b963ac1 100644
+--- a/crates/vp-protocol/src/inbound/http_in.rs
++++ b/crates/vp-protocol/src/inbound/http_in.rs
+@@ -39,14 +39,14 @@ impl vp_core::Inbound for HttpInbound {
+         let listener = TcpListener::bind((self.bind.as_str(), self.port)).await?;
+         let bound = listener.local_addr()?.port();
+         let tag = self.tag.clone();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn_listener(self.tag().to_string(), async move {
+             loop {
+                 match listener.accept().await {
+                     Ok((stream, src)) => {
+                         vp_transport::tune(&stream);
+                         let ctx = ctx.clone();
+                         let tag = tag.clone();
+-                        tokio::spawn(async move {
++                        vp_core::task_scope::spawn(async move {
+                             if let Err(e) = serve_http(stream, src, tag, &ctx).await {
+                                 debug!("http 入站会话结束: {e}");
+                             }
+diff --git a/crates/vp-protocol/src/inbound/mixed.rs b/crates/vp-protocol/src/inbound/mixed.rs
+index c40ebec5697031ec4dc428d0c3e6a40750dda161..6bdead86f3f25bd79c0607d6f7c9657fb0b325f6 100644
+--- a/crates/vp-protocol/src/inbound/mixed.rs
++++ b/crates/vp-protocol/src/inbound/mixed.rs
+@@ -39,14 +39,14 @@ impl vp_core::Inbound for MixedInbound {
+         let listener = TcpListener::bind((self.bind.as_str(), self.port)).await?;
+         let bound = listener.local_addr()?.port();
+         let tag = self.tag.clone();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn_listener(self.tag().to_string(), async move {
+             loop {
+                 match listener.accept().await {
+                     Ok((stream, src)) => {
+                         vp_transport::tune(&stream);
+                         let ctx = ctx.clone();
+                         let tag = tag.clone();
+-                        tokio::spawn(async move {
++                        vp_core::task_scope::spawn(async move {
+                             if let Err(e) = serve_mixed(stream, src, tag, &ctx).await {
+                                 debug!("mixed 入站会话结束: {e}");
+                             }
+diff --git a/crates/vp-protocol/src/inbound/socks5_in.rs b/crates/vp-protocol/src/inbound/socks5_in.rs
+index 76af78e47756f28eafe26fce8847585b482b27dd..35667d524cbd647d72dcf8670f3ce6c256abf36b 100644
+--- a/crates/vp-protocol/src/inbound/socks5_in.rs
++++ b/crates/vp-protocol/src/inbound/socks5_in.rs
+@@ -43,14 +43,14 @@ impl vp_core::Inbound for Socks5Inbound {
+         let listener = TcpListener::bind((self.bind.as_str(), self.port)).await?;
+         let bound = listener.local_addr()?.port();
+         let tag = self.tag.clone();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn_listener(self.tag().to_string(), async move {
+             loop {
+                 match listener.accept().await {
+                     Ok((stream, src)) => {
+                         vp_transport::tune(&stream);
+                         let ctx = ctx.clone();
+                         let tag = tag.clone();
+-                        tokio::spawn(async move {
++                        vp_core::task_scope::spawn(async move {
+                             if let Err(e) = serve_socks5(stream, src, tag, &ctx).await {
+                                 debug!("socks5 入站会话结束: {e}");
+                             }
+diff --git a/crates/vp-protocol/src/inbound/udp_nat.rs b/crates/vp-protocol/src/inbound/udp_nat.rs
+index c455fcfed1d3815f6729920c027798b899888790..6f6a407965b7cd308f3bcd57021cf7de49d0f0de 100644
+--- a/crates/vp-protocol/src/inbound/udp_nat.rs
++++ b/crates/vp-protocol/src/inbound/udp_nat.rs
+@@ -115,7 +115,7 @@ impl UdpNat {
+         let (tx, mut rx) = tokio::sync::mpsc::channel::<UdpPacket>(64);
+         let dst_key = dst.clone();
+         let this = self.clone();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             let sessions = &this.sessions;
+             loop {
+                 tokio::select! {
+diff --git a/crates/vp-protocol/src/mieru.rs b/crates/vp-protocol/src/mieru.rs
+index 02f52af18f47eb99a001f4786455a7529ea5eb98..fc4842677ab8bba492c045df4bfa9c6dc3278f67 100644
+--- a/crates/vp-protocol/src/mieru.rs
++++ b/crates/vp-protocol/src/mieru.rs
+@@ -1149,7 +1149,7 @@ impl MieruInbound {
+         // 4. 中继：读写半分离（read_segment 非取消安全，独占接收任务）
+         let (mut rh, mut wh) = io.into_split();
+         let (rec_tx, mut rec_rx) = mpsc::channel::<Vec<u8>>(64);
+-        let reader = tokio::spawn(async move {
++        let reader = vp_core::task_scope::spawn(async move {
+             let mut first = false; // accept/handshake 已消费 rx 首段 nonce
+             while let Ok((meta, payload)) = read_segment(&mut rh, &mut rx, first).await {
+                 first = false;
+@@ -1165,7 +1165,7 @@ impl MieruInbound {
+             }
+         });
+         let (chunk_tx, mut chunk_rx) = mpsc::channel::<Vec<u8>>(64);
+-        let writer = tokio::spawn(async move {
++        let writer = vp_core::task_scope::spawn(async move {
+             let mut s = seq;
+             while let Some(c) = chunk_rx.recv().await {
+                 let mut rest: &[u8] = &c;
+@@ -1227,14 +1227,14 @@ impl Inbound for MieruInbound {
+         let listener = tokio::net::TcpListener::bind((self.bind.as_str(), self.port)).await?;
+         let bound = listener.local_addr()?.port();
+         let this = self.clone();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn_listener(self.tag().to_string(), async move {
+             loop {
+                 match listener.accept().await {
+                     Ok((stream, src)) => {
+                         transport::tune(&stream);
+                         let this = this.clone();
+                         let ctx = ctx.clone();
+-                        tokio::spawn(async move {
++                        vp_core::task_scope::spawn(async move {
+                             if let Err(e) = this.serve(stream, src, &ctx).await {
+                                 tracing::warn!("mieru 入站会话结束: {e}");
+                             }
+@@ -1269,12 +1269,12 @@ mod tests {
+     async fn echo_server() -> std::sync::Arc<tokio::net::TcpListener> {
+         let l = std::sync::Arc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+         let l2 = l.clone();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             loop {
+                 let Ok((mut s, _)) = l2.accept().await else {
+                     break;
+                 };
+-                tokio::spawn(async move {
++                vp_core::task_scope::spawn(async move {
+                     let mut b = vec![0u8; 65536];
+                     loop {
+                         match s.read(&mut b).await {
+@@ -1391,7 +1391,7 @@ mod tests {
+         let mut rb = vec![0u8; big.len()];
+         let (mut rr, mut rw) = tokio::io::split(s);
+         let big2 = big.clone();
+-        let wtask = tokio::spawn(async move {
++        let wtask = vp_core::task_scope::spawn(async move {
+             rw.write_all(&big2).await.unwrap();
+             rw.flush().await.unwrap();
+         });
+diff --git a/crates/vp-protocol/src/naive.rs b/crates/vp-protocol/src/naive.rs
+index 886246005b043993255fdb9eae61c461a0428c53..2484646339698253c8a87bbbdadb30528c4a8517 100644
+--- a/crates/vp-protocol/src/naive.rs
++++ b/crates/vp-protocol/src/naive.rs
+@@ -308,7 +308,7 @@ impl NaiveOutbound {
+         let (mut client, conn) = h2::client::handshake(io)
+             .await
+             .map_err(|e| Error::Io(io::Error::other(format!("naive h2 握手失败: {e}"))))?;
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             let _ = conn.await;
+         });
+ 
+@@ -487,7 +487,7 @@ impl NaiveInbound {
+ 
+             let direct = self.direct.clone();
+             let tag = self.tag.clone();
+-            tokio::spawn(async move {
++            vp_core::task_scope::spawn(async move {
+                 let sess = Session::new_tcp(tag, Some(src), dst.clone());
+                 match direct.connect_stream(&sess, &dst).await {
+                     Ok(remote) => {
+@@ -518,13 +518,13 @@ impl Inbound for NaiveInbound {
+         let listener = tokio::net::TcpListener::bind((self.bind.as_str(), self.port)).await?;
+         let bound = listener.local_addr()?.port();
+         let this = self.clone();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn_listener(self.tag().to_string(), async move {
+             loop {
+                 match listener.accept().await {
+                     Ok((stream, src)) => {
+                         transport::tune(&stream);
+                         let this = this.clone();
+-                        tokio::spawn(async move {
++                        vp_core::task_scope::spawn(async move {
+                             if let Err(e) = this.handle_connection(stream, src).await {
+                                 tracing::debug!("naive 会话结束: {e}");
+                             }
+@@ -558,12 +558,12 @@ mod tests {
+     async fn echo_server() -> std::sync::Arc<tokio::net::TcpListener> {
+         let l = std::sync::Arc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+         let l2 = l.clone();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             loop {
+                 let Ok((mut s, _)) = l2.accept().await else {
+                     break;
+                 };
+-                tokio::spawn(async move {
++                vp_core::task_scope::spawn(async move {
+                     let mut b = vec![0u8; 65536];
+                     loop {
+                         match s.read(&mut b).await {
+@@ -645,7 +645,7 @@ mod tests {
+         let mut rb = vec![0u8; big.len()];
+         let (mut rr, mut rw) = tokio::io::split(s);
+         let big2 = big.clone();
+-        let wtask = tokio::spawn(async move {
++        let wtask = vp_core::task_scope::spawn(async move {
+             rw.write_all(&big2).await.unwrap();
+             rw.flush().await.unwrap();
+         });
+@@ -699,7 +699,7 @@ mod tests {
+             .await
+             .unwrap();
+         let (mut client, conn) = h2::client::handshake(tcp).await.unwrap();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             let _ = conn.await;
+         });
+ 
+diff --git a/crates/vp-protocol/src/redir.rs b/crates/vp-protocol/src/redir.rs
+index c0134a4143e9e04aded82c8568f86fd8ce5e6559..54a82cfb4ea510a56df4dc96fd55682fab0e2c98 100644
+--- a/crates/vp-protocol/src/redir.rs
++++ b/crates/vp-protocol/src/redir.rs
+@@ -59,13 +59,13 @@ impl Inbound for RedirInbound {
+             let listener = TcpListener::bind((self.bind.as_str(), self.port)).await?;
+             let bound = listener.local_addr()?.port();
+             let tag = self.tag.clone();
+-            tokio::spawn(async move {
++            vp_core::task_scope::spawn_listener(self.tag().to_string(), async move {
+                 loop {
+                     match listener.accept().await {
+                         Ok((stream, src)) => {
+                             let ctx = ctx.clone();
+                             let tag = tag.clone();
+-                            tokio::spawn(async move {
++                            vp_core::task_scope::spawn(async move {
+                                 let dst = match original_dst(&stream) {
+                                     Ok(d) => d,
+                                     Err(e) => {
+diff --git a/crates/vp-protocol/src/shadowtls.rs b/crates/vp-protocol/src/shadowtls.rs
+index 81e069a244b71c80fd447dbe99828547cbfd8948..0d10772faacbf6754110be482487095b3079ea44 100644
+--- a/crates/vp-protocol/src/shadowtls.rs
++++ b/crates/vp-protocol/src/shadowtls.rs
+@@ -627,7 +627,7 @@ async fn fallback_relay(client: TcpStream, cam: TcpStream, prefix: Vec<u8>) {
+         let _ = cw.write_all(&prefix).await;
+     }
+     let (mut xr, mut xw) = client.into_split();
+-    let a = tokio::spawn(async move {
++    let a = vp_core::task_scope::spawn(async move {
+         let _ = tokio::io::copy(&mut xr, &mut cw).await;
+     });
+     let _ = tokio::io::copy(&mut cr, &mut xw).await;
+@@ -653,7 +653,7 @@ pub async fn server_handshake(
+             .map_err(ServerHandshakeError::Io)?;
+         vp_transport::tune(&cam);
+         if !authed {
+-            tokio::spawn(fallback_relay(client, cam, ch.to_vec()));
++            vp_core::task_scope::spawn(fallback_relay(client, cam, ch.to_vec()));
+             return Err(ServerHandshakeError::Fallback);
+         }
+         cam.write_all(&ch).await.map_err(ServerHandshakeError::Io)?;
+@@ -662,7 +662,7 @@ pub async fn server_handshake(
+         let sh = match read_frame(&mut cam).await {
+             Ok(sh) => sh,
+             Err(e) => {
+-                tokio::spawn(fallback_relay(client, cam, Vec::new()));
++                vp_core::task_scope::spawn(fallback_relay(client, cam, Vec::new()));
+                 return Err(ServerHandshakeError::Io(e));
+             }
+         };
+@@ -673,7 +673,7 @@ pub async fn server_handshake(
+         let (server_random, tls13, hrr) = match extract_server_hello(&sh) {
+             Some(v) => v,
+             None => {
+-                tokio::spawn(fallback_relay(client, cam, Vec::new()));
++                vp_core::task_scope::spawn(fallback_relay(client, cam, Vec::new()));
+                 return Err(ServerHandshakeError::Io(std::io::Error::new(
+                     std::io::ErrorKind::InvalidData,
+                     "伪装站回包不是 ServerHello",
+@@ -681,7 +681,7 @@ pub async fn server_handshake(
+             }
+         };
+         if hrr || !tls13 {
+-            tokio::spawn(fallback_relay(client, cam, Vec::new()));
++            vp_core::task_scope::spawn(fallback_relay(client, cam, Vec::new()));
+             return Err(ServerHandshakeError::Io(std::io::Error::new(
+                 std::io::ErrorKind::Unsupported,
+                 "伪装站非 TLS 1.3",
+@@ -694,7 +694,7 @@ pub async fn server_handshake(
+         let mut wrap = ShadowTlsStream::<TcpStream>::handshake_chain(pw, &server_random);
+         let xk = xor_key(pw, &server_random);
+         let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+-        let task_a = tokio::spawn(async move {
++        let task_a = vp_core::task_scope::spawn(async move {
+             let mut cam_r = cam_r;
+             loop {
+                 let f = tokio::select! {
+@@ -842,7 +842,7 @@ mod tests {
+     async fn spawn_camouflage(n_appdata: usize) -> (String, u16) {
+         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let addr = l.local_addr().unwrap();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             let (mut s, _) = l.accept().await.unwrap();
+             let mut hdr = [0u8; 5];
+             s.read_exact(&mut hdr).await.unwrap();
+@@ -881,7 +881,7 @@ mod tests {
+         // shadow-tls 服务端
+         let srv = TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let srv_addr = srv.local_addr().unwrap();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             let (s, _) = srv.accept().await.unwrap();
+             let st = server_handshake(s, PW, &cam_host, cam_port).await.unwrap();
+             // echo
+@@ -917,7 +917,7 @@ mod tests {
+         let mut echo = Vec::with_capacity(big_len);
+         let writer_big = big.clone();
+         let (mut r, mut w) = tokio::io::split(cl);
+-        let writer = tokio::spawn(async move {
++        let writer = vp_core::task_scope::spawn(async move {
+             w.write_all(&writer_big).await.unwrap();
+             w.flush().await.unwrap();
+         });
+@@ -937,7 +937,7 @@ mod tests {
+         let (cam_host, cam_port) = spawn_camouflage(1).await;
+         let srv = TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let srv_addr = srv.local_addr().unwrap();
+-        let handle = tokio::spawn(async move {
++        let handle = vp_core::task_scope::spawn(async move {
+             let (s, _) = srv.accept().await.unwrap();
+             server_handshake(s, PW, &cam_host, cam_port).await
+         });
+@@ -959,7 +959,7 @@ mod tests {
+         let (cam_host, cam_port) = spawn_camouflage(1).await;
+         let srv = TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let srv_addr = srv.local_addr().unwrap();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             let (s, _) = srv.accept().await.unwrap();
+             if let Ok(mut st) = server_handshake(s, PW, &cam_host, cam_port).await {
+                 // 读客户端数据后篡改内容再回写（破坏 S 链）
+diff --git a/crates/vp-protocol/src/smux.rs b/crates/vp-protocol/src/smux.rs
+index bbd1d8c19550f3eedb836a2e213d0acb339d2203..58521f6c619449541daf236c2d35413442b0a77d 100644
+--- a/crates/vp-protocol/src/smux.rs
++++ b/crates/vp-protocol/src/smux.rs
+@@ -169,7 +169,7 @@ impl SmuxSession {
+ 
+         // 写任务
+         let is_closed_writer = is_closed.clone();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             while let Some(frame) = rx_frame.recv().await {
+                 let mut head = [0u8; 8];
+                 head[0] = SMUX_VERSION;
+@@ -194,7 +194,7 @@ impl SmuxSession {
+         // 读任务
+         let streams_reader = streams.clone();
+         let is_closed_reader = is_closed.clone();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             let mut head = [0u8; 8];
+             loop {
+                 if r_stream.read_exact(&mut head).await.is_err() {
+@@ -388,7 +388,7 @@ mod tests {
+         let client_session = SmuxSession::new(Box::new(client_io));
+ 
+         // 模拟服务端收到子流并回显
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             let mut s = server_io;
+             let mut head = [0u8; 8];
+             // 读 SYN
+diff --git a/crates/vp-protocol/src/snell.rs b/crates/vp-protocol/src/snell.rs
+index f8eea9f1aa3ca9161c0eb5cdc9e708c7302a9be2..93b2f99ceff13fab24bedb7134d48830a9ce633b 100644
+--- a/crates/vp-protocol/src/snell.rs
++++ b/crates/vp-protocol/src/snell.rs
+@@ -734,7 +734,7 @@ impl SnellInbound {
+                 };
+ 
+                 let client_stream = SnellStream::new(stream, enc, dec, Vec::new(), raw);
+-                tokio::spawn(async move {
++                vp_core::task_scope::spawn(async move {
+                     let _ = relay(Box::new(client_stream), remote, hook).await;
+                 });
+                 Ok(())
+@@ -752,7 +752,7 @@ impl SnellInbound {
+                 let udp_sock = Arc::new(tokio::net::UdpSocket::bind("0.0.0.0:0").await?);
+                 let sock_r = udp_sock.clone();
+ 
+-                tokio::spawn(async move {
++                vp_core::task_scope::spawn(async move {
+                     let mut ubuf = vec![0u8; 65535];
+                     loop {
+                         // 读取客户端请求：[addr][len][data]
+@@ -828,14 +828,14 @@ impl Inbound for SnellInbound {
+         let bound = listener.local_addr()?.port();
+         let this = self.clone();
+ 
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn_listener(self.tag().to_string(), async move {
+             loop {
+                 match listener.accept().await {
+                     Ok((stream, src)) => {
+                         vp_transport::tune(&stream);
+                         let this = this.clone();
+                         let ctx = ctx.clone();
+-                        tokio::spawn(async move {
++                        vp_core::task_scope::spawn(async move {
+                             if let Err(e) = this.serve(stream, src, &ctx).await {
+                                 tracing::debug!("snell 入站会话结束: {e}");
+                             }
+@@ -921,7 +921,7 @@ mod tests {
+         // 1. 启动 Echo 目标服务器
+         let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let echo_addr = echo.local_addr().unwrap();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             let (mut s, _) = echo.accept().await.unwrap();
+             let mut b = [0u8; 8192];
+             loop {
+diff --git a/crates/vp-protocol/src/ss.rs b/crates/vp-protocol/src/ss.rs
+index f797d06b381a30bc0392a4a9f1ee6ebdbcea07f1..fa7d68fe36f89348dc8c72df0994e61038cb2d60 100644
+--- a/crates/vp-protocol/src/ss.rs
++++ b/crates/vp-protocol/src/ss.rs
+@@ -471,7 +471,7 @@ impl SsInbound {
+                 let key = self.key.clone();
+                 let nat2 = nat.clone();
+                 let client = from;
+-                tokio::spawn(async move {
++                vp_core::task_scope::spawn(async move {
+                     let mut rbuf = [0u8; 65535];
+                     loop {
+                         let recv = match tokio::time::timeout(
+@@ -595,7 +595,7 @@ impl SsInbound {
+             meta: Some(meta),
+             stats: Some(ctx.stats.clone()),
+         };
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             let _ = relay(Box::new(client), remote, hook).await;
+         });
+         Ok(())
+@@ -670,20 +670,20 @@ impl Inbound for SsInbound {
+             };
+ 
+             let this = self.clone();
+-            tokio::spawn(async move {
++            vp_core::task_scope::spawn_listener(self.tag().to_string(), async move {
+                 if let Err(e) = this.serve_udp(udp).await {
+                     warn!("ss udp 入站结束: {e}");
+                 }
+             });
+             let this = self.clone();
+-            tokio::spawn(async move {
++            vp_core::task_scope::spawn_listener(self.tag().to_string(), async move {
+                 loop {
+                     match listener.accept().await {
+                         Ok((stream, src)) => {
+                             vp_transport::tune(&stream);
+                             let this = this.clone();
+                             let ctx = ctx.clone();
+-                            tokio::spawn(async move {
++                            vp_core::task_scope::spawn(async move {
+                                 let handled = match &this.shadow_tls {
+                                     Some(st) => {
+                                         match crate::shadowtls::server_handshake(
+@@ -737,7 +737,7 @@ mod tests {
+         // echo 源站
+         let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let echo_addr = echo.local_addr().unwrap();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             use tokio::io::{AsyncReadExt, AsyncWriteExt};
+             let (mut s, _) = echo.accept().await.unwrap();
+             let mut b = [0u8; 1024];
+diff --git a/crates/vp-protocol/src/ssh.rs b/crates/vp-protocol/src/ssh.rs
+index 83831f6fbab86497b70f470b21cf86bd289a3ba5..c5a047d5fd6716a39316c1ce1eae26021f5190a0 100644
+--- a/crates/vp-protocol/src/ssh.rs
++++ b/crates/vp-protocol/src/ssh.rs
+@@ -1205,7 +1205,7 @@ mod tests {
+         let passwords: Vec<String> = passwords.iter().map(|s| s.to_string()).collect();
+         let pubkeys: Vec<Vec<u8>> = pubkeys.to_vec();
+ 
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             loop {
+                 let Ok((io, _)) = listener.accept().await else {
+                     break;
+@@ -1213,7 +1213,7 @@ mod tests {
+                 let k_s = k_s.clone();
+                 let passwords = passwords.clone();
+                 let pubkeys = pubkeys.clone();
+-                tokio::spawn(async move {
++                vp_core::task_scope::spawn(async move {
+                     if let Err(e) =
+                         serve_ssh(io, echo_port, &k_s, &seed, &passwords, &pubkeys).await
+                     {
+@@ -1412,7 +1412,7 @@ mod tests {
+                     // 中继任务：目标 TCP → CHANNEL_DATA（经共享 writer）
+                     let w = writer.clone();
+                     let (dst_host, dst_port) = (dst.host.clone(), dst.port);
+-                    tokio::spawn(async move {
++                    vp_core::task_scope::spawn(async move {
+                         let Ok(mut target) =
+                             tokio::net::TcpStream::connect((dst_host.to_string(), dst_port)).await
+                         else {
+@@ -1490,12 +1490,12 @@ mod tests {
+         let l = std::sync::Arc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+         let port = l.local_addr().unwrap().port();
+         let l2 = l.clone();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             loop {
+                 let Ok((mut s, _)) = l2.accept().await else {
+                     break;
+                 };
+-                tokio::spawn(async move {
++                vp_core::task_scope::spawn(async move {
+                     let mut b = vec![0u8; 65536];
+                     loop {
+                         match s.read(&mut b).await {
+@@ -1541,7 +1541,7 @@ mod tests {
+         let mut rb = vec![0u8; big.len()];
+         let (mut rr, mut rw) = tokio::io::split(s);
+         let big2 = big.clone();
+-        let wtask = tokio::spawn(async move {
++        let wtask = vp_core::task_scope::spawn(async move {
+             rw.write_all(&big2).await.unwrap();
+             rw.flush().await.unwrap();
+         });
+diff --git a/crates/vp-protocol/src/ssr.rs b/crates/vp-protocol/src/ssr.rs
+index a9afacc93d188ac83ebde16cf438e0bffc7db787..ca09e96da3451142f45e973fb1c5112d51688255 100644
+--- a/crates/vp-protocol/src/ssr.rs
++++ b/crates/vp-protocol/src/ssr.rs
+@@ -976,7 +976,7 @@ mod tests {
+     async fn ssr_outbound_plain_loopback() {
+         let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let port = echo.local_addr().unwrap().port();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             let (mut s, _) = echo.accept().await.unwrap();
+             let mut buf = [0u8; 1024];
+             let n = s.read(&mut buf).await.unwrap();
+@@ -1013,7 +1013,7 @@ mod tests {
+         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let port = listener.local_addr().unwrap().port();
+         let password = "di15PV";
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             let (mut s, _) = listener.accept().await.unwrap();
+             // 服务端：读客户端 IV → 解密流 → 原样回显（用服务端自己的 IV 重新加密）
+             let suite = StreamSuite::parse("rc4-md5").unwrap();
+@@ -1071,7 +1071,7 @@ mod tests {
+         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let port = listener.local_addr().unwrap().port();
+         let password = "di15PV";
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             let (mut s, _) = listener.accept().await.unwrap();
+             let suite = StreamSuite::parse("rc4-md5").unwrap();
+             let master = suite.derive_key(password);
+@@ -1168,7 +1168,7 @@ mod tests {
+         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let port = listener.local_addr().unwrap().port();
+         let password = "di15PV";
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             let (mut s, _) = listener.accept().await.unwrap();
+             let mut buf = vec![0u8; 16 * 1024];
+             let n = s.read(&mut buf).await.unwrap();
+diff --git a/crates/vp-protocol/src/trojan.rs b/crates/vp-protocol/src/trojan.rs
+index 1076f934d0ff8e4b870e1d5656e739c7c4b5e5c2..4451c27bb95a3664be83b3e83e4d16664b8e870d 100644
+--- a/crates/vp-protocol/src/trojan.rs
++++ b/crates/vp-protocol/src/trojan.rs
+@@ -221,7 +221,7 @@ impl TrojanInbound {
+             stats: Some(ctx.stats.clone()),
+         };
+         let client: Box<dyn ProxyStream> = Box::new(stream);
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             let _ = relay(client, remote, hook).await;
+         });
+         Ok(())
+@@ -238,14 +238,14 @@ impl Inbound for TrojanInbound {
+         let listener = tokio::net::TcpListener::bind((self.bind.as_str(), self.port)).await?;
+         let bound = listener.local_addr()?.port();
+         let this = self.clone();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn_listener(self.tag().to_string(), async move {
+             loop {
+                 match listener.accept().await {
+                     Ok((stream, src)) => {
+                         vp_transport::tune(&stream);
+                         let this = this.clone();
+                         let ctx = ctx.clone();
+-                        tokio::spawn(async move {
++                        vp_core::task_scope::spawn(async move {
+                             if let Err(e) = this.serve(stream, src, &ctx).await {
+                                 tracing::warn!("trojan 入站会话结束: {e}");
+                             }
+@@ -271,7 +271,7 @@ mod tests {
+     async fn trojan_loopback() {
+         let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let echo_addr = echo.local_addr().unwrap();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             let (mut s, _) = echo.accept().await.unwrap();
+             let mut b = [0u8; 1024];
+             loop {
+diff --git a/crates/vp-protocol/src/uot.rs b/crates/vp-protocol/src/uot.rs
+index 9dc159e04e8e3223d46cb0963f352af68a2552fe..e3e8e032ed4b4a90d6af9aa3521ad6331d6134f6 100644
+--- a/crates/vp-protocol/src/uot.rs
++++ b/crates/vp-protocol/src/uot.rs
+@@ -283,7 +283,7 @@ async fn spawn_session(
+     }
+     let mut conn = res.outbound.connect_packet(sess, dst).await?;
+     let (tx, mut rx) = tokio::sync::mpsc::channel::<UdpPacket>(64);
+-    tokio::spawn(async move {
++    vp_core::task_scope::spawn(async move {
+         loop {
+             tokio::select! {
+                 biased;
+@@ -345,7 +345,7 @@ mod tests {
+     async fn frame_domain_roundtrip() {
+         let (mut client, mut server) = tokio::io::duplex(1024);
+         let frame = encode_frame(&DstAddr::new("dns.example.com", 53), b"q");
+-        let h = tokio::spawn(async move {
++        let h = vp_core::task_scope::spawn(async move {
+             client.write_all(&frame).await.unwrap();
+         });
+         let (addr, data) = read_frame(&mut server).await.unwrap();
+diff --git a/crates/vp-protocol/src/vless.rs b/crates/vp-protocol/src/vless.rs
+index f2ee35d9b1ef4d9d47e842454e0e251699d9ead6..76c6f6144e35c3ea796d7b4f94818e3a5b7a5115 100644
+--- a/crates/vp-protocol/src/vless.rs
++++ b/crates/vp-protocol/src/vless.rs
+@@ -464,7 +464,7 @@ impl VlessInbound {
+                     } else {
+                         Box::new(stream)
+                     };
+-                    tokio::spawn(async move {
++                    vp_core::task_scope::spawn(async move {
+                         let _ = relay(client, remote, hook).await;
+                     });
+                     return Ok(());
+@@ -489,14 +489,14 @@ impl Inbound for VlessInbound {
+         let listener = tokio::net::TcpListener::bind((self.bind.as_str(), self.port)).await?;
+         let bound = listener.local_addr()?.port();
+         let this = self.clone();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn_listener(self.tag().to_string(), async move {
+             loop {
+                 match listener.accept().await {
+                     Ok((stream, src)) => {
+                         vp_transport::tune(&stream);
+                         let this = this.clone();
+                         let ctx = ctx.clone();
+-                        tokio::spawn(async move {
++                        vp_core::task_scope::spawn(async move {
+                             if let Err(e) = this.serve(stream, src, &ctx).await {
+                                 tracing::warn!("vless 入站会话结束: {e}");
+                             }
+@@ -522,7 +522,7 @@ mod tests {
+     async fn vless_loopback() {
+         let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let echo_addr = echo.local_addr().unwrap();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             let (mut s, _) = echo.accept().await.unwrap();
+             let mut b = [0u8; 1024];
+             loop {
+@@ -576,7 +576,7 @@ mod tests {
+         // echo 回显服务器
+         let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let echo_addr = echo.local_addr().unwrap();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             let (mut s, _) = echo.accept().await.unwrap();
+             let mut b = [0u8; 8192];
+             loop {
+diff --git a/crates/vp-protocol/src/vmess.rs b/crates/vp-protocol/src/vmess.rs
+index fe4029b029923e1a99a04b863f6df722ba1a15b2..6d9efb415620ed9131f39b7919093387a5343b31 100644
+--- a/crates/vp-protocol/src/vmess.rs
++++ b/crates/vp-protocol/src/vmess.rs
+@@ -1112,7 +1112,7 @@ impl VmessInbound {
+             meta: Some(meta),
+             stats: Some(ctx.stats.clone()),
+         };
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             let _ = relay(Box::new(client), remote, hook).await;
+         });
+         Ok(())
+@@ -1129,14 +1129,14 @@ impl Inbound for VmessInbound {
+         let listener = tokio::net::TcpListener::bind((self.bind.as_str(), self.port)).await?;
+         let bound = listener.local_addr()?.port();
+         let this = self.clone();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn_listener(self.tag().to_string(), async move {
+             loop {
+                 match listener.accept().await {
+                     Ok((stream, src)) => {
+                         vp_transport::tune(&stream);
+                         let this = this.clone();
+                         let ctx = ctx.clone();
+-                        tokio::spawn(async move {
++                        vp_core::task_scope::spawn(async move {
+                             if let Err(e) = this.serve(stream, src, &ctx).await {
+                                 warn!("vmess 入站会话结束: {e}");
+                             }
+@@ -1161,7 +1161,7 @@ mod tests {
+     async fn roundtrip(security: &str) {
+         let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let echo_addr = echo.local_addr().unwrap();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             let (mut s, _) = echo.accept().await.unwrap();
+             let mut b = [0u8; 1024];
+             loop {
+diff --git a/crates/vp-protocol/src/wireguard.rs b/crates/vp-protocol/src/wireguard.rs
+index 8a1d8476c3c46b5d0a67c4aadaf6ae632d202cce..84855b28f276e55c57a325feca99ac4bcc507457 100644
+--- a/crates/vp-protocol/src/wireguard.rs
++++ b/crates/vp-protocol/src/wireguard.rs
+@@ -222,7 +222,7 @@ impl WgCore {
+             tx: std::sync::Mutex::new(std::collections::VecDeque::new()),
+         });
+         let tunn = Arc::new(std::sync::Mutex::new(tunn));
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             match async {
+                 let udp = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+                 udp.connect((server_owned.as_str(), port)).await?;
+@@ -232,7 +232,7 @@ impl WgCore {
+             {
+                 Ok(udp) => {
+                     let udp = Arc::new(udp);
+-                    tokio::spawn(wire_task(udp, tunn.clone(), q.clone()));
++                    vp_core::task_scope::spawn(wire_task(udp, tunn.clone(), q.clone()));
+                     stack_task(cmd_rx, q, local_v4, local_v6).await;
+                 }
+                 Err(e) => warn!("wireguard 隧道初始化失败: {e}"),
+@@ -1077,7 +1077,7 @@ mod tests {
+             Some(rate_limiter),
+         )
+         .unwrap();
+-        tokio::spawn(wg_server_task(
++        vp_core::task_scope::spawn(wg_server_task(
+             udp,
+             server_tunn,
+             PublicKey::from(client_pub),
+diff --git a/crates/vp-router/src/group.rs b/crates/vp-router/src/group.rs
+index d52dbd4475c996e8ab888d78926a938b38285604..e705c2a241c9092ea1c4378b19b15af32262877b 100644
+--- a/crates/vp-router/src/group.rs
++++ b/crates/vp-router/src/group.rs
+@@ -226,7 +226,7 @@ impl Group {
+             return;
+         }
+         let g = self.clone();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn_background(async move {
+             // lazy 策略组不主动发起全量首轮探活，只有在真实请求触发或手动测速时才探活；
+             // 避免 49 个甚至更多策略组在启动时并发雪崩。
+             if g.lazy {
+@@ -256,7 +256,7 @@ impl Group {
+             let m = m.clone();
+             let sem = semaphore.clone();
+             let url = self.test_url.clone();
+-            tasks.push(tokio::spawn(async move {
++            tasks.push(vp_core::task_scope::spawn(async move {
+                 let _permit = sem.acquire().await.ok();
+                 let started = std::time::Instant::now();
+                 let ok = probe(&m, &url).await.is_ok();
+diff --git a/crates/vp-transport/src/grpc.rs b/crates/vp-transport/src/grpc.rs
+index 49561ff51a85f3c75429032460b0c7a280b59dc0..b1cd4f076a4e0b3a43ed19fc331fa3a59fe66bbc 100644
+--- a/crates/vp-transport/src/grpc.rs
++++ b/crates/vp-transport/src/grpc.rs
+@@ -49,7 +49,7 @@ where
+         .await
+         .map_err(|e| Error::Io(std::io::Error::other(format!("h2 握手失败: {e}"))))?;
+     // 连接驱动任务
+-    tokio::spawn(async move {
++    vp_core::task_scope::spawn(async move {
+         let _ = conn.await;
+     });
+ 
+@@ -101,7 +101,7 @@ where
+         .ok_or(Error::Proto("grpc: 无请求"))?
+         .map_err(|e| Error::ProtoMsg(format!("grpc accept 失败: {e}")))?;
+     // 连接驱动：继续 accept（忽略后续请求）以维持 h2 连接存活
+-    tokio::spawn(async move { while server.accept().await.is_some() {} });
++    vp_core::task_scope::spawn(async move { while server.accept().await.is_some() {} });
+     let recv = req.into_body();
+     let resp = http::Response::builder()
+         .status(200)
+@@ -247,7 +247,7 @@ mod tests {
+         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let addr = listener.local_addr().unwrap();
+         // 服务端：grpc accept → echo
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             let (tcp, _) = listener.accept().await.unwrap();
+             let tls = acceptor.accept(tcp).await.unwrap();
+             let mut s = grpc_accept(tls).await.unwrap();
+@@ -285,7 +285,7 @@ mod tests {
+         let big: Vec<u8> = (0..100_000u32).map(|i| (i % 253) as u8).collect();
+         let (mut c_r, mut c_w) = tokio::io::split(c);
+         let big2 = big.clone();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             c_w.write_all(&big2).await.unwrap();
+             let _ = c_w.shutdown().await;
+         });
+diff --git a/crates/vp-transport/src/http.rs b/crates/vp-transport/src/http.rs
+index 3818a2900ed44fee2204fc040fe8996258e390db..2893964820bbcfe9eedb2964773f2d5295ce6970 100644
+--- a/crates/vp-transport/src/http.rs
++++ b/crates/vp-transport/src/http.rs
+@@ -217,7 +217,7 @@ mod tests {
+     async fn http_transport_roundtrip() {
+         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let addr = listener.local_addr().unwrap();
+-        let server = tokio::spawn(async move {
++        let server = vp_core::task_scope::spawn(async move {
+             use tokio::io::AsyncWriteExt as _;
+             let (mut s, _) = listener.accept().await.unwrap();
+             let mut buf = Vec::new();
+@@ -265,7 +265,7 @@ mod tests {
+     async fn head_is_lazy() {
+         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let addr = listener.local_addr().unwrap();
+-        let server = tokio::spawn(async move {
++        let server = vp_core::task_scope::spawn(async move {
+             let (mut s, _) = listener.accept().await.unwrap();
+             let mut b = [0u8; 1];
+             // 若客户端握手即发头，这里会立刻读到字节 —— 等待超时即符合预期
+diff --git a/crates/vp-transport/src/lib.rs b/crates/vp-transport/src/lib.rs
+index 0b5a1295cc2e6305a9e80be1ab9af5aba548fee0..014237e503d1cf6479b8f96f101818f4f9b3b93b 100644
+--- a/crates/vp-transport/src/lib.rs
++++ b/crates/vp-transport/src/lib.rs
+@@ -474,7 +474,7 @@ mod tests {
+     async fn dial_plain_tcp() {
+         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let addr = listener.local_addr().unwrap();
+-        let server = tokio::spawn(async move {
++        let server = vp_core::task_scope::spawn(async move {
+             use tokio::io::{AsyncReadExt, AsyncWriteExt};
+             let (mut s, _) = listener.accept().await.unwrap();
+             let mut b = [0u8; 2];
+@@ -496,7 +496,7 @@ mod tests {
+     async fn dial_tcp_multi_single_address() {
+         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let addr = listener.local_addr().unwrap();
+-        let server = tokio::spawn(async move {
++        let server = vp_core::task_scope::spawn(async move {
+             let (_s, _) = listener.accept().await.unwrap();
+         });
+         let c = dial_tcp_multi("127.0.0.1", addr.port(), Duration::from_secs(3))
+@@ -513,7 +513,7 @@ mod tests {
+         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let live = listener.local_addr().unwrap();
+         let dead: std::net::SocketAddr = "10.255.255.1:9".parse().unwrap();
+-        let server = tokio::spawn(async move {
++        let server = vp_core::task_scope::spawn(async move {
+             let (_s, _) = listener.accept().await.unwrap();
+         });
+         let c = dial_addrs_multi(
+diff --git a/crates/vp-transport/src/quic.rs b/crates/vp-transport/src/quic.rs
+index d00c6862d6ecf4bdaa9d89a2abfee801eb2f1a9e..5d4784e1216e290d85ea203022a296bf4e15160a 100644
+--- a/crates/vp-transport/src/quic.rs
++++ b/crates/vp-transport/src/quic.rs
+@@ -183,10 +183,10 @@ mod tests {
+         let addr = endpoint.local_addr().unwrap();
+ 
+         // 服务端：accept 连接 → accept_bi → echo
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             while let Some(incoming) = endpoint.accept().await {
+                 if let Ok(conn) = incoming.await {
+-                    tokio::spawn(async move {
++                    vp_core::task_scope::spawn(async move {
+                         while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                             let mut b = [0u8; 2048];
+                             loop {
+@@ -217,7 +217,7 @@ mod tests {
+         let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+         let (mut r, mut w) = tokio::io::split(c);
+         let big2 = big.clone();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             w.write_all(&big2).await.unwrap();
+             let _ = w.shutdown().await;
+         });
+diff --git a/crates/vp-transport/src/tls.rs b/crates/vp-transport/src/tls.rs
+index 806dfa7ecc686a3d53e4a98d602d6c60c57a5122..9b302242acddcac61e0cfc798c7f4c69d7aa4d36 100644
+--- a/crates/vp-transport/src/tls.rs
++++ b/crates/vp-transport/src/tls.rs
+@@ -394,7 +394,7 @@ mod tests {
+ 
+         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let addr = listener.local_addr().unwrap();
+-        let server = tokio::spawn(async move {
++        let server = vp_core::task_scope::spawn(async move {
+             let (tcp, _) = listener.accept().await.unwrap();
+             let mut tls = acceptor.accept(tcp).await.unwrap();
+             use tokio::io::{AsyncReadExt, AsyncWriteExt};
+diff --git a/crates/vp-transport/src/utls.rs b/crates/vp-transport/src/utls.rs
+index 8d578eb5201f99e99f9acb92c901829ae9a70f79..95d3b28989970ee42efa89b44b3cdc9ab29ccdd7 100644
+--- a/crates/vp-transport/src/utls.rs
++++ b/crates/vp-transport/src/utls.rs
+@@ -1565,11 +1565,11 @@ mod tests {
+         let acceptor = crate::tls::tls_acceptor(&cert_pem, &key_pem).unwrap();
+         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let port = l.local_addr().unwrap().port();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             loop {
+                 let Ok((s, _)) = l.accept().await else { break };
+                 let acceptor = acceptor.clone();
+-                tokio::spawn(async move {
++                vp_core::task_scope::spawn(async move {
+                     let Ok(tls) = acceptor.accept(s).await else {
+                         return;
+                     };
+@@ -1609,7 +1609,7 @@ mod tests {
+         let payload: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+         let (mut rh, mut wh) = tokio::io::split(s);
+         let send_payload = payload.clone();
+-        let send_task = tokio::spawn(async move {
++        let send_task = vp_core::task_scope::spawn(async move {
+             wh.write_all(&send_payload).await.unwrap();
+             wh.flush().await.unwrap();
+         });
+@@ -1647,7 +1647,7 @@ mod tests {
+         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(sc));
+         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let port = l.local_addr().unwrap().port();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             let (s, _) = l.accept().await.unwrap();
+             let mut tls = acceptor.accept(s).await.unwrap();
+             assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+@@ -1803,7 +1803,7 @@ mod tests {
+         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let port = listener.local_addr().unwrap().port();
+ 
+-        let srv_task = tokio::spawn(async move {
++        let srv_task = vp_core::task_scope::spawn(async move {
+             let (mut conn, _) = listener.accept().await.unwrap();
+             let srv_static_pri = x25519_dalek::StaticSecret::from(srv_pri_bytes);
+ 
+@@ -2105,7 +2105,7 @@ mod tests {
+         let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+         let port2 = listener2.local_addr().unwrap().port();
+ 
+-        let srv_task2 = tokio::spawn(async move {
++        let srv_task2 = vp_core::task_scope::spawn(async move {
+             let (mut conn, _) = listener2.accept().await.unwrap();
+             let srv_static_pri = x25519_dalek::StaticSecret::from(srv_pri_bytes);
+ 
+diff --git a/crates/vp-transport/src/ws.rs b/crates/vp-transport/src/ws.rs
+index c1da0f30fd3aa3a790e0dbab2975dfb6dee12b50..4bc4917088bb029cfc5c32cabdad32d4f24e8bfb 100644
+--- a/crates/vp-transport/src/ws.rs
++++ b/crates/vp-transport/src/ws.rs
+@@ -440,7 +440,8 @@ mod tests {
+             path: "/ws".into(),
+             headers: vec![("Host".into(), "example.com".into())],
+         };
+-        let server = tokio::spawn(async move { ws_handshake_server(b).await.unwrap() });
++        let server =
++            vp_core::task_scope::spawn(async move { ws_handshake_server(b).await.unwrap() });
+         let client = ws_handshake_client(a, "example.com", &cfg).await.unwrap();
+         let server = server.await.unwrap();
+         (client, server)
+@@ -464,7 +465,7 @@ mod tests {
+         let (mut c, mut s) = echo_pair().await;
+         let payload: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
+         let payload2 = payload.clone();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             c.write_all(&payload2).await.unwrap();
+         });
+         let mut got = vec![0u8; payload.len()];
+diff --git a/crates/vp-tun/src/lib.rs b/crates/vp-tun/src/lib.rs
+index 4a01b46adac70dd53b0412a6643dc9c38bce2e3f..4e4c2b716b9a2b118d87f28161138bcb4754b556 100644
+--- a/crates/vp-tun/src/lib.rs
++++ b/crates/vp-tun/src/lib.rs
+@@ -85,7 +85,7 @@ impl vp_core::Inbound for TunInbound {
+     async fn start(self: Arc<Self>, ctx: InboundCtx) -> Result<u16> {
+         let tag = self.tag.clone();
+         let cfg = self.cfg.clone();
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn_listener(self.tag().to_string(), async move {
+             if let Err(e) = run(cfg, tag, ctx).await {
+                 warn!("TUN 数据面退出: {e}");
+             }
+@@ -132,7 +132,7 @@ async fn run(cfg: TunConfig, tag: Arc<str>, ctx: InboundCtx) -> Result<()> {
+             }
+         }
+         IpAddr::V6(v6) => {
+-            tcfg.address(v6);
++            tcfg.address(std::net::IpAddr::V6(v6));
+         }
+     }
+     tcfg.tun_name("vpcore-tun");
+@@ -201,7 +201,7 @@ where
+         let pool = pool.clone();
+         let resolver = resolver.clone();
+         let dns_hijack = cfg.dns_hijack;
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             match stream {
+                 IpStackStream::Tcp(tcp) => {
+                     let dst_ip = tcp.peer_addr().ip();

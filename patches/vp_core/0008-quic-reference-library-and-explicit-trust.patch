@@ -1,0 +1,1373 @@
+diff --git a/crates/vp-protocol/src/hysteria2.rs b/crates/vp-protocol/src/hysteria2.rs
+index f13809f..06f05de 100644
+--- a/crates/vp-protocol/src/hysteria2.rs
++++ b/crates/vp-protocol/src/hysteria2.rs
+@@ -249,7 +249,7 @@ pub struct Hysteria2Outbound {
+     port: u16,
+     password: String,
+     sni: Option<String>,
+-    skip_verify: bool,
++    client_config: quinn::ClientConfig,
+     _up_mbps: u32,
+     down_mbps: u32,
+     _obfs: Option<SalamanderObfs>,
+@@ -279,7 +279,7 @@ impl Hysteria2Outbound {
+             port: cfg.port,
+             password: cfg.password.clone(),
+             sni: cfg.sni.clone().or(Some(cfg.server.clone())),
+-            skip_verify: cfg.skip_cert_verify,
++            client_config: hysteria_client_config(cfg.skip_cert_verify, cfg.sni.as_deref()),
+             _up_mbps: cfg.up.unwrap_or(0),
+             down_mbps: cfg.down.unwrap_or(0),
+             _obfs: obfs,
+@@ -288,6 +288,27 @@ impl Hysteria2Outbound {
+         })
+     }
+ 
++    /// Use an owned, explicit trust store for this outbound only.
++    ///
++    /// Certificate chains, signatures, validity and the configured SNI (or server
++    /// name) are still verified by rustls. This replaces, rather than augments,
++    /// the public root store, never mutates global trust, and refuses an empty
++    /// store or a conflicting `skip_cert_verify` request.
++    pub fn new_with_root_certificates(
++        cfg: &vp_config::Hysteria2Cfg,
++        roots: rustls::RootCertStore,
++    ) -> Result<Self> {
++        if roots.is_empty() || cfg.skip_cert_verify {
++            return Err(Error::Config(
++                "hysteria2: explicit roots require nonempty trust and certificate verification"
++                    .into(),
++            ));
++        }
++        let mut outbound = Self::new(cfg)?;
++        outbound.client_config = build_hy2_client_config(false, Some(roots));
++        Ok(outbound)
++    }
++
+     async fn connect_quic(&self) -> Result<(quinn::Connection, quinn::Endpoint)> {
+         let addr: SocketAddr = tokio::net::lookup_host((self.server.as_str(), self.port))
+             .await
+@@ -295,10 +316,7 @@ impl Hysteria2Outbound {
+             .next()
+             .ok_or(Error::Addr("无地址".into()))?;
+         let mut ep = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
+-        ep.set_default_client_config(hysteria_client_config(
+-            self.skip_verify,
+-            self.sni.as_deref(),
+-        ));
++        ep.set_default_client_config(self.client_config.clone());
+         let conn = ep
+             .connect(addr, self.sni.as_deref().unwrap_or(&self.server))
+             .map_err(|e| Error::Addr(format!("hy2 连接参数: {e}")))?
+@@ -539,18 +557,24 @@ fn hysteria_client_config(skip_verify: bool, _sni: Option<&str>) -> quinn::Clien
+     static NO_VERIFY: std::sync::OnceLock<quinn::ClientConfig> = std::sync::OnceLock::new();
+     if skip_verify {
+         NO_VERIFY
+-            .get_or_init(|| build_hy2_client_config(true))
++            .get_or_init(|| build_hy2_client_config(true, None))
+             .clone()
+     } else {
+         VERIFY
+-            .get_or_init(|| build_hy2_client_config(false))
++            .get_or_init(|| build_hy2_client_config(false, None))
+             .clone()
+     }
+ }
+ 
+-fn build_hy2_client_config(skip_verify: bool) -> quinn::ClientConfig {
+-    let mut roots = rustls::RootCertStore::empty();
+-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
++fn build_hy2_client_config(
++    skip_verify: bool,
++    roots: Option<rustls::RootCertStore>,
++) -> quinn::ClientConfig {
++    let roots = roots.unwrap_or_else(|| {
++        let mut roots = rustls::RootCertStore::empty();
++        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
++        roots
++    });
+     let mut crypto = rustls::ClientConfig::builder()
+         .with_root_certificates(roots)
+         .with_no_client_auth();
+diff --git a/crates/vp-protocol/src/tuic.rs b/crates/vp-protocol/src/tuic.rs
+index d030f55..a6b5227 100644
+--- a/crates/vp-protocol/src/tuic.rs
++++ b/crates/vp-protocol/src/tuic.rs
+@@ -140,9 +140,10 @@ pub struct TuicOutbound {
+     name: Arc<str>,
+     server: String,
+     port: u16,
++    sni: Option<String>,
+     uuid: String,
+     password: String,
+-    skip_verify: bool,
++    client_config: quinn::ClientConfig,
+     _congestion_controller: Option<String>,
+     assoc_counter: AtomicU16,
+     native_udp: bool,
+@@ -154,9 +155,10 @@ impl TuicOutbound {
+             name: "tuic".into(),
+             server: cfg.server.clone(),
+             port: cfg.port,
++            sni: cfg.sni.clone(),
+             uuid: cfg.uuid.clone(),
+             password: cfg.password.clone(),
+-            skip_verify: cfg.skip_cert_verify,
++            client_config: tuic_client_config(cfg.skip_cert_verify),
+             _congestion_controller: cfg.congestion_controller.clone(),
+             assoc_counter: AtomicU16::new(1),
+             native_udp: match cfg.udp_relay_mode.as_deref().unwrap_or("native") {
+@@ -167,6 +169,26 @@ impl TuicOutbound {
+         })
+     }
+ 
++    /// Use an owned, explicit trust store for this outbound only.
++    ///
++    /// Certificate chains, signatures, validity and the configured SNI (or server
++    /// name) are still verified by rustls. This replaces, rather than augments,
++    /// the public root store, never mutates global trust, and refuses an empty
++    /// store or a conflicting `skip_cert_verify` request.
++    pub fn new_with_root_certificates(
++        cfg: &vp_config::TuicCfg,
++        roots: rustls::RootCertStore,
++    ) -> Result<Self> {
++        if roots.is_empty() || cfg.skip_cert_verify {
++            return Err(Error::Config(
++                "tuic: explicit roots require nonempty trust and certificate verification".into(),
++            ));
++        }
++        let mut outbound = Self::new(cfg)?;
++        outbound.client_config = build_tuic_client_config(false, Some(roots));
++        Ok(outbound)
++    }
++
+     /// QUIC 连接 + Authenticate
+     async fn dial(&self) -> Result<quinn::Connection> {
+         let addr: SocketAddr = tokio::net::lookup_host((self.server.as_str(), self.port))
+@@ -175,9 +197,9 @@ impl TuicOutbound {
+             .next()
+             .ok_or(Error::Addr("无地址".into()))?;
+         let mut ep = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
+-        ep.set_default_client_config(tuic_client_config(self.skip_verify));
++        ep.set_default_client_config(self.client_config.clone());
+         let conn = ep
+-            .connect(addr, &self.server)
++            .connect(addr, self.sni.as_deref().unwrap_or(&self.server))
+             .map_err(|e| Error::Addr(format!("tuic 连接参数: {e}")))?
+             .await
+             .map_err(|e| Error::Io(std::io::Error::other(format!("tuic QUIC 握手: {e}"))))?;
+@@ -531,18 +553,24 @@ fn tuic_client_config(skip_verify: bool) -> quinn::ClientConfig {
+     static NO_VERIFY: std::sync::OnceLock<quinn::ClientConfig> = std::sync::OnceLock::new();
+     if skip_verify {
+         NO_VERIFY
+-            .get_or_init(|| build_tuic_client_config(true))
++            .get_or_init(|| build_tuic_client_config(true, None))
+             .clone()
+     } else {
+         VERIFY
+-            .get_or_init(|| build_tuic_client_config(false))
++            .get_or_init(|| build_tuic_client_config(false, None))
+             .clone()
+     }
+ }
+ 
+-fn build_tuic_client_config(skip_verify: bool) -> quinn::ClientConfig {
+-    let mut roots = rustls::RootCertStore::empty();
+-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
++fn build_tuic_client_config(
++    skip_verify: bool,
++    roots: Option<rustls::RootCertStore>,
++) -> quinn::ClientConfig {
++    let roots = roots.unwrap_or_else(|| {
++        let mut roots = rustls::RootCertStore::empty();
++        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
++        roots
++    });
+     let mut crypto = rustls::ClientConfig::builder()
+         .with_root_certificates(roots)
+         .with_no_client_auth();
+diff --git a/crates/vp-protocol/tests/quic_library_interop.rs b/crates/vp-protocol/tests/quic_library_interop.rs
+new file mode 100644
+index 0000000..46b91c5
+--- /dev/null
++++ b/crates/vp-protocol/tests/quic_library_interop.rs
+@@ -0,0 +1,592 @@
++//! Official sing-box protocol-library interoperability; NOT a full sing-box CLI test.
++//! The unmodified pinned reference libraries run only behind a loopback-enforcing adapter.
++use std::{
++    io::{Read, Write},
++    process::{Child, Command, Stdio},
++    sync::Arc,
++    time::Duration,
++};
++use vp_core::{Inbound, InboundCtx};
++struct NoopRouter;
++#[async_trait::async_trait]
++impl vp_core::Router for NoopRouter {
++    async fn pick(&self, _: &vp_core::session::Session) -> vp_core::router::Resolution {
++        unreachable!()
++    }
++}
++struct Peer(Child);
++impl Drop for Peer {
++    fn drop(&mut self) {
++        let _ = self.0.kill();
++        let _ = self.0.wait();
++    }
++}
++struct EphemeralIdentity {
++    ca: rcgen::Certificate,
++    cert: rcgen::Certificate,
++    key: rcgen::KeyPair,
++}
++fn ephemeral_identity() -> EphemeralIdentity {
++    use rcgen::{
++        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
++        KeyUsagePurpose,
++    };
++    let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
++    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
++    ca_params.distinguished_name.push(
++        rcgen::DnType::CommonName,
++        format!("ephemeral-ca-{:032x}", rand::random::<u128>()),
++    );
++    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
++    let ca_key = KeyPair::generate().unwrap();
++    let ca = ca_params.self_signed(&ca_key).unwrap();
++    let key = KeyPair::generate().unwrap();
++    let mut leaf = CertificateParams::new(vec!["localhost".into()]).unwrap();
++    leaf.key_usages = vec![KeyUsagePurpose::DigitalSignature];
++    leaf.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
++    let cert = leaf.signed_by(&key, &ca, &ca_key).unwrap();
++    EphemeralIdentity { ca, cert, key }
++}
++fn roots(ca: &rcgen::Certificate) -> rustls::RootCertStore {
++    let mut roots = rustls::RootCertStore::empty();
++    roots.add(ca.der().clone()).unwrap();
++    roots
++}
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Failure {
++    None,
++    Auth,
++    WrongCa,
++    WrongName,
++    PublicRoots,
++}
++impl Failure {
++    fn tls_reason(self) -> Option<&'static str> {
++        match self {
++            Self::WrongCa | Self::PublicRoots => Some("UnknownIssuer"),
++            Self::WrongName => Some("certificate not valid for name"),
++            _ => None,
++        }
++    }
++}
++
++async fn interop(protocol: &str, mode: &str, negative: bool) {
++    let bin = std::env::var_os("VP_QUIC_REFERENCE")
++        .expect("build the verified official protocol-library harness first");
++    let cert = ephemeral_identity();
++    let password = format!("ephemeral-{:032x}", rand::random::<u128>());
++    let ctx = InboundCtx {
++        router: Arc::new(NoopRouter),
++        stats: Arc::default(),
++        conns: Arc::new(vp_core::ConnTable::new()),
++    };
++    let server: Arc<dyn Inbound> = match protocol {
++        "tuic" => Arc::new(vp_protocol::tuic::TuicInbound::new(
++            "127.0.0.1",
++            0,
++            "reference",
++            vec![(
++                "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
++                password.clone(),
++            )],
++            cert.cert.pem().into_bytes(),
++            cert.key.serialize_pem().into_bytes(),
++        )),
++        "hysteria2" => Arc::new(vp_protocol::hysteria2::Hysteria2Inbound::new(
++            "127.0.0.1",
++            0,
++            "reference",
++            &password,
++            cert.cert.pem().into_bytes(),
++            cert.key.serialize_pem().into_bytes(),
++        )),
++        _ => unreachable!(),
++    };
++    let scope = vp_core::task_scope::TaskScope::new();
++    let port = scope.run(server.start(ctx)).await.unwrap();
++    let config = serde_json::json!({"protocol":protocol,"mode":mode,"port":port,"password":if negative {"invalid-ephemeral"}else{&password},"certificate":cert.ca.pem(),"negative":negative});
++    let child = Command::new(bin)
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::piped())
++        .spawn()
++        .unwrap();
++    let mut peer = Peer(child);
++    peer.0
++        .stdin
++        .take()
++        .unwrap()
++        .write_all(&serde_json::to_vec(&config).unwrap())
++        .unwrap();
++    let status = tokio::time::timeout(Duration::from_secs(20), async {
++        loop {
++            if let Some(status) = peer.0.try_wait().unwrap() {
++                break status;
++            }
++            tokio::time::sleep(Duration::from_millis(20)).await;
++        }
++    })
++    .await
++    .expect("reference harness must terminate");
++    let mut stdout = String::new();
++    let mut stderr = String::new();
++    peer.0
++        .stdout
++        .take()
++        .unwrap()
++        .read_to_string(&mut stdout)
++        .unwrap();
++    peer.0
++        .stderr
++        .take()
++        .unwrap()
++        .read_to_string(&mut stderr)
++        .unwrap();
++    let shutdown = scope.shutdown(Duration::ZERO, Duration::from_secs(2)).await;
++    assert_eq!(
++        shutdown.remaining_tasks, 0,
++        "reference test leaked product tasks"
++    );
++    assert!(status.success(), "reference library failed: {stderr}");
++    let result: serde_json::Value = serde_json::from_str(&stdout).unwrap();
++    assert_eq!(result["ok"], true);
++    assert_eq!(result["kind"], "official-protocol-library");
++    eprintln!("PASS official protocol-library peer (not CLI): {stdout}");
++}
++#[tokio::test]
++#[ignore = "requires verified official-library harness"]
++async fn sing_quic_tuic_native_tcp_udp() {
++    interop("tuic", "native", false).await
++}
++#[tokio::test]
++#[ignore = "requires verified official-library harness"]
++async fn sing_quic_tuic_stream_tcp_udp() {
++    interop("tuic", "quic", false).await
++}
++#[tokio::test]
++#[ignore = "requires verified official-library harness"]
++async fn sing_quic_hysteria2_tcp_udp() {
++    interop("hysteria2", "native", false).await
++}
++#[tokio::test]
++#[ignore = "requires verified official-library harness"]
++async fn sing_quic_tuic_invalid_auth_never_forwards() {
++    interop("tuic", "native", true).await
++}
++#[tokio::test]
++#[ignore = "requires verified official-library harness"]
++async fn sing_quic_hysteria2_invalid_auth_never_forwards() {
++    interop("hysteria2", "native", true).await
++}
++
++async fn finish_server(peer: &mut Peer, stdin: std::process::ChildStdin) {
++    // EOF requests normal service Close; Drop remains a kill/wait fallback on panic.
++    drop(stdin);
++    let status = tokio::time::timeout(Duration::from_secs(3), async {
++        loop {
++            if let Some(status) = peer.0.try_wait().unwrap() {
++                break status;
++            }
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    })
++    .await
++    .expect("reference server must close after stdin EOF");
++    let mut stderr = String::new();
++    peer.0
++        .stderr
++        .take()
++        .unwrap()
++        .read_to_string(&mut stderr)
++        .unwrap();
++    assert!(
++        status.success(),
++        "reference server shutdown failed: {stderr}"
++    );
++}
++
++async fn reverse_interop(protocol: &str, mode: &str, failure: Failure) {
++    use std::io::BufRead;
++    use tokio::io::{AsyncReadExt, AsyncWriteExt};
++    use vp_common::DstAddr;
++    use vp_core::{Outbound, UdpPacket, session::Session};
++    let bin = std::env::var_os("VP_QUIC_REFERENCE").expect("verified test-only reference required");
++    let cert = ephemeral_identity();
++    let password = format!("ephemeral-{:032x}", rand::random::<u128>());
++    let config = serde_json::json!({"role":"server","protocol":protocol,"password":password,"certificate":cert.cert.pem(),"privateKey":cert.key.serialize_pem()});
++    let child = Command::new(bin)
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::piped())
++        .spawn()
++        .unwrap();
++    let mut peer = Peer(child);
++    let mut stdin = peer.0.stdin.take().unwrap();
++    stdin
++        .write_all(&serde_json::to_vec(&config).unwrap())
++        .unwrap();
++    stdin.write_all(b"\n").unwrap();
++    let stdout = peer.0.stdout.take().unwrap();
++    let ready = tokio::time::timeout(
++        Duration::from_secs(5),
++        tokio::task::spawn_blocking(move || {
++            let mut line = String::new();
++            std::io::BufReader::new(stdout)
++                .read_line(&mut line)
++                .unwrap();
++            line
++        }),
++    )
++    .await
++    .unwrap()
++    .unwrap();
++    if ready.is_empty() {
++        let mut err = String::new();
++        peer.0
++            .stderr
++            .take()
++            .unwrap()
++            .read_to_string(&mut err)
++            .unwrap();
++        panic!("reference server failed: {err}");
++    }
++    let ready: serde_json::Value = serde_json::from_str(&ready).unwrap();
++    assert_eq!(ready["ready"], true);
++    let port = ready["port"].as_u64().unwrap() as u16;
++    let credential = if failure == Failure::Auth {
++        "invalid-ephemeral"
++    } else {
++        &password
++    };
++    // Per-instance owned CA, normal rustls validation; no global trust changes.
++    let root_store = if failure == Failure::WrongCa {
++        roots(&ephemeral_identity().ca)
++    } else {
++        roots(&cert.ca)
++    };
++    let name = if failure == Failure::WrongName {
++        "wrong.invalid"
++    } else {
++        "localhost"
++    };
++    let cfg = serde_json::json!({"server":"127.0.0.1","port":port,"password":credential,
++        "uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","sni":name,"skip_cert_verify":false,"udp_relay_mode":mode});
++    let outbound: Box<dyn Outbound> = match protocol {
++        "tuic" => {
++            let cfg = serde_json::from_value(cfg).unwrap();
++            Box::new(
++                if failure == Failure::PublicRoots {
++                    vp_protocol::tuic::TuicOutbound::new(&cfg)
++                } else {
++                    vp_protocol::tuic::TuicOutbound::new_with_root_certificates(&cfg, root_store)
++                }
++                .unwrap(),
++            )
++        }
++        "hysteria2" => {
++            let cfg = serde_json::from_value(cfg).unwrap();
++            Box::new(
++                if failure == Failure::PublicRoots {
++                    vp_protocol::hysteria2::Hysteria2Outbound::new(&cfg)
++                } else {
++                    vp_protocol::hysteria2::Hysteria2Outbound::new_with_root_certificates(
++                        &cfg, root_store,
++                    )
++                }
++                .unwrap(),
++            )
++        }
++        _ => unreachable!(),
++    };
++    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let tcp_addr = tcp.local_addr().unwrap();
++    let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
++    let udp_addr = udp.local_addr().unwrap();
++    let tcp_dst = DstAddr::ip(tcp_addr.ip(), tcp_addr.port());
++    let udp_dst = DstAddr::ip(udp_addr.ip(), udp_addr.port());
++    let tcp_session = Session::new_tcp("reverse".into(), None, tcp_dst.clone());
++    let udp_session = Session::new_udp("reverse".into(), None, udp_dst.clone());
++    if failure != Failure::None {
++        let tcp_result = tokio::time::timeout(
++            Duration::from_secs(3),
++            outbound.connect_stream(&tcp_session, &tcp_dst),
++        )
++        .await
++        .unwrap();
++        if let Some(reason) = failure.tls_reason() {
++            assert!(
++                tcp_result
++                    .as_ref()
++                    .err()
++                    .is_some_and(|error| error.to_string().contains(reason)),
++                "expected TCP TLS {reason}, got {:?}",
++                tcp_result.as_ref().err()
++            );
++        }
++        let mut tcp_attempt = tcp_result.ok();
++        if let Some(stream) = &mut tcp_attempt {
++            let _ = stream.write_all(b"unauthorized").await;
++        }
++        let udp_result = tokio::time::timeout(
++            Duration::from_secs(3),
++            outbound.connect_packet(&udp_session, &udp_dst),
++        )
++        .await
++        .unwrap();
++        if let Some(reason) = failure.tls_reason() {
++            assert!(
++                udp_result
++                    .as_ref()
++                    .err()
++                    .is_some_and(|error| error.to_string().contains(reason)),
++                "expected UDP TLS {reason}, got {:?}",
++                udp_result.as_ref().err()
++            );
++        }
++        let udp_attempt = udp_result.ok();
++        if let Some(packet) = &udp_attempt {
++            let _ = packet
++                .send(&UdpPacket {
++                    src: "127.0.0.1:0".parse().unwrap(),
++                    dst: udp_addr,
++                    data: b"unauthorized".as_slice().into(),
++                })
++                .await;
++        }
++        assert!(
++            tokio::time::timeout(Duration::from_millis(400), tcp.accept())
++                .await
++                .is_err(),
++            "invalid vp_core credentials reached reference TCP target"
++        );
++        let mut bytes = [0; 128];
++        assert!(
++            tokio::time::timeout(Duration::from_millis(400), udp.recv_from(&mut bytes))
++                .await
++                .is_err(),
++            "invalid vp_core credentials reached reference UDP target"
++        );
++        eprintln!(
++            "PASS vp_core outbound -> official protocol-library {protocol}/{mode}: {failure:?} causes no TCP/UDP destination traffic (not CLI; certificate verification ON)"
++        );
++        finish_server(&mut peer, stdin).await;
++        return;
++    }
++    let mut targets = tokio::task::JoinSet::new();
++    targets.spawn(async move {
++        let (mut stream, _) = tcp.accept().await.unwrap();
++        let (mut read, mut write) = stream.split();
++        tokio::io::copy(&mut read, &mut write).await.unwrap();
++    });
++    let mut stream = outbound
++        .connect_stream(&tcp_session, &tcp_dst)
++        .await
++        .unwrap();
++    stream.write_all(b"independent-reverse-tcp").await.unwrap();
++    let mut reply = [0; 23];
++    stream.read_exact(&mut reply).await.unwrap();
++    assert_eq!(&reply, b"independent-reverse-tcp");
++    stream.shutdown().await.unwrap();
++    let mut eof = [0];
++    assert_eq!(stream.read(&mut eof).await.unwrap(), 0);
++    let mut packet = outbound
++        .connect_packet(&udp_session, &udp_dst)
++        .await
++        .unwrap();
++    let second = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
++    let sizes = if protocol == "hysteria2" {
++        [73, 4096, 4096, 73]
++    } else {
++        [73, 6000, 6000, 73]
++    };
++    let mut expected_source = None;
++    for (index, size) in sizes.into_iter().enumerate() {
++        let target = if index % 2 == 0 { &udp } else { &second };
++        let address = target.local_addr().unwrap();
++        let body = vec![0x41 + index as u8; size];
++        packet
++            .send(&UdpPacket {
++                src: "127.0.0.1:0".parse().unwrap(),
++                dst: address,
++                data: body.clone().into(),
++            })
++            .await
++            .unwrap();
++        let mut bytes = vec![0; 65535];
++        let (n, source) = target.recv_from(&mut bytes).await.unwrap();
++        assert_eq!(&bytes[..n], &body);
++        if let Some(expected) = expected_source {
++            assert_eq!(
++                source, expected,
++                "reference association source port changed"
++            );
++        }
++        expected_source = Some(source);
++        target.send_to(&bytes[..n], source).await.unwrap();
++        let reply = packet.recv().await.unwrap();
++        assert_eq!(reply.data.as_ref(), body);
++        assert_eq!(reply.src, address);
++    }
++    eprintln!(
++        "PASS vp_core outbound -> official protocol-library {protocol}/{mode}: TCP+half-close, UDP sizes {sizes:?}, multi-target/stable association (not CLI; ephemeral CA chain/name/signature verification ON)"
++    );
++    finish_server(&mut peer, stdin).await;
++    targets.join_next().await.unwrap().unwrap();
++}
++
++#[tokio::test]
++#[ignore = "requires verified official-library harness"]
++async fn vp_tuic_native_to_official_server() {
++    tokio::time::timeout(
++        Duration::from_secs(15),
++        reverse_interop("tuic", "native", Failure::None),
++    )
++    .await
++    .unwrap();
++}
++#[tokio::test]
++#[ignore = "requires verified official-library harness"]
++async fn vp_tuic_stream_to_official_server() {
++    tokio::time::timeout(
++        Duration::from_secs(15),
++        reverse_interop("tuic", "quic", Failure::None),
++    )
++    .await
++    .unwrap();
++}
++#[tokio::test]
++#[ignore = "requires verified official-library harness"]
++async fn vp_hysteria2_to_official_server() {
++    tokio::time::timeout(
++        Duration::from_secs(15),
++        reverse_interop("hysteria2", "native", Failure::None),
++    )
++    .await
++    .unwrap();
++}
++#[tokio::test]
++#[ignore = "requires verified official-library harness"]
++async fn vp_tuic_invalid_auth_to_official_server() {
++    tokio::time::timeout(
++        Duration::from_secs(15),
++        reverse_interop("tuic", "native", Failure::Auth),
++    )
++    .await
++    .unwrap();
++}
++#[tokio::test]
++#[ignore = "requires verified official-library harness"]
++async fn vp_hysteria2_invalid_auth_to_official_server() {
++    tokio::time::timeout(
++        Duration::from_secs(15),
++        reverse_interop("hysteria2", "native", Failure::Auth),
++    )
++    .await
++    .unwrap();
++}
++
++#[tokio::test]
++#[ignore = "requires verified official-library harness"]
++async fn sing_quic_tuic_stream_invalid_auth_never_forwards() {
++    interop("tuic", "quic", true).await
++}
++#[tokio::test]
++#[ignore = "requires verified official-library harness"]
++async fn vp_tuic_stream_invalid_auth_to_official_server() {
++    tokio::time::timeout(
++        Duration::from_secs(15),
++        reverse_interop("tuic", "quic", Failure::Auth),
++    )
++    .await
++    .unwrap();
++}
++
++#[tokio::test]
++#[ignore = "requires verified official-library harness"]
++async fn vp_tuic_wrong_ca_rejects_official_server() {
++    tokio::time::timeout(
++        Duration::from_secs(15),
++        reverse_interop("tuic", "native", Failure::WrongCa),
++    )
++    .await
++    .unwrap();
++}
++
++#[tokio::test]
++#[ignore = "requires verified official-library harness"]
++async fn vp_tuic_wrong_name_rejects_official_server() {
++    tokio::time::timeout(
++        Duration::from_secs(15),
++        reverse_interop("tuic", "native", Failure::WrongName),
++    )
++    .await
++    .unwrap();
++}
++
++#[tokio::test]
++#[ignore = "requires verified official-library harness"]
++async fn vp_tuic_untrusted_default_roots_rejects_official_server() {
++    tokio::time::timeout(
++        Duration::from_secs(15),
++        reverse_interop("tuic", "native", Failure::PublicRoots),
++    )
++    .await
++    .unwrap();
++}
++
++#[tokio::test]
++#[ignore = "requires verified official-library harness"]
++async fn vp_hysteria2_wrong_ca_rejects_official_server() {
++    tokio::time::timeout(
++        Duration::from_secs(15),
++        reverse_interop("hysteria2", "native", Failure::WrongCa),
++    )
++    .await
++    .unwrap();
++}
++
++#[tokio::test]
++#[ignore = "requires verified official-library harness"]
++async fn vp_hysteria2_wrong_name_rejects_official_server() {
++    tokio::time::timeout(
++        Duration::from_secs(15),
++        reverse_interop("hysteria2", "native", Failure::WrongName),
++    )
++    .await
++    .unwrap();
++}
++
++#[tokio::test]
++#[ignore = "requires verified official-library harness"]
++async fn vp_hysteria2_untrusted_default_roots_rejects_official_server() {
++    tokio::time::timeout(
++        Duration::from_secs(15),
++        reverse_interop("hysteria2", "native", Failure::PublicRoots),
++    )
++    .await
++    .unwrap();
++}
++
++#[test]
++fn explicit_quic_trust_rejects_empty_or_insecure_configuration() {
++    let cert = ephemeral_identity();
++    for insecure in [false, true] {
++        let cfg = serde_json::json!({"server":"127.0.0.1","port":1,"password":"ephemeral", "uuid":"b831381d-6324-4d53-ad4f-8cda48b30811","skip_cert_verify":insecure});
++        let tuic = serde_json::from_value(cfg.clone()).unwrap();
++        let hy2 = serde_json::from_value(cfg).unwrap();
++        let trust = || {
++            if insecure {
++                roots(&cert.ca)
++            } else {
++                rustls::RootCertStore::empty()
++            }
++        };
++        assert!(
++            vp_protocol::tuic::TuicOutbound::new_with_root_certificates(&tuic, trust()).is_err()
++        );
++        assert!(
++            vp_protocol::hysteria2::Hysteria2Outbound::new_with_root_certificates(&hy2, trust())
++                .is_err()
++        );
++    }
++}
+diff --git a/crates/vp-protocol/tests/reference_quic/README.md b/crates/vp-protocol/tests/reference_quic/README.md
+new file mode 100644
+index 0000000..d8396a7
+--- /dev/null
++++ b/crates/vp-protocol/tests/reference_quic/README.md
+@@ -0,0 +1,79 @@
++# Independent official protocol-library peer (test-only)
++
++This adapter constructs the **unmodified** exported `sing-quic` TUIC/Hysteria2
++clients and servers selected by official sing-box **1.14.4**. It does not construct
++the sing-box CLI or NetworkManager. A library pass is **not** a full-program CLI
++pass. No Go/reference dependency is linked into or required by the product core.
++
++All protocol authentication, QUIC/TLS, HTTP/3 and UDP fragment processing is upstream
++code. This harness supplies only standard TLS configuration, a loopback-only dialer,
++a loopback-only ordinary payload relay, and destination-side assertions.
++
++## Source integrity
++
++Pinned to the official release [go.mod](https://raw.githubusercontent.com/SagerNet/sing-box/v1.14.4/go.mod)
++and [go.sum](https://raw.githubusercontent.com/SagerNet/sing-box/v1.14.4/go.sum):
++
++- `github.com/sagernet/sing-quic v0.7.2-0.20261020082049-7e0a5869a5f4`
++- `github.com/sagernet/quic-go v0.61.0-sing-box-mod.12`
++- `github.com/sagernet/sing v0.9.7-0.20261023115459-5dc452e537bf`
++
++Both module and go.mod `h1` checksums for all three match the official release
++manifest. The checked-in `go.sum` locks the complete harness dependency graph.
++Never disable `GOSUMDB` verification; run `go mod verify` before building.
++The official release go.sum SHA-256 used for comparison is
++`a93ea3b691cdfbba29d49ac63ed8352601306d89625e0abc87e41241434e8592`.
++
++Validated compiler: official Go **1.26.10**, linux-amd64 archive SHA-256
++`ccfe7ae822d2c2f41f4fe7c956199967a4dac22d0ee0d2b2bfdb440aab3b20c5`,
++verified against `https://go.dev/dl/?mode=json&include=all` before extraction.
++The toolchain is test-only; it is not a new product dependency.
++
++## Reproduce
++
++Use an authorized, checksum-verified official Go compiler, with writable private
++`GOMODCACHE`/`GOCACHE`. From this directory:
++
++```sh
++export GOTOOLCHAIN=local GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org
++go mod download
++go mod verify
++go vet ./...
++go build -mod=readonly -trimpath -buildvcs=false -o /absolute/test-output/reference-quic .
++```
++
++From the vp_core workspace (Rust 1.88.0 and unchanged Cargo.lock):
++
++```sh
++export CARGO_INCREMENTAL=0
++export VP_QUIC_REFERENCE=/absolute/test-output/reference-quic
++cargo test --locked -p vp-protocol --test quic_library_interop -- --include-ignored --nocapture
++cargo test --locked -p vp-protocol --test quic_auth_negative
++```
++
++The Rust tests supply fresh credentials, CA, signed leaf and private key over stdin;
++no keys are saved. Client and server listeners/targets are ephemeral loopback-only.
++The reverse client uses an owned per-instance CA store and normal certificate,
++signature and SNI validation. Wrong CA, wrong name and untrusted-default-root cases
++must produce actual TLS verification errors **and** no TCP/UDP destination traffic.
++Empty custom trust stores and insecure/custom-trust conflicts are rejected.
++No global trust store, route/firewall/TUN/system proxy, monitor or installer changes.
++
++## Coverage and limits
++
++Both directions: official library client -> vp_core inbound; vp_core outbound ->
++official library server. TUIC native-datagram and QUIC-stream modes; Hysteria2;
++authenticated TCP echo; reverse TCP half-close; UDP alternating two destinations,
++stable association source, payload/source validation and fragmentation. Wrong
++credentials cover TCP/UDP in both directions and both TUIC UDP modes.
++
++UDP payloads: TUIC **73 and 6000 bytes**; Hysteria2 **73 and 4096 bytes**.
++The unmodified official Hy2 peer declares `MaxUDPSize = 4096` and rejects larger
++writes locally. A first 6000-byte attempt failed before sending with
++`DATAGRAM frame too large (maximum: 4096 bytes)`; this is a reference-library limit,
++not a measured product wire failure or an implicit passed test.
++
++Full official CLI testing remains independently blocked before listening by sandbox
++netlink-monitor `EPERM`. These local library tests do not certify full CLI startup,
++non-loopback operation, native platforms, performance, optional obfuscation,
++all TLS policy combinations or complete protocol conformance.
+diff --git a/crates/vp-protocol/tests/reference_quic/go.mod b/crates/vp-protocol/tests/reference_quic/go.mod
+new file mode 100644
+index 0000000..5cc4922
+--- /dev/null
++++ b/crates/vp-protocol/tests/reference_quic/go.mod
+@@ -0,0 +1,30 @@
++module vp-product-test-only/reference-quic
++
++go 1.26.0
++
++// Exact protocol-library identities from the official sing-box v1.14.4 go.mod.
++require (
++	github.com/sagernet/quic-go v0.61.0-sing-box-mod.12 // indirect
++	github.com/sagernet/sing v0.9.7-0.20261023115459-5dc452e537bf
++	github.com/sagernet/sing-quic v0.7.2-0.20261020082049-7e0a5869a5f4
++)
++
++require (
++	github.com/andybalholm/brotli v1.0.6 // indirect
++	github.com/gofrs/uuid/v5 v5.5.1 // indirect
++	github.com/google/gopacket v1.1.19 // indirect
++	github.com/huin/goupnp v1.2.0 // indirect
++	github.com/jackpal/go-nat-pmp v1.0.2 // indirect
++	github.com/klauspost/compress v1.17.9 // indirect
++	github.com/koron/go-ssdp v0.0.4 // indirect
++	github.com/libp2p/go-nat v1.0.1-0.20250821073202-01afc089f138 // indirect
++	github.com/libp2p/go-netroute v0.2.1 // indirect
++	github.com/metacubex/utls v1.8.7 // indirect
++	github.com/quic-go/qpack v0.6.0 // indirect
++	golang.org/x/crypto v0.54.0 // indirect
++	golang.org/x/exp v0.0.0-20250911091902-df9299821621 // indirect
++	golang.org/x/net v0.56.0 // indirect
++	golang.org/x/sync v0.22.0 // indirect
++	golang.org/x/sys v0.47.0 // indirect
++	golang.org/x/text v0.40.0 // indirect
++)
+diff --git a/crates/vp-protocol/tests/reference_quic/go.sum b/crates/vp-protocol/tests/reference_quic/go.sum
+new file mode 100644
+index 0000000..27488b9
+--- /dev/null
++++ b/crates/vp-protocol/tests/reference_quic/go.sum
+@@ -0,0 +1,61 @@
++github.com/andybalholm/brotli v1.0.6 h1:Yf9fFpf49Zrxb9NlQaluyE92/+X7UVHlhMNJN2sxfOI=
++github.com/andybalholm/brotli v1.0.6/go.mod h1:fO7iG3H7G2nSZ7m0zPUDn85XEX2GTukHGRSepvi9Eig=
++github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
++github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
++github.com/gofrs/uuid/v5 v5.5.1 h1:z1Ce19/JwNidXpy3tOQc3241lnJLKdKyq/xlNvlD4Ng=
++github.com/gofrs/uuid/v5 v5.5.1/go.mod h1:bbAA98EoIlxyRHIVg6ektCSsZ5n8mSbwgEhvhMYlZgg=
++github.com/google/gopacket v1.1.19 h1:ves8RnFZPGiFnTS0uPQStjwru6uO6h+nlr9j6fL7kF8=
++github.com/google/gopacket v1.1.19/go.mod h1:iJ8V8n6KS+z2U1A8pUwu8bW5SyEMkXJB8Yo/Vo+TKTo=
++github.com/huin/goupnp v1.2.0 h1:uOKW26NG1hsSSbXIZ1IR7XP9Gjd1U8pnLaCMgntmkmY=
++github.com/huin/goupnp v1.2.0/go.mod h1:gnGPsThkYa7bFi/KWmEysQRf48l2dvR5bxr2OFckNX8=
++github.com/jackpal/go-nat-pmp v1.0.2 h1:KzKSgb7qkJvOUTqYl9/Hg/me3pWgBmERKrTGD7BdWus=
++github.com/jackpal/go-nat-pmp v1.0.2/go.mod h1:QPH045xvCAeXUZOxsnwmrtiCoxIr9eob+4orBN1SBKc=
++github.com/klauspost/compress v1.17.9 h1:6KIumPrER1LHsvBVuDa0r5xaG0Es51mhhB9BQB2qeMA=
++github.com/klauspost/compress v1.17.9/go.mod h1:Di0epgTjJY877eYKx5yC51cX2A2Vl2ibi7bDH9ttBbw=
++github.com/koron/go-ssdp v0.0.4 h1:1IDwrghSKYM7yLf7XCzbByg2sJ/JcNOZRXS2jczTwz0=
++github.com/koron/go-ssdp v0.0.4/go.mod h1:oDXq+E5IL5q0U8uSBcoAXzTzInwy5lEgC91HoKtbmZk=
++github.com/libp2p/go-nat v1.0.1-0.20250821073202-01afc089f138 h1:YohuNPT/1k3VcThCQlBZ43PCPWPfMRS1zcxWBF2SLK8=
++github.com/libp2p/go-nat v1.0.1-0.20250821073202-01afc089f138/go.mod h1:TXQg5tfSy+bUjnhT5728j5j/MBj7keIYqqZ1+8k/ui8=
++github.com/libp2p/go-netroute v0.2.1 h1:V8kVrpD8GK0Riv15/7VN6RbUQ3URNZVosw7H2v9tksU=
++github.com/libp2p/go-netroute v0.2.1/go.mod h1:hraioZr0fhBjG0ZRXJJ6Zj2IVEVNx6tDTFQfSmcq7mQ=
++github.com/metacubex/utls v1.8.7 h1:Cp+yWkNTFkSihETgGWq34hlVFds5HpYWVOR1xovUVTs=
++github.com/metacubex/utls v1.8.7/go.mod h1:kncGGVhFaoGn5M3pFe3SXhZCzsbCJayNOH4UEqTKTko=
++github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
++github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
++github.com/quic-go/qpack v0.6.0 h1:g7W+BMYynC1LbYLSqRt8PBg5Tgwxn214ZZR34VIOjz8=
++github.com/quic-go/qpack v0.6.0/go.mod h1:lUpLKChi8njB4ty2bFLX2x4gzDqXwUpaO1DP9qMDZII=
++github.com/sagernet/quic-go v0.61.0-sing-box-mod.12 h1:9/USaaiONHFeqBePb+4C/A0MBM2dmxED49UGBpHLHS4=
++github.com/sagernet/quic-go v0.61.0-sing-box-mod.12/go.mod h1:hmLC8GJPp+BrpBgrgJnacvI4fZGIhasuy1ROJJ8GR4E=
++github.com/sagernet/sing v0.9.7-0.20261023115459-5dc452e537bf h1:qWlGERjsI0F1I9e1W5Z/ARk/9KEN7xIas6e2QHEypUM=
++github.com/sagernet/sing v0.9.7-0.20261023115459-5dc452e537bf/go.mod h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=
++github.com/sagernet/sing-quic v0.7.2-0.20261020082049-7e0a5869a5f4 h1:QuhAb8QW0pKYmSvfj/nK91libunBwVJiWb852yidlxI=
++github.com/sagernet/sing-quic v0.7.2-0.20261020082049-7e0a5869a5f4/go.mod h1:rJFeVxbEej2iuyeCJ3drKW+p5rOgtLIW3XhZ6ty7Fig=
++github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
++github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
++golang.org/x/crypto v0.0.0-20190308221718-c2843e01d9a2/go.mod h1:djNgcEr1/C05ACkg1iLfiJU5Ep61QUkGW8qpdssI0+w=
++golang.org/x/crypto v0.0.0-20191011191535-87dc89f01550/go.mod h1:yigFU9vqHzYiE8UmvKecakEJjdnWj3jj499lnFckfCI=
++golang.org/x/crypto v0.54.0 h1:YLIA59K4fiNzHzjnZt2tUJQjQtUWfWbeHBqKtk3eScw=
++golang.org/x/crypto v0.54.0/go.mod h1:KWL8ny2AZdGR2cWmzeHrp2azQPGogOv+HeQaVEXC2dk=
++golang.org/x/exp v0.0.0-20250911091902-df9299821621 h1:2id6c1/gto0kaHYyrixvknJ8tUK/Qs5IsmBtrc+FtgU=
++golang.org/x/exp v0.0.0-20250911091902-df9299821621/go.mod h1:TwQYMMnGpvZyc+JpB/UAuTNIsVJifOlSkrZkhcvpVUk=
++golang.org/x/lint v0.0.0-20200302205851-738671d3881b/go.mod h1:3xt1FjdF8hUf6vQPIChWIBhFzV8gjjsPE/fR3IyQdNY=
++golang.org/x/mod v0.1.1-0.20191105210325-c90efee705ee/go.mod h1:QqPTAvyqsEbceGzBzNggFXnrqF1CaUcvgkdR5Ot7KZg=
++golang.org/x/net v0.0.0-20190404232315-eb5bcb51f2a3/go.mod h1:t9HGtf8HONx5eT2rtn7q6eTqICYqUVnKs3thJo3Qplg=
++golang.org/x/net v0.0.0-20190620200207-3b0461eec859/go.mod h1:z5CRVTTTmAJ677TzLLGU+0bjPO0LkuOLi4/5GtJWs/s=
++golang.org/x/net v0.56.0 h1:Rw8j/hFzGvJUZwNBXnAtf5sVDVt+65SK2C7IxCxZt5o=
++golang.org/x/net v0.56.0/go.mod h1:D3Ku6r+V6JROoZK144D2XfMHFcMq/0zSfLelVTCFKec=
++golang.org/x/sync v0.0.0-20190423024810-112230192c58/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
++golang.org/x/sync v0.0.0-20210220032951-036812b2e83c/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
++golang.org/x/sync v0.22.0 h1:SZjpbeLmrCk4xhRSZFNZW5gFUeCeFgjekvI/+gfScek=
++golang.org/x/sync v0.22.0/go.mod h1:9xrNwdLfx4jkKbNva9FpL6vEN7evnE43NNNJQ2LF3+0=
++golang.org/x/sys v0.0.0-20190215142949-d0b11bdaac8a/go.mod h1:STP8DvDyc/dI5b8T5hshtkjS+E42TnysNCUPdjciGhY=
++golang.org/x/sys v0.0.0-20190412213103-97732733099d/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
++golang.org/x/sys v0.47.0 h1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=
++golang.org/x/sys v0.47.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
++golang.org/x/text v0.3.0/go.mod h1:NqM8EUOU14njkJ3fqMW+pc6Ldnwhi/IjpwHt7yyuwOQ=
++golang.org/x/text v0.40.0 h1:Ub2Z6/xjgF1WrYQz2nuITOEegKFtiIy+rieRJ5lHZKs=
++golang.org/x/text v0.40.0/go.mod h1:hpnzDAfGV753zIKo+wk3u1bVKCGPbrnF7+7LBF/UHVY=
++golang.org/x/tools v0.0.0-20200130002326-2f3ba24bd6e7/go.mod h1:TB2adYChydJhpapKDTa4BR/hXlZSLoq2Wpct/0txZ28=
++golang.org/x/xerrors v0.0.0-20191011141410-1b5146add898/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
++gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
++gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
+diff --git a/crates/vp-protocol/tests/reference_quic/main.go b/crates/vp-protocol/tests/reference_quic/main.go
+new file mode 100644
+index 0000000..37630a9
+--- /dev/null
++++ b/crates/vp-protocol/tests/reference_quic/main.go
+@@ -0,0 +1,238 @@
++// Test-only adapter around UNMODIFIED official sing-box protocol dependencies.
++// No NetworkManager, TUN, route/firewall API, system proxy, or remote target exists.
++// Credentials and certificates arrive on stdin and are never written or logged.
++package main
++
++import (
++	"bytes"
++	"context"
++	"crypto/tls"
++	"crypto/x509"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"os"
++	"time"
++
++	"github.com/sagernet/sing-quic/hysteria2"
++	"github.com/sagernet/sing-quic/tuic"
++	"github.com/sagernet/sing/common/logger"
++	M "github.com/sagernet/sing/common/metadata"
++	aTLS "github.com/sagernet/sing/common/tls"
++)
++
++type input struct {
++	Protocol, Mode, Password, Certificate, PrivateKey, Role string
++	Port                                                    uint16
++	Negative                                                bool
++}
++type client interface {
++	DialConn(context.Context, M.Socksaddr) (net.Conn, error)
++	ListenPacket(context.Context) (net.PacketConn, error)
++	CloseWithError(error) error
++}
++
++// Supported public transport/TLS adapter interfaces only. Protocol processing,
++// auth framing, TLS/QUIC, HTTP/3 and datagram fragmentation remain official code.
++type loopbackDialer struct{}
++
++func (loopbackDialer) DialContext(ctx context.Context, network string, d M.Socksaddr) (net.Conn, error) {
++	if !d.Addr.IsLoopback() || (network != "tcp" && network != "udp") {
++		return nil, errors.New("test dialer refuses non-loopback target")
++	}
++	var dialer net.Dialer
++	return dialer.DialContext(ctx, network, d.String())
++}
++func (loopbackDialer) ListenPacket(ctx context.Context, d M.Socksaddr) (net.PacketConn, error) {
++	if !d.Addr.IsLoopback() {
++		return nil, errors.New("test dialer refuses non-loopback bind")
++	}
++	var listen net.ListenConfig
++	return listen.ListenPacket(ctx, "udp", "127.0.0.1:0")
++}
++
++type stdTLS struct {
++	config  *tls.Config
++	timeout time.Duration
++}
++
++func (t *stdTLS) ServerName() string                   { return t.config.ServerName }
++func (t *stdTLS) SetServerName(v string)               { t.config.ServerName = v }
++func (t *stdTLS) NextProtos() []string                 { return t.config.NextProtos }
++func (t *stdTLS) SetNextProtos(v []string)             { t.config.NextProtos = v }
++func (t *stdTLS) HandshakeTimeout() time.Duration      { return t.timeout }
++func (t *stdTLS) SetHandshakeTimeout(v time.Duration)  { t.timeout = v }
++func (t *stdTLS) STDConfig() (*tls.Config, error)      { return t.config, nil }
++func (t *stdTLS) Client(c net.Conn) (aTLS.Conn, error) { return tls.Client(c, t.config), nil }
++func (t *stdTLS) Clone() aTLS.Config                   { return &stdTLS{t.config.Clone(), t.timeout} }
++
++func run() error {
++	var cfg input
++	if err := json.NewDecoder(io.LimitReader(os.Stdin, 65536)).Decode(&cfg); err != nil {
++		return err
++	}
++	if cfg.Role == "server" {
++		return runServer(cfg)
++	}
++	if cfg.Port == 0 {
++		return errors.New("missing loopback server port")
++	}
++	roots := x509.NewCertPool()
++	if !roots.AppendCertsFromPEM([]byte(cfg.Certificate)) {
++		return errors.New("invalid ephemeral CA")
++	}
++	tlsConfig := &stdTLS{&tls.Config{RootCAs: roots, ServerName: "localhost", NextProtos: []string{"h3"}, MinVersion: tls.VersionTLS13}, 3 * time.Second}
++	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
++	defer cancel()
++	server := M.ParseSocksaddr(fmt.Sprintf("127.0.0.1:%d", cfg.Port))
++	var c client
++	var err error
++	switch cfg.Protocol {
++	case "tuic":
++		c, err = tuic.NewClient(tuic.ClientOptions{Context: ctx, Dialer: loopbackDialer{}, ServerAddress: server, TLSConfig: tlsConfig,
++			UUID:     [16]byte{0xb8, 0x31, 0x38, 0x1d, 0x63, 0x24, 0x4d, 0x53, 0xad, 0x4f, 0x8c, 0xda, 0x48, 0xb3, 0x08, 0x11},
++			Password: cfg.Password, CongestionControl: "cubic", UDPStream: cfg.Mode == "quic"})
++	case "hysteria2":
++		c, err = hysteria2.NewClient(hysteria2.ClientOptions{Logger: logger.NOP(), Context: ctx, Dialer: loopbackDialer{}, ServerAddress: server, TLSConfig: tlsConfig, Password: cfg.Password})
++	default:
++		return errors.New("unsupported test protocol")
++	}
++	if err != nil {
++		return err
++	}
++	defer c.CloseWithError(os.ErrClosed)
++	tcp, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
++	if err != nil {
++		return err
++	}
++	defer tcp.Close()
++	target, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
++	if err != nil {
++		return err
++	}
++	defer target.Close()
++	tcpDst := M.SocksaddrFromNet(tcp.Addr())
++	if cfg.Negative {
++		conn, e := c.DialConn(ctx, tcpDst)
++		if e == nil {
++			defer conn.Close()
++			conn.SetDeadline(time.Now().Add(time.Second))
++			conn.Write([]byte("unauthorized"))
++		}
++		packet, e := c.ListenPacket(ctx)
++		if e == nil {
++			defer packet.Close()
++			packet.SetDeadline(time.Now().Add(time.Second))
++			packet.WriteTo([]byte("unauthorized"), target.LocalAddr())
++		}
++		tcp.SetDeadline(time.Now().Add(400 * time.Millisecond))
++		if conn, e := tcp.Accept(); e == nil {
++			conn.Close()
++			return errors.New("wrong credentials reached TCP destination")
++		} else if !errors.Is(e, os.ErrDeadlineExceeded) {
++			return fmt.Errorf("TCP negative observation failed: %w", e)
++		}
++		target.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
++		var buf [64]byte
++		if _, _, e := target.ReadFrom(buf[:]); e == nil {
++			return errors.New("wrong credentials reached UDP destination")
++		} else if !errors.Is(e, os.ErrDeadlineExceeded) {
++			return fmt.Errorf("UDP negative observation failed: %w", e)
++		}
++		return json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "kind": "official-protocol-library", "protocol": cfg.Protocol, "mode": cfg.Mode, "negative": true})
++	}
++	// Echo target, authenticated TCP. It exists only on loopback and closes at exit.
++	echoDone := make(chan error, 1)
++	go func() {
++		conn, e := tcp.AcceptTCP()
++		if e != nil {
++			echoDone <- e
++			return
++		}
++		defer conn.Close()
++		conn.SetDeadline(time.Now().Add(5 * time.Second))
++		_, e = io.Copy(conn, conn)
++		echoDone <- e
++	}()
++	conn, err := c.DialConn(ctx, tcpDst)
++	if err != nil {
++		return fmt.Errorf("TCP dial: %w", err)
++	}
++	defer conn.Close()
++	conn.SetDeadline(time.Now().Add(5 * time.Second))
++	body := []byte("official-library-independent-TCP")
++	if _, err = conn.Write(body); err != nil {
++		return fmt.Errorf("TCP write: %w", err)
++	}
++	got := make([]byte, len(body))
++	if _, err = io.ReadFull(conn, got); err != nil {
++		return fmt.Errorf("TCP read: %w", err)
++	}
++	if !bytes.Equal(got, body) {
++		return errors.New("TCP payload mismatch")
++	}
++	conn.Close()
++	if err = <-echoDone; err != nil {
++		return fmt.Errorf("TCP target completion: %w", err)
++	}
++	packet, err := c.ListenPacket(ctx)
++	if err != nil {
++		return fmt.Errorf("UDP listen: %w", err)
++	}
++	defer packet.Close()
++	second, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
++	if err != nil {
++		return err
++	}
++	defer second.Close()
++	var source string
++	sizes := []int{73, 6000, 6000, 73}
++	// The unmodified official Hysteria2 peer caps UDP payloads at 4096 bytes.
++	// Exercise that boundary and fragmentation without changing reference code.
++	if cfg.Protocol == "hysteria2" {
++		sizes = []int{73, 4096, 4096, 73}
++	}
++	for i, size := range sizes {
++		dst := target
++		if i%2 == 1 {
++			dst = second
++		}
++		body = bytes.Repeat([]byte{byte(0x31 + i)}, size)
++		packet.SetDeadline(time.Now().Add(5 * time.Second))
++		dst.SetDeadline(time.Now().Add(5 * time.Second))
++		if _, err = packet.WriteTo(body, dst.LocalAddr()); err != nil {
++			return fmt.Errorf("UDP send size %d: %w", size, err)
++		}
++		buf := make([]byte, 65535)
++		n, from, e := dst.ReadFrom(buf)
++		if e != nil {
++			return fmt.Errorf("UDP target size %d: %w", size, e)
++		}
++		if !bytes.Equal(buf[:n], body) {
++			return errors.New("UDP destination payload mismatch")
++		}
++		if source != "" && source != from.String() {
++			return errors.New("UDP association source port changed")
++		}
++		source = from.String()
++		if _, e = dst.WriteTo(buf[:n], from); e != nil {
++			return e
++		}
++		n, from, e = packet.ReadFrom(buf)
++		if e != nil {
++			return fmt.Errorf("UDP reply size %d: %w", size, e)
++		}
++		if !bytes.Equal(buf[:n], body) || from.String() != dst.LocalAddr().String() {
++			return errors.New("UDP reply payload/source mismatch")
++		}
++	}
++	return json.NewEncoder(os.Stdout).Encode(map[string]any{"ok": true, "kind": "official-protocol-library", "protocol": cfg.Protocol, "mode": cfg.Mode, "tcp": true, "udp_sizes": sizes, "udp_source_stable": true})
++}
++func main() {
++	if err := run(); err != nil {
++		fmt.Fprintln(os.Stderr, "reference-quic:", err)
++		os.Exit(1)
++	}
++}
+diff --git a/crates/vp-protocol/tests/reference_quic/server.go b/crates/vp-protocol/tests/reference_quic/server.go
+new file mode 100644
+index 0000000..533301d
+--- /dev/null
++++ b/crates/vp-protocol/tests/reference_quic/server.go
+@@ -0,0 +1,148 @@
++package main
++
++import (
++	"context"
++	"crypto/tls"
++	"encoding/json"
++	"errors"
++	"io"
++	"net"
++	"os"
++	"time"
++
++	"github.com/sagernet/sing-quic/hysteria2"
++	"github.com/sagernet/sing-quic/tuic"
++	"github.com/sagernet/sing/common/bufio"
++	"github.com/sagernet/sing/common/logger"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++	aTLS "github.com/sagernet/sing/common/tls"
++)
++
++func (t *stdTLS) Start() error                            { return nil }
++func (t *stdTLS) Close() error                            { return nil }
++func (t *stdTLS) Server(conn net.Conn) (aTLS.Conn, error) { return tls.Server(conn, t.config), nil }
++
++// This handler is only an ordinary loopback socket relay. All protocol negotiation,
++// access checks, QUIC stream/datagram framing and fragment processing are upstream.
++type loopbackHandler struct{}
++
++func (loopbackHandler) NewConnectionEx(ctx context.Context, conn net.Conn, _ M.Socksaddr, dst M.Socksaddr, onClose N.CloseHandlerFunc) {
++	defer conn.Close()
++	if onClose != nil {
++		defer onClose(nil)
++	}
++	remote, err := (loopbackDialer{}).DialContext(ctx, "tcp", dst)
++	if err != nil {
++		N.ReportHandshakeFailure(conn, err)
++		return
++	}
++	defer remote.Close()
++	if N.ReportHandshakeSuccess(conn) != nil {
++		return
++	}
++	conn.SetDeadline(time.Now().Add(10 * time.Second))
++	remote.SetDeadline(time.Now().Add(10 * time.Second))
++	done := make(chan struct{})
++	go func() {
++		io.Copy(remote, conn)
++		if c, ok := remote.(interface{ CloseWrite() error }); ok {
++			c.CloseWrite()
++		}
++		close(done)
++	}()
++	io.Copy(conn, remote)
++	conn.Close()
++	remote.Close()
++	<-done
++}
++func (loopbackHandler) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, _ M.Socksaddr, _ M.Socksaddr, onClose N.CloseHandlerFunc) {
++	defer conn.Close()
++	if onClose != nil {
++		defer onClose(nil)
++	}
++	packet := bufio.NewNetPacketConn(conn)
++	sock, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
++	if err != nil {
++		return
++	}
++	defer sock.Close()
++	buffer := make([]byte, 65535)
++	for {
++		if ctx.Err() != nil {
++			return
++		}
++		packet.SetReadDeadline(time.Now().Add(10 * time.Second))
++		n, destination, err := packet.ReadFrom(buffer)
++		if err != nil {
++			return
++		}
++		dst := M.SocksaddrFromNet(destination)
++		if !dst.Addr.Is4() || !dst.Addr.IsLoopback() {
++			return
++		}
++		sock.SetDeadline(time.Now().Add(5 * time.Second))
++		if _, err = sock.WriteTo(buffer[:n], dst.UDPAddr()); err != nil {
++			return
++		}
++		n, source, err := sock.ReadFrom(buffer)
++		if err != nil {
++			return
++		}
++		if _, err = packet.WriteTo(buffer[:n], source); err != nil {
++			return
++		}
++	}
++}
++
++func runServer(cfg input) error {
++	certificate, err := tls.X509KeyPair([]byte(cfg.Certificate), []byte(cfg.PrivateKey))
++	if err != nil {
++		return err
++	}
++	tlsConfig := &stdTLS{&tls.Config{Certificates: []tls.Certificate{certificate}, NextProtos: []string{"h3"}, MinVersion: tls.VersionTLS13}, 3 * time.Second}
++	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
++	defer cancel()
++	socket, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
++	if err != nil {
++		return err
++	}
++	defer socket.Close()
++	var server interface {
++		Start(net.PacketConn) error
++		Close() error
++	}
++	switch cfg.Protocol {
++	case "tuic":
++		service, e := tuic.NewService[int](tuic.ServiceOptions{Context: ctx, Logger: logger.NOP(), TLSConfig: tlsConfig, Handler: loopbackHandler{}, CongestionControl: "cubic", UDPTimeout: 10 * time.Second})
++		if e != nil {
++			return e
++		}
++		service.UpdateUsers([]int{1}, [][16]byte{{0xb8, 0x31, 0x38, 0x1d, 0x63, 0x24, 0x4d, 0x53, 0xad, 0x4f, 0x8c, 0xda, 0x48, 0xb3, 0x08, 0x11}}, []string{cfg.Password})
++		server = service
++	case "hysteria2":
++		service, e := hysteria2.NewService[int](hysteria2.ServiceOptions{Context: ctx, Logger: logger.NOP(), TLSConfig: tlsConfig, Handler: loopbackHandler{}, UDPTimeout: 10 * time.Second})
++		if e != nil {
++			return e
++		}
++		service.UpdateUsers([]int{1}, []string{cfg.Password})
++		server = service
++	default:
++		return errors.New("unsupported protocol")
++	}
++	if err = server.Start(socket); err != nil {
++		return err
++	}
++	defer server.Close()
++	if err = json.NewEncoder(os.Stdout).Encode(map[string]any{"ready": true, "kind": "official-protocol-library", "port": socket.LocalAddr().(*net.UDPAddr).Port}); err != nil {
++		return err
++	}
++	done := make(chan struct{})
++	go func() { io.Copy(io.Discard, os.Stdin); close(done) }()
++	select {
++	case <-done:
++		return nil
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++}

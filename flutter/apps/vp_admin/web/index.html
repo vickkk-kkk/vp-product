@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <base href="$FLUTTER_BASE_HREF">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="VP 服务器管理。明确区分期望配置与实际运行状态。">
+  <meta name="theme-color" content="#F7F9FA">
+  <meta name="referrer" content="no-referrer">
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <title>VP · 服务器管理</title>
+  <style>
+    body { margin: 0; background: #F7F9FA; color: #203438; font-family: system-ui, sans-serif; }
+    #vp-loading { margin: 15vh auto; max-width: 32rem; padding: 2rem; line-height: 1.6; }
+    #vp-loading strong { font-size: 1.4rem; }
+    @media (prefers-color-scheme: dark) { body { background: #10191D; color: #E8EFF0; } }
+  </style>
+</head>
+<body>
+  <div id="vp-loading" role="status"><strong>VP · 服务器管理</strong><p>正在载入管理界面…</p></div>
+  <noscript>此管理界面需要 JavaScript。启用后请重新载入。</noscript>
+  <script src="flutter_bootstrap.js" async></script>
+</body>
+</html>

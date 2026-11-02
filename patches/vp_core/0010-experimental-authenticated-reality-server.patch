@@ -1,0 +1,1241 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 2689ffa4ee22494ad0e7aef4f7b8a0846fe23fb1..4d4dd2c1527496e13634327dd6abf2c92fda131a 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2870,6 +2870,7 @@ dependencies = [
+  "sha1",
+  "sha2",
+  "socket2",
++ "subtle",
+  "tokio",
+  "tokio-rustls",
+  "tracing",
+@@ -2879,6 +2880,7 @@ dependencies = [
+  "vp-dns",
+  "webpki-roots 0.26.11",
+  "x25519-dalek",
++ "zeroize",
+ ]
+ 
+ [[package]]
+diff --git a/crates/vp-transport/Cargo.toml b/crates/vp-transport/Cargo.toml
+index 153e2338e24186c87cf6ce18a0b0b26d80820f95..a858ade60e7720fc53fb9f1af2095ce6c48c2c93 100644
+--- a/crates/vp-transport/Cargo.toml
++++ b/crates/vp-transport/Cargo.toml
+@@ -32,10 +32,15 @@ hkdf.workspace = true
+ hmac.workspace = true
+ sha2.workspace = true
+ aes-gcm.workspace = true
++rcgen = { workspace = true, optional = true }
++subtle = { version = "2", optional = true }
++zeroize = { version = "1", optional = true }
+ 
+ [features]
+ default = ["tls"]
+ tls = []
++# Authenticated TLS experiment only: no target camouflage, fallback or Vision.
++experimental-reality-server = ["dep:rcgen", "dep:subtle", "dep:zeroize", "x25519-dalek/zeroize"]
+ 
+ [dev-dependencies]
+ tracing-subscriber.workspace = true
+diff --git a/crates/vp-transport/src/lib.rs b/crates/vp-transport/src/lib.rs
+index de5b9876f77032462fdf90370f8007a85f9a93a2..35050e41f5a118f1089b97f176b1945cd14a265a 100644
+--- a/crates/vp-transport/src/lib.rs
++++ b/crates/vp-transport/src/lib.rs
+@@ -6,6 +6,8 @@ pub mod grpc;
+ pub mod hpke;
+ pub mod http;
+ pub mod quic;
++#[cfg(feature = "experimental-reality-server")]
++pub mod reality_server;
+ pub mod server;
+ pub mod tls;
+ pub mod utls;
+diff --git a/crates/vp-transport/src/reality_server.rs b/crates/vp-transport/src/reality_server.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..812e71856e89b96d4317858fd888cd194ba3c089
+--- /dev/null
++++ b/crates/vp-transport/src/reality_server.rs
+@@ -0,0 +1,887 @@
++//! Experimental authenticated REALITY TLS transport, **not a complete REALITY server**.
++//!
++//! This module is excluded from default builds and is not connected to any App
++//! listener factory. It provides bounded classic-X25519 ClientHello authentication
++//! and resumes the unchanged TLS transcript with rustls and a per-connection
++//! Ed25519 certificate. Its certificate MAC follows the publicly inspectable
++//! REALITY client contract; TLS signatures, key schedule, records and Finished
++//! verification remain entirely within rustls/ring.
++//!
++//! **Do not deploy as an equivalent of REALITY.** Target-handshake mirroring,
++//! unauthenticated camouflage forwarding, hybrid-only ML-KEM ClientHellos,
++//! ML-DSA certificate verification, and Vision raw-stream transitions are absent.
++//! In particular rejection closes the stream rather than disguising this endpoint
++//! as a target website. Independent-client interoperability is not certified.
++//!
++//! Source reference: XTLS/Xray-core
++//! `0afec66085a85191e9dd2a4a6646c7c9a94688d1`,
++//! `transport/internet/reality/reality.go`. Independently authored Rust; no
++//! reference implementation source, TLS engine or GPL code is embedded here.
++
++use std::fmt;
++use std::io;
++use std::pin::Pin;
++use std::sync::Arc;
++use std::task::{Context, Poll};
++use std::time::{Duration, SystemTime, UNIX_EPOCH};
++
++use rcgen::{CertificateParams, KeyPair, RemoteKeyPair, SignatureAlgorithm};
++use ring::{aead, hkdf, hmac};
++use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
++use subtle::{Choice, ConstantTimeEq};
++use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
++use tokio::sync::Semaphore;
++use tokio_rustls::server::{StartHandshake, TlsStream};
++use x25519_dalek::{PublicKey, StaticSecret};
++use zeroize::Zeroizing;
++
++const MAX_HELLO_BYTES: usize = 16_384;
++const MAX_HELLO_RECORDS: usize = 32;
++const MAX_SERVER_NAMES: usize = 64;
++const MAX_SHORT_IDS: usize = 1_024;
++
++/// Explicit experimental options. Private key bytes are never serialized or
++/// included in Debug. The caller must supply a securely generated static key.
++/// Empty short IDs are represented by an explicitly configured eight-zero array;
++/// an empty *list* never permits arbitrary clients.
++pub struct ExperimentalRealityOptions {
++    pub private_key: StaticSecret,
++    pub server_names: Vec<String>,
++    pub short_ids: Vec<[u8; 8]>,
++    pub alpn: Vec<Vec<u8>>,
++    pub min_client_version: Option<[u8; 3]>,
++    pub max_client_version: Option<[u8; 3]>,
++    /// Mandatory freshness window, greater than zero and at most five minutes.
++    pub max_time_difference: Duration,
++    /// Total ClientHello/authentication/TLS-handshake budget (at most 60 seconds).
++    pub handshake_timeout: Duration,
++    /// No unbounded task spawning or permit queueing occurs in this module.
++    pub max_concurrent_handshakes: usize,
++}
++
++impl ExperimentalRealityOptions {
++    pub fn new(
++        private_key: StaticSecret,
++        server_names: Vec<String>,
++        short_ids: Vec<[u8; 8]>,
++    ) -> Self {
++        Self {
++            private_key,
++            server_names,
++            short_ids,
++            alpn: Vec::new(),
++            min_client_version: None,
++            max_client_version: None,
++            max_time_difference: Duration::from_secs(30),
++            handshake_timeout: Duration::from_secs(5),
++            max_concurrent_handshakes: 64,
++        }
++    }
++
++    fn validate(&self) -> Result<(), RealityAcceptError> {
++        let invalid = RealityAcceptError::InvalidConfiguration;
++        if self.server_names.is_empty()
++            || self.server_names.len() > MAX_SERVER_NAMES
++            || self.short_ids.is_empty()
++            || self.short_ids.len() > MAX_SHORT_IDS
++            || self.alpn.len() > 16
++            || self.max_time_difference < Duration::from_secs(1)
++            || self.max_time_difference > Duration::from_secs(300)
++            || self.handshake_timeout.is_zero()
++            || self.handshake_timeout > Duration::from_secs(60)
++            || !(1..=1024).contains(&self.max_concurrent_handshakes)
++        {
++            return Err(invalid);
++        }
++        if let (Some(min), Some(max)) = (self.min_client_version, self.max_client_version) {
++            if min > max {
++                return Err(invalid);
++            }
++        }
++        for (index, name) in self.server_names.iter().enumerate() {
++            if name.is_empty()
++                || name.len() > 253
++                || !name.is_ascii()
++                || name.ends_with('.')
++                || name != &name.to_ascii_lowercase()
++                || !matches!(
++                    ServerName::try_from(name.as_str()),
++                    Ok(ServerName::DnsName(_))
++                )
++                || self.server_names[..index].contains(name)
++            {
++                return Err(invalid);
++            }
++        }
++        for (index, id) in self.short_ids.iter().enumerate() {
++            if self.short_ids[..index].contains(id) {
++                return Err(invalid);
++            }
++        }
++        for (index, protocol) in self.alpn.iter().enumerate() {
++            if protocol.is_empty() || protocol.len() > 255 || self.alpn[..index].contains(protocol)
++            {
++                return Err(invalid);
++            }
++        }
++        Ok(())
++    }
++}
++
++impl fmt::Debug for ExperimentalRealityOptions {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("ExperimentalRealityOptions")
++            .field("private_key", &"[REDACTED]")
++            .field("short_ids", &"[REDACTED]")
++            .finish_non_exhaustive()
++    }
++}
++
++/// Errors intentionally omit peer-controlled strings and authentication details.
++/// This type is not a capability or certification result.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum RealityAcceptError {
++    InvalidConfiguration,
++    Busy,
++    TimedOut,
++    Rejected,
++    Io,
++    Internal,
++}
++
++impl fmt::Display for RealityAcceptError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(match self {
++            Self::InvalidConfiguration => "invalid experimental REALITY configuration",
++            Self::Busy => "experimental REALITY handshake capacity exhausted",
++            Self::TimedOut => "experimental REALITY handshake timed out",
++            Self::Rejected => "experimental REALITY handshake rejected",
++            Self::Io => "experimental REALITY transport I/O failed",
++            Self::Internal => "experimental REALITY cryptographic setup failed",
++        })
++    }
++}
++impl std::error::Error for RealityAcceptError {}
++
++/// Owns authentication policy and a bounded permit pool. No sockets are opened,
++/// no background tasks are spawned, and no traffic is forwarded by construction.
++/// Dropping an `accept` future drops its owned stream and releases its permit.
++pub struct ExperimentalRealityAcceptor {
++    options: ExperimentalRealityOptions,
++    permits: Arc<Semaphore>,
++}
++
++impl ExperimentalRealityAcceptor {
++    pub fn new(options: ExperimentalRealityOptions) -> Result<Self, RealityAcceptError> {
++        options.validate()?;
++        let permits = Arc::new(Semaphore::new(options.max_concurrent_handshakes));
++        Ok(Self { options, permits })
++    }
++
++    /// Authenticate a classic-X25519 ClientHello and complete the TLS 1.3
++    /// handshake. This is transport authentication, NOT VLESS user authentication.
++    /// PSK/0-RTT are rejected. Errors/cancellation drop the supplied owned stream;
++    /// there is no plaintext, ordinary-TLS, or camouflage fallback.
++    pub async fn accept<S>(
++        &self,
++        stream: S,
++    ) -> Result<AuthenticatedRealityStream<S>, RealityAcceptError>
++    where
++        S: AsyncRead + AsyncWrite + Unpin + Send,
++    {
++        let _permit = self
++            .permits
++            .clone()
++            .try_acquire_owned()
++            .map_err(|_| RealityAcceptError::Busy)?;
++        tokio::time::timeout(self.options.handshake_timeout, self.accept_inner(stream))
++            .await
++            .map_err(|_| RealityAcceptError::TimedOut)?
++    }
++
++    async fn accept_inner<S>(
++        &self,
++        mut stream: S,
++    ) -> Result<AuthenticatedRealityStream<S>, RealityAcceptError>
++    where
++        S: AsyncRead + AsyncWrite + Unpin + Send,
++    {
++        let (records, hello) = read_client_hello(&mut stream).await?;
++        let now = SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .map_err(|_| RealityAcceptError::Internal)?;
++        let auth = authenticate_client_hello(&hello, &self.options, now)?;
++        // Feed byte-identical input to rustls. Never replace the encrypted
++        // session ID with its plaintext or the AAD's zero-filled session ID.
++        let mut acceptor = rustls::server::Acceptor::default();
++        let mut input = io::Cursor::new(records.as_slice());
++        while (input.position() as usize) < records.len() {
++            if acceptor
++                .read_tls(&mut input)
++                .map_err(|_| RealityAcceptError::Rejected)?
++                == 0
++            {
++                return Err(RealityAcceptError::Rejected);
++            }
++        }
++        let accepted = acceptor
++            .accept()
++            .map_err(|_| RealityAcceptError::Rejected)?
++            .ok_or(RealityAcceptError::Rejected)?;
++        if accepted.client_hello().server_name() != Some(auth.server_name.as_str()) {
++            return Err(RealityAcceptError::Rejected);
++        }
++        if !self.options.alpn.is_empty()
++            && !accepted.client_hello().alpn().is_some_and(|mut offered| {
++                offered.any(|name| self.options.alpn.iter().any(|allowed| name == allowed))
++            })
++        {
++            return Err(RealityAcceptError::Rejected);
++        }
++        let config = per_connection_config(&auth.key, &auth.server_name, &self.options.alpn)?;
++        let tls = StartHandshake::from_parts(accepted, stream)
++            .into_stream(Arc::new(config))
++            .await
++            .map_err(|_| RealityAcceptError::Rejected)?;
++        if tls.get_ref().1.protocol_version() != Some(rustls::ProtocolVersion::TLSv1_3)
++            || tls.get_ref().1.is_handshaking()
++        {
++            return Err(RealityAcceptError::Rejected);
++        }
++        Ok(AuthenticatedRealityStream { tls })
++    }
++}
++
++impl fmt::Debug for ExperimentalRealityAcceptor {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("ExperimentalRealityAcceptor")
++            .finish_non_exhaustive()
++    }
++}
++
++/// A completed authenticated TLS stream. Raw-stream detachment is intentionally
++/// absent: this type is NOT suitable for Vision command 2. No success can be
++/// observed until rustls has verified the peer's Finished message.
++pub struct AuthenticatedRealityStream<S> {
++    tls: TlsStream<S>,
++}
++impl<S> AuthenticatedRealityStream<S> {
++    pub fn negotiated_alpn(&self) -> Option<&[u8]> {
++        self.tls.get_ref().1.alpn_protocol()
++    }
++    pub fn server_name(&self) -> Option<&str> {
++        self.tls.get_ref().1.server_name()
++    }
++}
++impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for AuthenticatedRealityStream<S> {
++    fn poll_read(
++        self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        buf: &mut ReadBuf<'_>,
++    ) -> Poll<io::Result<()>> {
++        Pin::new(&mut self.get_mut().tls).poll_read(cx, buf)
++    }
++}
++impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for AuthenticatedRealityStream<S> {
++    fn poll_write(
++        self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        buf: &[u8],
++    ) -> Poll<io::Result<usize>> {
++        Pin::new(&mut self.get_mut().tls).poll_write(cx, buf)
++    }
++    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Pin::new(&mut self.get_mut().tls).poll_flush(cx)
++    }
++    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Pin::new(&mut self.get_mut().tls).poll_shutdown(cx)
++    }
++}
++
++struct Reader<'a>(&'a [u8]);
++impl<'a> Reader<'a> {
++    fn take(&mut self, n: usize) -> Result<&'a [u8], RealityAcceptError> {
++        let (head, tail) = self
++            .0
++            .split_at_checked(n)
++            .ok_or(RealityAcceptError::Rejected)?;
++        self.0 = tail;
++        Ok(head)
++    }
++    fn byte(&mut self) -> Result<u8, RealityAcceptError> {
++        Ok(self.take(1)?[0])
++    }
++    fn word(&mut self) -> Result<usize, RealityAcceptError> {
++        let b = self.take(2)?;
++        Ok(u16::from_be_bytes([b[0], b[1]]) as usize)
++    }
++    fn vector(&mut self) -> Result<&'a [u8], RealityAcceptError> {
++        let n = self.word()?;
++        self.take(n)
++    }
++}
++
++struct AuthenticatedHello {
++    key: Zeroizing<[u8; 32]>,
++    server_name: String,
++}
++
++fn authenticate_client_hello(
++    hello: &[u8],
++    options: &ExperimentalRealityOptions,
++    now: Duration,
++) -> Result<AuthenticatedHello, RealityAcceptError> {
++    let rejected = RealityAcceptError::Rejected;
++    if hello.len() > MAX_HELLO_BYTES || hello.len() < 71 || hello[0] != 1 {
++        return Err(rejected);
++    }
++    let declared = ((hello[1] as usize) << 16) | ((hello[2] as usize) << 8) | hello[3] as usize;
++    if declared != hello.len() - 4 {
++        return Err(rejected);
++    }
++    let mut r = Reader(&hello[4..]);
++    if r.take(2)? != [3, 3] {
++        return Err(rejected);
++    }
++    let random = r.take(32)?;
++    if r.byte()? != 32 {
++        return Err(rejected);
++    }
++    let session_id = r.take(32)?;
++    let suites = r.vector()?;
++    if suites.is_empty()
++        || suites.len() % 2 != 0
++        || !suites.chunks_exact(2).any(|s| matches!(s, [0x13, 1..=3]))
++    {
++        return Err(rejected);
++    }
++    if r.byte()? != 1 || r.byte()? != 0 {
++        return Err(rejected);
++    }
++    let mut extensions = Reader(r.vector()?);
++    if !r.0.is_empty() {
++        return Err(rejected);
++    }
++    // All attacker-controlled allocations are bounded by MAX_HELLO_BYTES.
++    let mut seen = std::collections::HashSet::new();
++    let mut sni = None;
++    let mut public = None;
++    let mut tls13 = false;
++    let mut ed25519 = false;
++    let mut x25519_supported = false;
++    while !extensions.0.is_empty() {
++        let ty = extensions.word()?;
++        if !seen.insert(ty) {
++            return Err(rejected);
++        }
++        let data = extensions.vector()?;
++        let mut e = Reader(data);
++        match ty {
++            0 => {
++                let mut names = Reader(e.vector()?);
++                if !e.0.is_empty() || names.byte()? != 0 {
++                    return Err(rejected);
++                }
++                sni = Some(names.vector()?);
++                if !names.0.is_empty() {
++                    return Err(rejected);
++                }
++            }
++            10 | 13 => {
++                let values = e.vector()?;
++                if values.is_empty() || values.len() % 2 != 0 || !e.0.is_empty() {
++                    return Err(rejected);
++                }
++                if ty == 10 {
++                    x25519_supported = values.chunks_exact(2).any(|v| v == [0, 29]);
++                } else {
++                    ed25519 = values.chunks_exact(2).any(|v| v == [8, 7]);
++                }
++            }
++            41 | 42 => return Err(rejected), // no PSK resumption or 0-RTT bypass
++            43 => {
++                let size = e.byte()? as usize;
++                let versions = e.take(size)?;
++                if size == 0 || size % 2 != 0 || !e.0.is_empty() {
++                    return Err(rejected);
++                }
++                tls13 = versions.chunks_exact(2).any(|v| v == [3, 4]);
++            }
++            51 => {
++                let mut shares = Reader(e.vector()?);
++                if !e.0.is_empty() {
++                    return Err(rejected);
++                }
++                let mut groups = std::collections::HashSet::new();
++                while !shares.0.is_empty() {
++                    let group = shares.word()?;
++                    let bytes = shares.vector()?;
++                    if !groups.insert(group) || bytes.is_empty() {
++                        return Err(rejected);
++                    }
++                    if group == 29 {
++                        public = Some(<[u8; 32]>::try_from(bytes).map_err(|_| rejected)?);
++                    }
++                }
++            }
++            _ => {}
++        }
++    }
++    let sni = sni.ok_or(rejected)?;
++    if !tls13
++        || !ed25519
++        || !x25519_supported
++        || !options
++            .server_names
++            .iter()
++            .any(|name| name.as_bytes() == sni)
++    {
++        return Err(rejected);
++    }
++    let shared = options
++        .private_key
++        .diffie_hellman(&PublicKey::from(public.ok_or(rejected)?));
++    if !shared.was_contributory() {
++        return Err(rejected);
++    }
++    struct KeyLength;
++    impl hkdf::KeyType for KeyLength {
++        fn len(&self) -> usize {
++            32
++        }
++    }
++    let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, &random[..20]).extract(shared.as_bytes());
++    let mut key = Zeroizing::new([0; 32]);
++    prk.expand(&[b"REALITY"], KeyLength)
++        .map_err(|_| RealityAcceptError::Internal)?
++        .fill(key.as_mut())
++        .map_err(|_| RealityAcceptError::Internal)?;
++    let mut aad = hello.to_vec();
++    aad[39..71].fill(0);
++    let mut payload = Zeroizing::new(session_id.to_vec());
++    let cipher = aead::LessSafeKey::new(
++        aead::UnboundKey::new(&aead::AES_256_GCM, key.as_ref())
++            .map_err(|_| RealityAcceptError::Internal)?,
++    );
++    let nonce = aead::Nonce::try_assume_unique_for_key(&random[20..]).map_err(|_| rejected)?;
++    let plain = cipher
++        .open_in_place(nonce, aead::Aad::from(aad), &mut payload)
++        .map_err(|_| rejected)?;
++    if plain.len() != 16 || plain[3] != 0 {
++        return Err(rejected);
++    }
++    let version = <[u8; 3]>::try_from(&plain[..3]).map_err(|_| rejected)?;
++    if options.min_client_version.is_some_and(|min| version < min)
++        || options.max_client_version.is_some_and(|max| version > max)
++    {
++        return Err(rejected);
++    }
++    let mut found = Choice::from(0);
++    for short_id in &options.short_ids {
++        found |= short_id.as_slice().ct_eq(&plain[8..]);
++    }
++    if !bool::from(found) {
++        return Err(rejected);
++    }
++    let stamp = u32::from_be_bytes(plain[4..8].try_into().map_err(|_| rejected)?) as u64;
++    // The peer timestamp is whole seconds; retaining the local fraction avoids
++    // accidentally extending the configured freshness window by up to a second.
++    if now.abs_diff(Duration::from_secs(stamp)) > options.max_time_difference {
++        return Err(rejected);
++    }
++    let server_name = std::str::from_utf8(sni).map_err(|_| rejected)?.to_owned();
++    Ok(AuthenticatedHello { key, server_name })
++}
++
++async fn read_client_hello<S: AsyncRead + Unpin>(
++    stream: &mut S,
++) -> Result<(Vec<u8>, Vec<u8>), RealityAcceptError> {
++    let mut records = Vec::new();
++    let mut hello = Vec::new();
++    for _ in 0..MAX_HELLO_RECORDS {
++        let mut header = [0; 5];
++        stream
++            .read_exact(&mut header)
++            .await
++            .map_err(|_| RealityAcceptError::Io)?;
++        let size = u16::from_be_bytes([header[3], header[4]]) as usize;
++        if header[0] != 22
++            || header[1] != 3
++            || !(1..=3).contains(&header[2])
++            || size == 0
++            || size > MAX_HELLO_BYTES
++            || hello.len() + size > MAX_HELLO_BYTES
++        {
++            return Err(RealityAcceptError::Rejected);
++        }
++        let offset = hello.len();
++        hello.resize(offset + size, 0);
++        stream
++            .read_exact(&mut hello[offset..])
++            .await
++            .map_err(|_| RealityAcceptError::Io)?;
++        records.extend_from_slice(&header);
++        records.extend_from_slice(&hello[offset..]);
++        if hello.len() >= 4 {
++            let size = ((hello[1] as usize) << 16) | ((hello[2] as usize) << 8) | hello[3] as usize;
++            if hello[0] != 1 || size + 4 > MAX_HELLO_BYTES {
++                return Err(RealityAcceptError::Rejected);
++            }
++            if hello.len() >= size + 4 {
++                if hello.len() != size + 4 {
++                    return Err(RealityAcceptError::Rejected);
++                }
++                return Ok((records, hello));
++            }
++        }
++    }
++    Err(RealityAcceptError::Rejected)
++}
++
++struct CertificateMac {
++    public: Vec<u8>,
++    signature: Vec<u8>,
++}
++impl RemoteKeyPair for CertificateMac {
++    fn public_key(&self) -> &[u8] {
++        &self.public
++    }
++    fn sign(&self, _: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
++        Ok(self.signature.clone())
++    }
++    fn algorithm(&self) -> &'static SignatureAlgorithm {
++        &rcgen::PKCS_ED25519
++    }
++}
++
++fn per_connection_config(
++    auth: &[u8; 32],
++    name: &str,
++    alpn: &[Vec<u8>],
++) -> Result<rustls::ServerConfig, RealityAcceptError> {
++    let internal = RealityAcceptError::Internal;
++    let pair = KeyPair::generate_for(&rcgen::PKCS_ED25519).map_err(|_| internal)?;
++    let public = pair.public_key_raw().to_vec();
++    let signature = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA512, auth), &public)
++        .as_ref()
++        .to_vec();
++    let cert_key = KeyPair::from_remote(Box::new(CertificateMac { public, signature }))
++        .map_err(|_| internal)?;
++    let cert = CertificateParams::new(vec![name.to_owned()])
++        .map_err(|_| internal)?
++        .self_signed(&cert_key)
++        .map_err(|_| internal)?;
++    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
++        rustls::crypto::ring::default_provider(),
++    ))
++    .with_protocol_versions(&[&rustls::version::TLS13])
++    .map_err(|_| internal)?
++    .with_no_client_auth()
++    .with_single_cert(
++        vec![cert.der().clone()],
++        PrivatePkcs8KeyDer::from(pair.serialize_der()).into(),
++    )
++    .map_err(|_| internal)?;
++    config.send_tls13_tickets = 0;
++    config.max_early_data_size = 0;
++    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
++    config.alpn_protocols = alpn.to_vec();
++    Ok(config)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use tokio::io::AsyncWriteExt;
++
++    const NAME: &str = "reality-test.example.invalid";
++    const NOW: u32 = 1_800_000_000;
++    const SHORT_ID: [u8; 8] = [1, 2, 3, 4, 0, 0, 0, 0];
++
++    fn options() -> ExperimentalRealityOptions {
++        let mut secret = [0; 32];
++        vp_common::rand_bytes(&mut secret);
++        ExperimentalRealityOptions::new(
++            StaticSecret::from(secret),
++            vec![NAME.into()],
++            vec![SHORT_ID],
++        )
++    }
++    fn extension(out: &mut Vec<u8>, ty: u16, bytes: &[u8]) {
++        out.extend_from_slice(&ty.to_be_bytes());
++        out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
++        out.extend_from_slice(bytes);
++    }
++    fn payload() -> [u8; 16] {
++        let mut result = [0; 16];
++        result[..3].copy_from_slice(&[1, 8, 1]);
++        result[4..8].copy_from_slice(&NOW.to_be_bytes());
++        result[8..].copy_from_slice(&SHORT_ID);
++        result
++    }
++    fn fixture(
++        opts: &ExperimentalRealityOptions,
++        payload: [u8; 16],
++        extra: Option<(u16, &[u8])>,
++        low_order: bool,
++    ) -> Vec<u8> {
++        let mut private = [0; 32];
++        vp_common::rand_bytes(&mut private);
++        let private = StaticSecret::from(private);
++        let public = PublicKey::from(&private);
++        let mut random = [0; 32];
++        vp_common::rand_bytes(&mut random);
++        let mut body = vec![1, 0, 0, 0, 3, 3];
++        body.extend_from_slice(&random);
++        body.push(32);
++        body.extend_from_slice(&[0; 32]);
++        body.extend_from_slice(&[0, 2, 0x13, 1, 1, 0]);
++        let mut extensions = Vec::new();
++        let mut names = ((NAME.len() + 3) as u16).to_be_bytes().to_vec();
++        names.push(0);
++        names.extend_from_slice(&(NAME.len() as u16).to_be_bytes());
++        names.extend_from_slice(NAME.as_bytes());
++        extension(&mut extensions, 0, &names);
++        extension(&mut extensions, 10, &[0, 2, 0, 29]);
++        extension(&mut extensions, 13, &[0, 2, 8, 7]);
++        extension(&mut extensions, 43, &[2, 3, 4]);
++        let mut share = vec![0, 36, 0, 29, 0, 32];
++        share.extend_from_slice(if low_order {
++            &[0; 32]
++        } else {
++            public.as_bytes()
++        });
++        extension(&mut extensions, 51, &share);
++        if let Some((ty, bytes)) = extra {
++            extension(&mut extensions, ty, bytes);
++        }
++        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
++        body.extend_from_slice(&extensions);
++        let size = (body.len() - 4) as u32;
++        body[1..4].copy_from_slice(&size.to_be_bytes()[1..]);
++        let shared = private.diffie_hellman(&PublicKey::from(&opts.private_key));
++        let hk = hkdf::Salt::new(hkdf::HKDF_SHA256, &random[..20]).extract(shared.as_bytes());
++        struct Length;
++        impl hkdf::KeyType for Length {
++            fn len(&self) -> usize {
++                32
++            }
++        }
++        let mut key = Zeroizing::new([0; 32]);
++        hk.expand(&[b"REALITY"], Length)
++            .unwrap()
++            .fill(key.as_mut())
++            .unwrap();
++        let cipher = aead::LessSafeKey::new(
++            aead::UnboundKey::new(&aead::AES_256_GCM, key.as_ref()).unwrap(),
++        );
++        let nonce = aead::Nonce::try_assume_unique_for_key(&random[20..]).unwrap();
++        let mut encrypted = payload.to_vec();
++        cipher
++            .seal_in_place_append_tag(nonce, aead::Aad::from(&body), &mut encrypted)
++            .unwrap();
++        body[39..71].copy_from_slice(&encrypted);
++        body
++    }
++    fn authentic(hello: &[u8], opts: &ExperimentalRealityOptions) -> bool {
++        authenticate_client_hello(hello, opts, Duration::from_secs(NOW as u64)).is_ok()
++    }
++
++    #[test]
++    fn strict_authentication_rejects_every_truncation_and_byte_mutation() {
++        let opts = options();
++        let hello = fixture(&opts, payload(), None, false);
++        assert!(authentic(&hello, &opts));
++        for end in 0..hello.len() {
++            assert!(!authentic(&hello[..end], &opts));
++        }
++        for offset in 0..hello.len() {
++            let mut changed = hello.clone();
++            changed[offset] ^= 1;
++            assert!(
++                !authentic(&changed, &opts),
++                "accepted byte mutation {offset}"
++            );
++        }
++    }
++
++    #[test]
++    fn malformed_bounded_corpus_never_panics_or_authenticates() {
++        let opts = options();
++        for length in 0..2048 {
++            let mut bytes = vec![0; length];
++            vp_common::rand_bytes(&mut bytes);
++            assert!(!authentic(&bytes, &opts));
++        }
++        assert!(!authentic(&vec![0; MAX_HELLO_BYTES + 1], &opts));
++    }
++
++    #[test]
++    fn valid_aead_does_not_bypass_policy_or_reserved_fields() {
++        let mut opts = options();
++        let mut plain = payload();
++        plain[3] = 1;
++        assert!(!authentic(&fixture(&opts, plain, None, false), &opts));
++        plain = payload();
++        plain[8] ^= 1;
++        assert!(!authentic(&fixture(&opts, plain, None, false), &opts));
++        for timestamp in [NOW - 31, NOW + 31, 0, u32::MAX] {
++            plain = payload();
++            plain[4..8].copy_from_slice(&timestamp.to_be_bytes());
++            assert!(!authentic(&fixture(&opts, plain, None, false), &opts));
++        }
++        for timestamp in [NOW - 30, NOW + 30] {
++            plain = payload();
++            plain[4..8].copy_from_slice(&timestamp.to_be_bytes());
++            assert!(authentic(&fixture(&opts, plain, None, false), &opts));
++        }
++        let hello = fixture(&opts, payload(), None, false);
++        opts.min_client_version = Some([1, 8, 2]);
++        assert!(!authentic(&hello, &opts));
++        opts.min_client_version = None;
++        opts.max_client_version = Some([1, 8, 0]);
++        assert!(!authentic(&hello, &opts));
++        opts.max_client_version = Some([1, 8, 1]);
++        assert!(authentic(&hello, &opts));
++    }
++
++    #[test]
++    fn duplicate_extensions_psk_early_data_and_low_order_shares_are_rejected() {
++        let opts = options();
++        for extension in [
++            (0, &[][..]),
++            (43, &[2, 3, 4][..]),
++            (51, &[][..]),
++            (41, &[][..]),
++            (42, &[][..]),
++        ] {
++            assert!(!authentic(
++                &fixture(&opts, payload(), Some(extension), false),
++                &opts
++            ));
++        }
++        assert!(!authentic(&fixture(&opts, payload(), None, true), &opts));
++        // Unknown non-security extension is authenticated as AAD, then left for
++        // rustls to validate; it cannot silently alter authentication policy.
++        assert!(authentic(
++            &fixture(&opts, payload(), Some((12345, &[1, 2])), false),
++            &opts
++        ));
++    }
++
++    #[test]
++    fn one_matching_short_id_among_many_is_required() {
++        let mut opts = options();
++        let hello = fixture(&opts, payload(), None, false);
++        opts.short_ids = vec![[99; 8], SHORT_ID, [88; 8]];
++        assert!(authentic(&hello, &opts));
++        opts.short_ids = vec![[99; 8], [88; 8]];
++        assert!(!authentic(&hello, &opts));
++    }
++
++    #[test]
++    fn configuration_is_bounded_and_redacted() {
++        let mut opts = options();
++        assert!(opts.validate().is_ok());
++        let debug = format!("{opts:?}");
++        assert!(debug.contains("[REDACTED]"));
++        assert!(!debug.contains(NAME));
++        opts.server_names.clear();
++        assert!(opts.validate().is_err());
++        opts.server_names = vec!["127.0.0.1".into()];
++        assert!(opts.validate().is_err());
++        opts.server_names = vec!["EXAMPLE.INVALID".into()];
++        assert!(opts.validate().is_err());
++        opts.server_names = vec![NAME.into(), NAME.into()];
++        assert!(opts.validate().is_err());
++        opts.server_names = vec![NAME.into()];
++        opts.short_ids.clear();
++        assert!(opts.validate().is_err());
++        opts.short_ids = vec![SHORT_ID, SHORT_ID];
++        assert!(opts.validate().is_err());
++        opts.short_ids = vec![SHORT_ID];
++        opts.alpn = vec![vec![]];
++        assert!(opts.validate().is_err());
++        opts.alpn = vec![vec![0; 256]];
++        assert!(opts.validate().is_err());
++        opts.alpn.clear();
++        opts.max_time_difference = Duration::ZERO;
++        assert!(opts.validate().is_err());
++        opts.max_time_difference = Duration::from_millis(1);
++        assert!(opts.validate().is_err());
++        opts.max_time_difference = Duration::from_secs(301);
++        assert!(opts.validate().is_err());
++        opts.max_time_difference = Duration::from_secs(30);
++        opts.handshake_timeout = Duration::ZERO;
++        assert!(opts.validate().is_err());
++        opts.handshake_timeout = Duration::from_secs(61);
++        assert!(opts.validate().is_err());
++        opts.handshake_timeout = Duration::from_secs(5);
++        opts.max_concurrent_handshakes = 0;
++        assert!(opts.validate().is_err());
++        opts.max_concurrent_handshakes = 1025;
++        assert!(opts.validate().is_err());
++        opts.max_concurrent_handshakes = 1;
++        opts.min_client_version = Some([2, 0, 0]);
++        opts.max_client_version = Some([1, 0, 0]);
++        assert!(opts.validate().is_err());
++    }
++
++    fn records(hello: &[u8], chunk_size: usize) -> Vec<u8> {
++        let mut encoded = Vec::new();
++        for chunk in hello.chunks(chunk_size) {
++            encoded.extend_from_slice(&[22, 3, 3]);
++            encoded.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
++            encoded.extend_from_slice(chunk);
++        }
++        encoded
++    }
++    async fn read_bytes(encoded: Vec<u8>) -> Result<(Vec<u8>, Vec<u8>), RealityAcceptError> {
++        let (mut writer, mut reader) = tokio::io::duplex(encoded.len() + 1);
++        writer.write_all(&encoded).await.unwrap();
++        drop(writer);
++        read_client_hello(&mut reader).await
++    }
++    #[tokio::test]
++    async fn fragmented_records_preserve_exact_transcript_and_raw_input() {
++        let opts = options();
++        let hello = fixture(&opts, payload(), None, false);
++        for size in [7, 31, hello.len()] {
++            let encoded = records(&hello, size);
++            let (raw, parsed) = read_bytes(encoded.clone()).await.unwrap();
++            assert_eq!(raw, encoded);
++            assert_eq!(parsed, hello);
++        }
++    }
++    #[tokio::test]
++    async fn excessive_fragmentation_oversize_and_trailing_messages_rejected() {
++        let opts = options();
++        let hello = fixture(&opts, payload(), None, false);
++        assert!(matches!(
++            read_bytes(records(&hello, 1)).await,
++            Err(RealityAcceptError::Rejected)
++        ));
++        assert!(matches!(
++            read_bytes(vec![22, 3, 3, 0xff, 0xff]).await,
++            Err(RealityAcceptError::Rejected)
++        ));
++        assert!(matches!(
++            read_bytes(vec![22, 3, 3, 0, 0]).await,
++            Err(RealityAcceptError::Rejected)
++        ));
++        assert!(matches!(
++            read_bytes(vec![23, 3, 3, 0, 1, 0]).await,
++            Err(RealityAcceptError::Rejected)
++        ));
++        let mut extra = hello.clone();
++        extra.extend_from_slice(&[1, 0, 0, 0]);
++        assert!(matches!(
++            read_bytes(records(&extra, extra.len())).await,
++            Err(RealityAcceptError::Rejected)
++        ));
++        assert!(matches!(
++            read_bytes(vec![22, 3]).await,
++            Err(RealityAcceptError::Io)
++        ));
++    }
++}
+diff --git a/crates/vp-transport/tests/reality_experimental_server.rs b/crates/vp-transport/tests/reality_experimental_server.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..22765ab8652b35579a2e6f56bc7176e8621f3ffe
+--- /dev/null
++++ b/crates/vp-transport/tests/reality_experimental_server.rs
+@@ -0,0 +1,289 @@
++//! Same-engine loopback checks for the opt-in experimental source. These are not
++//! independent interoperability, a VLESS profile, camouflage, or Vision tests.
++#![cfg(feature = "experimental-reality-server")]
++
++use std::sync::Arc;
++use std::time::Duration;
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use tokio::net::{TcpListener, TcpStream};
++use vp_transport::RealityConfig;
++use vp_transport::reality_server::{
++    ExperimentalRealityAcceptor, ExperimentalRealityOptions, RealityAcceptError,
++};
++use vp_transport::utls::{Fingerprint, UtlsConfig, utls_connect};
++use x25519_dalek::{PublicKey, StaticSecret};
++
++const NAME: &str = "reality-test.example.invalid";
++const SHORT_ID: [u8; 8] = [1, 2, 3, 4, 0, 0, 0, 0];
++fn make_options() -> (ExperimentalRealityOptions, [u8; 32]) {
++    let mut key = [0; 32];
++    vp_common::rand_bytes(&mut key);
++    let private = StaticSecret::from(key);
++    let public = *PublicKey::from(&private).as_bytes();
++    (
++        ExperimentalRealityOptions::new(private, vec![NAME.into()], vec![SHORT_ID]),
++        public,
++    )
++}
++fn client_config(public_key: [u8; 32]) -> UtlsConfig {
++    UtlsConfig {
++        fingerprint: Fingerprint::Chrome,
++        server_name: Some(NAME.into()),
++        alpn: vec![],
++        skip_cert_verify: false,
++        reality: Some(RealityConfig {
++            public_key,
++            short_id: SHORT_ID,
++            spider_x: None,
++        }),
++    }
++}
++
++#[tokio::test]
++async fn experimental_transport_large_loopback_and_clean_shutdown() {
++    tokio::time::timeout(Duration::from_secs(10), async {
++        let (options, public) = make_options();
++        let acceptor = ExperimentalRealityAcceptor::new(options).unwrap();
++        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let addr = listener.local_addr().unwrap();
++        let server = tokio::spawn(async move {
++            let (stream, _) = listener.accept().await.unwrap();
++            let mut tls = acceptor.accept(stream).await.unwrap();
++            assert_eq!(tls.server_name(), Some(NAME));
++            assert_eq!(tls.negotiated_alpn(), None);
++            let mut payload = vec![0; 300_000];
++            tls.read_exact(&mut payload).await.unwrap();
++            tls.write_all(&payload).await.unwrap();
++            tls.shutdown().await.unwrap();
++        });
++        let tcp = TcpStream::connect(addr).await.unwrap();
++        let mut client = utls_connect(tcp, NAME, &client_config(public))
++            .await
++            .unwrap();
++        let mut sent: Vec<u8> = (0..300_000).map(|index| (index % 251) as u8).collect();
++        // Real application zeros at TLS-record boundaries are not padding.
++        for chunk in sent.chunks_mut(16_384) {
++            *chunk.last_mut().unwrap() = 0;
++        }
++        client.write_all(&sent).await.unwrap();
++        client.flush().await.unwrap();
++        let mut received = vec![0; sent.len()];
++        client.read_exact(&mut received).await.unwrap();
++        assert_eq!(sent, received);
++        let mut tail = [0];
++        assert_eq!(client.read(&mut tail).await.unwrap(), 0);
++        server.await.unwrap();
++    })
++    .await
++    .unwrap();
++}
++
++#[derive(Clone, Copy)]
++enum Rejection {
++    Key,
++    ShortId,
++    Sni,
++    ClientVersion,
++    Alpn,
++}
++async fn rejected(case: Rejection) {
++    let (mut options, public) = make_options();
++    let mut cfg = client_config(public);
++    match case {
++        Rejection::Key => cfg.reality.as_mut().unwrap().public_key = make_options().1,
++        Rejection::ShortId => cfg.reality.as_mut().unwrap().short_id[0] ^= 1,
++        Rejection::Sni => cfg.server_name = Some("wrong.example.invalid".into()),
++        Rejection::ClientVersion => options.min_client_version = Some([255, 0, 0]),
++        Rejection::Alpn => {
++            options.alpn = vec![b"h2".to_vec()];
++            cfg.alpn = vec!["http/1.1".into()];
++        }
++    }
++    let acceptor = ExperimentalRealityAcceptor::new(options).unwrap();
++    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let addr = listener.local_addr().unwrap();
++    let server = tokio::spawn(async move {
++        let (stream, _) = listener.accept().await.unwrap();
++        assert!(matches!(
++            acceptor.accept(stream).await,
++            Err(RealityAcceptError::Rejected)
++        ));
++    });
++    let client = async {
++        let tcp = TcpStream::connect(addr).await.unwrap();
++        assert!(utls_connect(tcp, NAME, &cfg).await.is_err());
++        server.await.unwrap();
++    };
++    tokio::time::timeout(Duration::from_secs(5), client)
++        .await
++        .unwrap();
++}
++#[tokio::test]
++async fn wrong_key_never_yields_authenticated_stream() {
++    rejected(Rejection::Key).await;
++}
++#[tokio::test]
++async fn wrong_short_id_never_yields_authenticated_stream() {
++    rejected(Rejection::ShortId).await;
++}
++#[tokio::test]
++async fn wrong_sni_never_yields_authenticated_stream() {
++    rejected(Rejection::Sni).await;
++}
++#[tokio::test]
++async fn disallowed_client_version_never_yields_authenticated_stream() {
++    rejected(Rejection::ClientVersion).await;
++}
++#[tokio::test]
++async fn wrong_alpn_never_yields_authenticated_stream() {
++    rejected(Rejection::Alpn).await;
++}
++
++#[tokio::test]
++async fn h2_frames_over_authenticated_transport_not_vless_profile() {
++    tokio::time::timeout(Duration::from_secs(5), async {
++        let (mut options, public) = make_options();
++        options.alpn = vec![b"h2".to_vec()];
++        let acceptor = ExperimentalRealityAcceptor::new(options).unwrap();
++        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let addr = listener.local_addr().unwrap();
++        let (stop, mut stopped) = tokio::sync::oneshot::channel();
++        let server = tokio::spawn(async move {
++            let (stream, _) = listener.accept().await.unwrap();
++            let tls = acceptor.accept(stream).await.unwrap();
++            assert_eq!(tls.negotiated_alpn(), Some(b"h2".as_slice()));
++            let mut connection = h2::server::handshake(tls).await.unwrap();
++            let (request, mut responder) = connection.accept().await.unwrap().unwrap();
++            assert_eq!(request.uri().path(), "/transport-check");
++            let response = http::Response::builder().status(200).body(()).unwrap();
++            let mut body = responder.send_response(response, false).unwrap();
++            body.send_data(
++                bytes::Bytes::from_static(b"h2 over authenticated TLS"),
++                true,
++            )
++            .unwrap();
++            drop(body);
++            drop(responder);
++            drop(request);
++            // This test establishes H2 frame exchange, not H2 drain policy.
++            // Retain/drive the connection until the client confirms the body;
++            // then explicitly cancel both harness drivers.
++            tokio::select! {
++                biased;
++                _ = &mut stopped => {},
++                next = connection.accept() => {
++                    let _ = next.expect("H2 closed before body confirmation").expect("H2 failed before body confirmation");
++                    panic!("unexpected second request");
++                }
++            }
++        });
++        let tcp = TcpStream::connect(addr).await.unwrap();
++        let mut cfg = client_config(public);
++        cfg.alpn = vec!["h2".into()];
++        let tls = utls_connect(tcp, NAME, &cfg).await.unwrap();
++        let (sender, connection) = h2::client::handshake(tls).await.unwrap();
++        let driver = tokio::spawn(connection);
++        let mut sender = sender.ready().await.unwrap();
++        let request = http::Request::builder()
++            .uri(format!("https://{NAME}/transport-check"))
++            .body(())
++            .unwrap();
++        let (response, _) = sender.send_request(request, true).unwrap();
++        let mut response = response.await.unwrap();
++        assert_eq!(response.status(), 200);
++        assert_eq!(
++            response.body_mut().data().await.unwrap().unwrap(),
++            b"h2 over authenticated TLS"[..]
++        );
++        assert!(response.body_mut().data().await.is_none());
++        drop(response);
++        stop.send(()).unwrap();
++        driver.abort();
++        assert!(matches!(driver.await, Err(error) if error.is_cancelled()));
++        drop(sender);
++        server.await.unwrap();
++    })
++    .await
++    .unwrap();
++}
++
++#[tokio::test]
++async fn accept_cancellation_releases_capacity_without_spawned_work() {
++    let (mut opts, _) = make_options();
++    opts.max_concurrent_handshakes = 1;
++    let acceptor = Arc::new(ExperimentalRealityAcceptor::new(opts).unwrap());
++    let (stream, mut peer) = tokio::io::duplex(1);
++    let acceptor2 = acceptor.clone();
++    let task = tokio::spawn(async move { acceptor2.accept(stream).await });
++    // Completion of a two-byte write through a one-byte duplex proves the first
++    // accept has acquired its permit and is awaiting the rest of the header.
++    peer.write_all(&[22, 3]).await.unwrap();
++    let (stream, _peer) = tokio::io::duplex(1);
++    assert!(matches!(
++        acceptor.accept(stream).await,
++        Err(RealityAcceptError::Busy)
++    ));
++    task.abort();
++    assert!(matches!(task.await, Err(error) if error.is_cancelled()));
++    let (stream, peer) = tokio::io::duplex(1);
++    drop(peer);
++    assert!(matches!(
++        acceptor.accept(stream).await,
++        Err(RealityAcceptError::Io)
++    ));
++}
++
++#[tokio::test]
++async fn stalled_handshake_times_out_and_releases_capacity() {
++    let (mut opts, _) = make_options();
++    opts.handshake_timeout = Duration::from_millis(20);
++    opts.max_concurrent_handshakes = 1;
++    let acceptor = ExperimentalRealityAcceptor::new(opts).unwrap();
++    let (stream, _peer) = tokio::io::duplex(1);
++    assert!(matches!(
++        acceptor.accept(stream).await,
++        Err(RealityAcceptError::TimedOut)
++    ));
++    let (stream, peer) = tokio::io::duplex(1);
++    drop(peer);
++    assert!(matches!(
++        acceptor.accept(stream).await,
++        Err(RealityAcceptError::Io)
++    ));
++}
++
++#[tokio::test]
++async fn ordinary_tls_client_is_not_authorized_as_reality() {
++    let (options, _) = make_options();
++    let acceptor = ExperimentalRealityAcceptor::new(options).unwrap();
++    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let addr = listener.local_addr().unwrap();
++    let server = tokio::spawn(async move {
++        let (stream, _) = listener.accept().await.unwrap();
++        assert!(matches!(
++            acceptor.accept(stream).await,
++            Err(RealityAcceptError::Rejected)
++        ));
++    });
++    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
++        rustls::crypto::ring::default_provider(),
++    ))
++    .with_protocol_versions(&[&rustls::version::TLS13])
++    .unwrap()
++    .with_root_certificates(rustls::RootCertStore::empty())
++    .with_no_client_auth();
++    let action = async {
++        let tcp = TcpStream::connect(addr).await.unwrap();
++        let name = rustls::pki_types::ServerName::try_from(NAME).unwrap();
++        assert!(
++            tokio_rustls::TlsConnector::from(Arc::new(config))
++                .connect(name, tcp)
++                .await
++                .is_err()
++        );
++        server.await.unwrap();
++    };
++    tokio::time::timeout(Duration::from_secs(5), action)
++        .await
++        .unwrap();
++}

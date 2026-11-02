@@ -1,0 +1,2923 @@
+From d45c0a8948997770c31e9195ff492c77ce78cf74 Mon Sep 17 00:00:00 2001
+From: VP Product Engineering <vp-product@example.invalid>
+Date: Fri, 30 Oct 2026 11:30:52 +0900
+Subject: [PATCH] fix(quic): gate TUIC and Hysteria2 forwarding on connection
+ authentication
+
+Enforce connection-bound credentials, deadlines, bounded pending work and session resources; correct TUIC packet size/mode and retain Hy2 critical streams. Add destination-observing auth-negative tests and optional independent official peer tests. Full CLI interoperability remains environment-blocked, not certified.
+---
+ crates/vp-protocol/src/hysteria2.rs           | 729 ++++++++------
+ crates/vp-protocol/src/tuic.rs                | 912 ++++++++++++------
+ .../vp-protocol/tests/quic_auth_negative.rs   | 662 +++++++++++++
+ .../vp-protocol/tests/quic_server_interop.rs  | 242 +++++
+ 4 files changed, 1966 insertions(+), 579 deletions(-)
+ create mode 100644 crates/vp-protocol/tests/quic_auth_negative.rs
+ create mode 100644 crates/vp-protocol/tests/quic_server_interop.rs
+
+diff --git a/crates/vp-protocol/src/hysteria2.rs b/crates/vp-protocol/src/hysteria2.rs
+index d68cc9f..fe66cc2 100644
+--- a/crates/vp-protocol/src/hysteria2.rs
++++ b/crates/vp-protocol/src/hysteria2.rs
+@@ -10,6 +10,8 @@ use std::collections::HashMap;
+ use std::net::SocketAddr;
+ use std::sync::Arc;
+ use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
++use std::time::Duration;
++use tokio::task::{AbortHandle, JoinSet};
+ 
+ use async_trait::async_trait;
+ use blake2::digest::{Digest, consts::U32};
+@@ -26,6 +28,13 @@ use vp_core::{Inbound, Outbound, PacketConn, ProxyStream, UdpPacket};
+ type Blake2b256 = blake2::Blake2b<U32>;
+ 
+ const TCP_REQUEST_ID: u64 = 0x401;
++const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
++const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
++const MAX_CONNECTIONS: usize = 256;
++const MAX_STREAMS: usize = 64;
++const MAX_UDP_SESSIONS: usize = 64;
++const MAX_ADDRESS: usize = 2048;
++const MAX_PADDING: usize = 4096;
+ 
+ // ---------------------------------------------------------------------------
+ // QUIC varint
+@@ -183,37 +192,35 @@ pub struct Hysteria2UdpDemuxer {
+     _task: tokio::task::JoinHandle<()>,
+ }
+ 
++impl Drop for Hysteria2UdpDemuxer {
++    fn drop(&mut self) {
++        self._task.abort();
++    }
++}
++
+ impl Hysteria2UdpDemuxer {
+     pub fn new(conn: quinn::Connection) -> Self {
+         let listeners: Arc<RwLock<HashMap<u32, mpsc::Sender<UdpPacket>>>> =
+             Arc::new(RwLock::new(HashMap::new()));
+         let listeners_cloned = listeners.clone();
+-        let task = tokio::spawn(async move {
++        let task = vp_core::task_scope::spawn(async move {
++            let mut fragments = HyFragments::default();
+             while let Ok(dgram) = conn.read_datagram().await {
+-                if dgram.len() < 8 {
++                let Some(fragment) = parse_udp_message(&dgram) else {
+                     continue;
+-                }
+-                let session = u32::from_be_bytes([dgram[0], dgram[1], dgram[2], dgram[3]]);
+-                // frag id/total：未分片实现——分片包直接丢弃
+-                if dgram[7] != 1 {
+-                    continue;
+-                }
+-                let Some((alen, used)) = read_varint(&dgram[8..]) else {
++                };
++                let Some(packet) = fragments.push(fragment) else {
+                     continue;
+                 };
+-                let start = 8 + used;
+-                let end = start + alen as usize;
+-                if dgram.len() < end {
++                let session = packet.session;
++                let vp_common::Host::Ip(ip) = packet.dst.host else {
+                     continue;
+-                }
+-                let addr = std::str::from_utf8(&dgram[start..end])
+-                    .ok()
+-                    .and_then(|s| s.parse::<SocketAddr>().ok());
+-                let Some(src) = addr else { continue };
++                };
++                let src = SocketAddr::new(ip, packet.dst.port);
+                 let pkt = UdpPacket {
+                     src,
+                     dst: src,
+-                    data: dgram.slice(end..),
++                    data: packet.payload,
+                 };
+                 let guard = listeners_cloned.read().await;
+                 if let Some(sender) = guard.get(&session) {
+@@ -402,6 +409,9 @@ impl Outbound for Hysteria2Outbound {
+                 return Err(Error::ProtoMsg("hy2 TCPResponse 错误".into()));
+             }
+             let (msg_len, _) = read_varint_async(&mut recv).await?;
++            if msg_len > 2048 {
++                return Err(Error::Proto("hy2: response message too large"));
++            }
+             if msg_len > 0 {
+                 let mut msg = vec![0u8; msg_len as usize];
+                 recv.read_exact(&mut msg)
+@@ -409,6 +419,9 @@ impl Outbound for Hysteria2Outbound {
+                     .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 读消息: {e}"))))?;
+             }
+             let (pad_len, _) = read_varint_async(&mut recv).await?;
++            if pad_len > MAX_PADDING as u64 {
++                return Err(Error::Proto("hy2: response padding too large"));
++            }
+             if pad_len > 0 {
+                 let mut pad = vec![0u8; pad_len as usize];
+                 recv.read_exact(&mut pad).await.map_err(|e| {
+@@ -494,7 +507,7 @@ impl Drop for Hy2UdpConn {
+     fn drop(&mut self) {
+         let demux = self.demux.clone();
+         let session = self.session;
+-        tokio::spawn(async move {
++        vp_core::task_scope::spawn(async move {
+             demux.unregister(session).await;
+         });
+     }
+@@ -504,19 +517,13 @@ impl Drop for Hy2UdpConn {
+ impl PacketConn for Hy2UdpConn {
+     async fn send(&self, pkt: &UdpPacket) -> Result<()> {
+         let pkt_id = self.pkt_id.fetch_add(1, Ordering::Relaxed);
+-        let addr = format!("{}:{}", pkt.dst.ip(), pkt.dst.port());
+-        let mut msg = Vec::with_capacity(pkt.data.len() + addr.len() + 16);
+-        msg.extend_from_slice(&self.session.to_be_bytes());
+-        msg.extend_from_slice(&pkt_id.to_be_bytes());
+-        msg.push(0); // frag id
+-        msg.push(1); // frag total
+-        write_varint(&mut msg, addr.len() as u64);
+-        msg.extend_from_slice(addr.as_bytes());
+-        msg.extend_from_slice(&pkt.data);
+-        self.conn
+-            .send_datagram(Bytes::from(msg))
+-            .map_err(|e| Error::Io(std::io::Error::other(format!("hy2 datagram: {e}"))))?;
+-        Ok(())
++        send_udp_message(
++            &self.conn,
++            self.session,
++            pkt_id,
++            &DstAddr::ip(pkt.dst.ip(), pkt.dst.port()),
++            &pkt.data,
++        )
+     }
+ 
+     async fn recv(&mut self) -> Result<UdpPacket> {
+@@ -648,6 +655,9 @@ impl Inbound for Hysteria2Inbound {
+     }
+ 
+     async fn start(self: Arc<Self>, ctx: InboundCtx) -> Result<u16> {
++        if self.password.is_empty() {
++            return Err(Error::Config("hy2: nonempty password required".into()));
++        }
+         let certs: Vec<_> = rustls_pemfile::certs(&mut &self.cert_pem[..])
+             .collect::<std::result::Result<_, _>>()
+             .map_err(|e| Error::Config(format!("hy2 证书: {e}")))?;
+@@ -665,273 +675,312 @@ impl Inbound for Hysteria2Inbound {
+         ));
+         let mut t = quinn::TransportConfig::default();
+         t.datagram_receive_buffer_size(Some(1 << 20));
++        t.max_concurrent_bidi_streams((MAX_STREAMS as u32).into());
++        t.max_concurrent_uni_streams(16u32.into());
++        t.max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()));
+         scfg.transport_config(Arc::new(t));
+ 
+-        let bind_addr: SocketAddr = format!("{}:{}", self.bind, self.port)
+-            .parse()
+-            .unwrap_or_else(|_| {
+-                SocketAddr::new(std::net::IpAddr::V4([0, 0, 0, 0].into()), self.port)
+-            });
++        let bind_addr = SocketAddr::new(
++            self.bind
++                .parse()
++                .map_err(|_| Error::Config("hy2: bind must be an IP address".into()))?,
++            self.port,
++        );
+         let endpoint = quinn::Endpoint::server(scfg, bind_addr)?;
+         let bound = endpoint.local_addr()?.port();
+         let this = self.clone();
+-        tokio::spawn(async move {
+-            while let Some(incoming) = endpoint.accept().await {
+-                let Ok(conn) = incoming.await else { continue };
+-                let this = this.clone();
+-                let ctx = ctx.clone();
+-                tokio::spawn(async move {
+-                    if let Err(e) = this.serve_conn(conn, &ctx).await {
+-                        tracing::debug!("hy2 连接结束: {e}");
++        vp_core::task_scope::spawn_listener(self.tag.to_string(), async move {
++            let mut connections = JoinSet::new();
++            loop {
++                tokio::select! {
++                    incoming = endpoint.accept() => {
++                        let Some(incoming) = incoming else { break };
++                        if connections.len() >= MAX_CONNECTIONS { incoming.refuse(); continue; }
++                        let this = this.clone();
++                        let ctx = ctx.clone();
++                        let endpoint = endpoint.clone();
++                        crate::tuic::spawn_connection(&mut connections, async move {
++                            let _endpoint = endpoint;
++                            if let Ok(Ok(conn)) = tokio::time::timeout(HEADER_TIMEOUT, incoming).await {
++                                let _close = CloseConnection(conn.clone());
++                                if let Err(e) = this.serve_conn(conn, &ctx).await {
++                                    tracing::debug!("hy2 connection ended: {e}");
++                                }
++                            }
++                        });
+                     }
+-                });
++                    _ = connections.join_next(), if !connections.is_empty() => {}
++                }
+             }
+         });
+         Ok(bound)
+     }
+ }
+ 
++struct CloseConnection(quinn::Connection);
++impl Drop for CloseConnection {
++    fn drop(&mut self) {
++        self.0.close(0u32.into(), b"connection ended");
++    }
++}
++
++async fn open_server_h3_streams(conn: &quinn::Connection) -> Result<Vec<quinn::SendStream>> {
++    let mut streams = Vec::new();
++    for kind in [0u64, 2, 3] {
++        let mut stream = conn.open_uni().await.map_err(hy_error)?;
++        let mut header = Vec::new();
++        write_varint(&mut header, kind);
++        if kind == 0 {
++            header.extend_from_slice(&[4, 0]);
++        } // empty SETTINGS
++        stream.write_all(&header).await.map_err(hy_error)?;
++        streams.push(stream);
++    }
++    Ok(streams)
++}
++
++enum HyCommand {
++    Auth(Vec<(String, String)>, quinn::SendStream),
++    Tcp(DstAddr, quinn::SendStream, quinn::RecvStream),
++}
++
++async fn read_bounded(recv: &mut quinn::RecvStream, limit: usize) -> Result<Vec<u8>> {
++    let (len, _) = read_varint_async(recv).await?;
++    if len > limit as u64 {
++        return Err(Error::Proto("hy2: field too large"));
++    }
++    let mut data = vec![0; len as usize];
++    recv.read_exact(&mut data).await.map_err(hy_error)?;
++    Ok(data)
++}
++
++fn hy_error(e: impl std::fmt::Display) -> Error {
++    Error::Io(std::io::Error::other(e.to_string()))
++}
++
++async fn read_command(mut recv: quinn::RecvStream, send: quinn::SendStream) -> Result<HyCommand> {
++    let (kind, _) = read_varint_async(&mut recv).await?;
++    match kind {
++        TCP_REQUEST_ID => {
++            let address = read_bounded(&mut recv, MAX_ADDRESS).await?;
++            let address =
++                std::str::from_utf8(&address).map_err(|_| Error::Proto("hy2: address encoding"))?;
++            let dst = DstAddr::parse(address)?;
++            if dst.port == 0 {
++                return Err(Error::Proto("hy2: zero port"));
++            }
++            let _padding = read_bounded(&mut recv, MAX_PADDING).await?;
++            Ok(HyCommand::Tcp(dst, send, recv))
++        }
++        crate::h3_min::FRAME_HEADERS => {
++            let block = read_bounded(&mut recv, 16 * 1024).await?;
++            Ok(HyCommand::Auth(
++                crate::h3_min::decode_header_block(&block)?,
++                send,
++            ))
++        }
++        _ => Err(Error::Proto("hy2: unknown request")),
++    }
++}
++
++struct HyUdpSession {
++    sock: Arc<tokio::net::UdpSocket>,
++    abort: AbortHandle,
++    used: tokio::time::Instant,
++}
++impl Drop for HyUdpSession {
++    fn drop(&mut self) {
++        self.abort.abort();
++    }
++}
++
+ impl Hysteria2Inbound {
+     async fn serve_conn(self: Arc<Self>, conn: quinn::Connection, ctx: &InboundCtx) -> Result<()> {
+-        let mut udp_sessions: std::collections::HashMap<
+-            u32,
+-            std::sync::Arc<tokio::sync::Mutex<std::net::SocketAddr>>,
+-        > = std::collections::HashMap::new();
++        let auth_until = tokio::time::Instant::now() + AUTH_TIMEOUT;
++        let deadline = tokio::time::sleep_until(auth_until);
++        tokio::pin!(deadline);
++        // HTTP/3 control and QPACK streams are critical: retain them until connection exit.
++        // Dropping the old server_init_stream SendStream prematurely caused H3_CLOSED_CRITICAL_STREAM.
++        let _critical = tokio::time::timeout(AUTH_TIMEOUT, open_server_h3_streams(&conn))
++            .await
++            .map_err(|_| Error::Proto("hy2: HTTP/3 setup timeout"))??;
++        let mut authenticated = false;
++        let mut failed = false;
++        let mut parsers = JoinSet::new();
++        let mut controls = JoinSet::new();
++        let mut relays = JoinSet::new();
++        let mut sessions: HashMap<(u32, bool), HyUdpSession> = HashMap::new();
++        let mut fragments = HyFragments::default();
++        let mut pending = std::collections::VecDeque::new();
++        let mut sweep = tokio::time::interval(Duration::from_secs(5));
+         loop {
+             tokio::select! {
+-                uni = conn.accept_uni() => {
+-                    let Ok(mut s) = uni else { break };
+-                    let mut tb = [0u8; 1];
+-                    if s.read_exact(&mut tb).await.is_err() {
+-                        continue;
+-                    }
+-                    let st = read_varint(&tb).map(|(v, _)| v).unwrap_or(u64::MAX);
+-                    if st == crate::h3_min::STREAM_CONTROL {
+-                        // 客户端开了控制流：服务端也开一条并回应空 SETTINGS
+-                        if let Ok(out) = conn.open_uni().await {
+-                            let _ = crate::h3_min::server_init_stream(out, crate::h3_min::STREAM_CONTROL).await;
+-                        }
+-                    }
++                biased;
++                _ = &mut deadline, if !authenticated => {
++                    conn.close(0x100u32.into(), b"authentication timeout");
++                    return Err(Error::Proto("hy2: authentication timeout"));
+                 }
+-                bi = conn.accept_bi() => {
+-                    let Ok((mut send, mut recv)) = bi else { break };
+-                    // 嗅探首字节：TCP 请求(0x44 0x01) 或 HEADERS 帧(0x01)
+-                    let mut first: Vec<u8> = Vec::with_capacity(16);
+-                    let handled = loop {
+-                        let mut b = [0u8; 1];
+-                        if recv.read_exact(&mut b).await.is_err() {
+-                            break false;
+-                        }
+-                        first.push(b[0]);
+-                        if first.len() == 2 && first == [0x44, 0x01] {
+-                            let this = self.clone();
+-                            let ctx = ctx.clone();
+-                            tokio::spawn(async move {
+-                                this.serve_tcp(recv, send, &ctx).await;
+-                            });
+-                            break true;
++                _ = conn.closed() => break,
++                _ = sweep.tick() => {
++                    sessions.retain(|_, s| s.used.elapsed() < Duration::from_secs(60));
++                    fragments.0.retain(|_, f| f.created.elapsed() < Duration::from_secs(10));
++                }
++                _ = relays.join_next(), if !relays.is_empty() => {}
++                _ = controls.join_next(), if !controls.is_empty() => {}
++                uni = conn.accept_uni(), if controls.len() < 16 => {
++                    let Ok(mut recv) = uni else { break };
++                    crate::tuic::spawn_owned(&mut controls, async move {
++                        let Ok(Ok((kind, _))) = tokio::time::timeout(HEADER_TIMEOUT, read_varint_async(&mut recv)).await else { return };
++                        if !matches!(kind, 0 | 2 | 3) { return; }
++                        // Capacity zero is advertised, so dynamic QPACK entries are not needed.
++                        // Keep the peer's critical streams open, bounded by QUIC stream credit.
++                        let mut buf = [0; 1024];
++                        while let Ok(Some(_)) = recv.read(&mut buf).await {}
++                    });
++                }
++                bi = conn.accept_bi(), if parsers.len() < MAX_STREAMS && relays.len() < MAX_STREAMS => {
++                    let Ok((send, recv)) = bi else { break };
++                    crate::tuic::spawn_owned(&mut parsers, async move {
++                        tokio::time::timeout(HEADER_TIMEOUT, read_command(recv, send)).await
++                            .map_err(|_| Error::Proto("hy2: header timeout"))?
++                    });
++                }
++                done = parsers.join_next(), if !parsers.is_empty() => {
++                    let Some(Ok(Ok(cmd))) = done else {
++                        conn.close(0x107u32.into(), b"invalid request");
++                        return Err(Error::Proto("hy2: invalid or timed out request"));
++                    };
++                    match cmd {
++                        HyCommand::Auth(headers, mut send) => {
++                            let valid = !authenticated && !failed && self.valid_auth(&headers);
++                            let fields: &[(&str, &str)] = if valid {
++                                &[(":status", "233"), ("hysteria-udp", "true"), ("hysteria-cc-rx", "auto")]
++                            } else { &[(":status", "404")] };
++                            let written = tokio::time::timeout_at(if authenticated { tokio::time::Instant::now() + HEADER_TIMEOUT } else { auth_until },
++                                crate::h3_min::write_response_headers(&mut send, fields)).await;
++                            let finished = send.finish().is_ok();
++                            if valid && matches!(written, Ok(Ok(()))) && finished {
++                                authenticated = true;
++                            } else {
++                                // A failed/repeated authentication is terminal for proxy access.
++                                failed = true;
++                                pending.clear();
++                                if authenticated { conn.close(0x100u32.into(), b"authentication repeated"); break; }
++                            }
+                         }
+-                        if first[0] == 0x01 {
+-                            let mut full = first.clone();
+-                            match read_h3_headers(&mut recv, &mut full).await {
+-                                Ok(headers) => {
+-                                    let this = self.clone();
+-                                    let conn = conn.clone();
+-                                    let ctx = ctx.clone();
+-                                    tokio::spawn(async move {
+-                                        this.serve_auth(headers, send, &conn, &ctx).await;
+-                                    });
+-                                    break true;
+-                                }
+-                                Err(e) => {
+-                                    tracing::debug!("hy2 请求解析失败: {e}");
+-                                    let _ = send.reset(quinn::VarInt::from_u32(0x8));
+-                                    break true;
+-                                }
++                        cmd @ HyCommand::Tcp(..) => {
++                            if failed { continue; }
++                            if pending.len() >= 32 {
++                                conn.close(0x107u32.into(), b"request limit");
++                                break;
+                             }
++                            pending.push_back(cmd);
+                         }
+-                        if first.len() > 8 {
+-                            break false;
++                    }
++                    if authenticated {
++                        while let Some(HyCommand::Tcp(dst, send, recv)) = pending.pop_front() {
++                            if relays.len() >= MAX_STREAMS { continue; }
++                            let this = self.clone();
++                            let ctx = ctx.clone();
++                            let source = conn.remote_address();
++                            crate::tuic::spawn_owned(&mut relays, async move { this.serve_tcp(dst, recv, send, source, &ctx).await; });
+                         }
+-                    };
+-                    let _ = handled;
++                    }
+                 }
+                 dg = conn.read_datagram() => {
+                     let Ok(dg) = dg else { break };
+-                    let Some(pkt) = parse_udp_message(&dg) else { continue };
+-                    let sess = udp_sessions
+-                        .entry(pkt.session)
+-                        .or_insert_with(|| {
+-                            std::sync::Arc::new(tokio::sync::Mutex::new(
+-                                "127.0.0.1:0".parse().unwrap(),
+-                            ))
+-                        })
+-                        .clone();
+-                    let mut g = sess.lock().await;
+-                    if g.port() == 0 {
+-                        *g = pkt.src;
+-                    }
+-                    let target = *g;
+-                    drop(g);
+-                    if target.port() == 0 {
+-                        continue;
+-                    }
+-                    let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+-                    sock.connect(target).await?;
+-                    let _ = sock.send(&pkt.payload).await;
+-                    let conn2 = conn.clone();
+-                    let session = pkt.session;
+-                    tokio::spawn(async move {
+-                        let mut rbuf = [0u8; 65535];
+-                        loop {
+-                            let Ok(Ok((n, from))) = tokio::time::timeout(
+-                                std::time::Duration::from_secs(300),
+-                                sock.recv_from(&mut rbuf),
+-                            ).await else { break };
+-                            let addr = format!("{}:{}", from.ip(), from.port());
+-                            let mut msg = Vec::with_capacity(n + addr.len() + 16);
+-                            msg.extend_from_slice(&session.to_be_bytes());
+-                            msg.extend_from_slice(&0u16.to_be_bytes());
+-                            msg.push(0);
+-                            msg.push(1);
+-                            write_varint(&mut msg, addr.len() as u64);
+-                            msg.extend_from_slice(addr.as_bytes());
+-                            msg.extend_from_slice(&rbuf[..n]);
+-                            if conn2.send_datagram(Bytes::from(msg)).is_err() {
+-                                break;
+-                            }
++                    if !authenticated || failed { continue; }
++                    let Some(fragment) = parse_udp_message(&dg) else { continue };
++                    let Some(pkt) = fragments.push(fragment) else { continue };
++                    let target = match &pkt.dst.host {
++                        vp_common::Host::Ip(ip) => SocketAddr::new(*ip, pkt.dst.port),
++                        vp_common::Host::Domain(host) => {
++                            let Ok(Ok(mut addresses)) = tokio::time::timeout(HEADER_TIMEOUT,
++                                tokio::net::lookup_host((host.as_str(), pkt.dst.port))).await else { continue };
++                            let Some(address) = addresses.next() else { continue };
++                            address
+                         }
+-                    });
++                    };
++                    let key = (pkt.session, target.is_ipv6());
++                    if !sessions.contains_key(&key) {
++                        if sessions.len() >= MAX_UDP_SESSIONS { continue; }
++                        let bind = if target.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
++                        let sock = Arc::new(tokio::net::UdpSocket::bind(bind).await?);
++                        let rx = sock.clone();
++                        let conn = conn.clone();
++                        let session = pkt.session;
++                        let abort = crate::tuic::spawn_owned(&mut relays, async move {
++                            let mut buf = vec![0; 65535];
++                            let mut id = 0u16;
++                            while let Ok((n, from)) = rx.recv_from(&mut buf).await {
++                                id = id.wrapping_add(1);
++                                if send_udp_message(&conn, session, id, &DstAddr::ip(from.ip(), from.port()), &buf[..n]).is_err() { break; }
++                            }
++                        });
++                        sessions.insert(key, HyUdpSession { sock, abort, used: tokio::time::Instant::now() });
++                    }
++                    let sess = sessions.get_mut(&key).unwrap();
++                    sess.used = tokio::time::Instant::now();
++                    let _ = sess.sock.send_to(&pkt.payload, target).await;
+                 }
+             }
+         }
+         Ok(())
+     }
+ 
+-    /// /auth → 233；其它/密码错 → 伪装 404
+-    async fn serve_auth(
+-        &self,
+-        headers: Vec<(String, String)>,
+-        mut send: quinn::SendStream,
+-        conn: &quinn::Connection,
+-        _ctx: &InboundCtx,
+-    ) {
+-        let path = headers
+-            .iter()
+-            .find(|(k, _)| k == ":path")
+-            .map(|(_, v)| v.clone())
+-            .unwrap_or_default();
+-        let got = headers
+-            .iter()
+-            .find(|(k, _)| k == "hysteria-auth")
+-            .map(|(_, v)| v.clone())
+-            .unwrap_or_default();
+-        if path != "/auth" || got != self.password {
+-            let _ = crate::h3_min::write_response_headers(&mut send, &[(":status", "404")]).await;
+-            let _ = send.finish();
+-            if path == "/auth" {
+-                conn.close(quinn::VarInt::from_u32(8), b"auth failed");
++    fn valid_auth(&self, headers: &[(String, String)]) -> bool {
++        let unique = |name: &str| -> Option<&str> {
++            let mut values = headers
++                .iter()
++                .filter(|(k, _)| k == name)
++                .map(|(_, v)| v.as_str());
++            let value = values.next()?;
++            if values.next().is_some() {
++                return None;
+             }
+-            return;
+-        }
+-        let _ = crate::h3_min::write_response_headers(
+-            &mut send,
+-            &[
+-                (":status", "233"),
+-                ("hysteria-udp", "true"),
+-                ("hysteria-cc-rx", "0"),
+-            ],
+-        )
+-        .await;
+-        let _ = send.finish();
++            Some(value)
++        };
++        unique(":method") == Some("POST")
++            && unique(":path") == Some("/auth")
++            && unique(":authority") == Some("hysteria")
++            && unique(":scheme") == Some("https")
++            && unique("hysteria-auth").is_some_and(|p| {
++                crate::tuic::credentials_equal(p.as_bytes(), self.password.as_bytes())
++            })
+     }
+ 
+-    /// TCP 请求流（0x44 0x01 已消费）
+     async fn serve_tcp(
+         &self,
+-        mut recv: quinn::RecvStream,
++        dst: DstAddr,
++        recv: quinn::RecvStream,
+         mut send: quinn::SendStream,
++        source: SocketAddr,
+         ctx: &InboundCtx,
+     ) {
+-        let mut addr_buf: Vec<u8> = Vec::with_capacity(300);
+-        let dst = loop {
+-            match read_varint(&addr_buf) {
+-                Some((alen, used)) if addr_buf.len() >= used + alen as usize => {
+-                    let s = std::str::from_utf8(&addr_buf[used..used + alen as usize])
+-                        .unwrap_or("127.0.0.1:0");
+-                    let s = s
+-                        .strip_prefix('[')
+-                        .map(|x| x.trim_end_matches(']'))
+-                        .unwrap_or(s);
+-                    break DstAddr::parse(s)
+-                        .unwrap_or_else(|_| DstAddr::ip([127, 0, 0, 1].into(), 0));
+-                }
+-                _ => {
+-                    let mut b = [0u8; 1];
+-                    if recv.read_exact(&mut b).await.is_err() {
+-                        break DstAddr::ip([127, 0, 0, 1].into(), 0);
+-                    }
+-                    addr_buf.push(b[0]);
+-                    if addr_buf.len() > 300 {
+-                        break DstAddr::ip([127, 0, 0, 1].into(), 0);
+-                    }
+-                }
+-            }
+-        };
+-        if dst.port == 0 {
+-            let _ = send.reset(quinn::VarInt::from_u32(0x8));
+-            return;
+-        }
+-        // 消费 padding：[varint |pad|][pad bytes]（本实现恒空，读 varint 即可）
+-        let mut padb: Vec<u8> = Vec::with_capacity(8);
+-        let pad_len = loop {
+-            match read_varint(&padb) {
+-                Some((v, _)) => break v as usize,
+-                None => {
+-                    let mut b = [0u8; 1];
+-                    if recv.read_exact(&mut b).await.is_err() {
+-                        break 0;
+-                    }
+-                    padb.push(b[0]);
+-                    if padb.len() > 8 {
+-                        break 0;
+-                    }
+-                }
+-            }
+-        };
+-        if pad_len > 0 {
+-            let mut skip = vec![0u8; pad_len];
+-            let _ = recv.read_exact(&mut skip).await;
+-        }
+-        let sess = Session::new_tcp(self.tag.clone(), None, dst.clone());
++        let sess = Session::new_tcp(self.tag.clone(), Some(source), dst.clone());
+         let direct =
+             crate::direct::DirectOutbound::new(Arc::new(vp_dns::Resolver::system()), false);
+-        match direct.connect_stream(&sess, &dst).await {
+-            Ok(remote) => {
+-                // TCPResponse: [0x00][varint 0][varint 0]
+-                let _ = send.write_all(&[0x00, 0x00, 0x00]).await;
++        match tokio::time::timeout(HEADER_TIMEOUT, direct.connect_stream(&sess, &dst)).await {
++            Ok(Ok(remote)) => {
++                if send.write_all(&[0, 0, 0]).await.is_err() {
++                    return;
++                }
+                 let client: Box<dyn ProxyStream> = Box::new(QuicBiStream { send, recv });
+-                let meta = vp_core::ConnMeta {
+-                    id: sess.id,
+-                    inbound: sess.inbound.clone(),
+-                    network: "tcp",
+-                    host: dst.host.to_string(),
+-                    dst_port: dst.port,
+-                    src: None,
+-                    process: None,
+-                    rule: None,
+-                    chain: Some("hy2-server".into()),
+-                    start: vp_common::now_millis(),
+-                };
+-                let hook = RelayHook {
+-                    table: Some(ctx.conns.clone()),
+-                    meta: Some(meta),
+-                    stats: Some(ctx.stats.clone()),
+-                };
+-                let _ = relay(client, remote, hook).await;
++                let _ = relay(
++                    client,
++                    remote,
++                    RelayHook {
++                        table: Some(ctx.conns.clone()),
++                        meta: Some(crate::tuic::connection_meta(&sess, &dst, "hy2-server")),
++                        stats: Some(ctx.stats.clone()),
++                    },
++                )
++                .await;
+             }
+-            Err(_) => {
+-                let _ = send.reset(quinn::VarInt::from_u32(0x8));
++            _ => {
++                // Error TCPResponse, not an unframed QUIC reset.
++                let _ = send.write_all(&[1, 0, 0]).await;
++                let _ = send.finish();
+             }
+         }
+     }
+@@ -939,65 +988,165 @@ impl Hysteria2Inbound {
+ 
+ struct Hy2Packet {
+     session: u32,
+-    src: SocketAddr,
++    id: u16,
++    index: u8,
++    total: u8,
++    dst: DstAddr,
+     payload: Bytes,
+ }
+ 
+ fn parse_udp_message(dg: &[u8]) -> Option<Hy2Packet> {
+-    if dg.len() < 10 {
++    if dg.len() < 10 || dg[7] == 0 || (dg[7] > 1 && dg[6] >= dg[7]) {
+         return None;
+     }
+-    let session = u32::from_be_bytes([dg[0], dg[1], dg[2], dg[3]]);
+-    let _pkt = u16::from_be_bytes([dg[4], dg[5]]);
+-    if dg[7] != 1 {
++    let (alen, used) = read_varint(&dg[8..])?;
++    if alen == 0 || alen > MAX_ADDRESS as u64 {
+         return None;
+     }
+-    let (alen, used) = read_varint(&dg[8..])?;
+     let start = 8 + used;
+-    let end = start + alen as usize;
+-    if dg.len() < end {
++    let end = start.checked_add(alen as usize)?;
++    let dst = DstAddr::parse(std::str::from_utf8(dg.get(start..end)?).ok()?).ok()?;
++    if dst.port == 0 {
+         return None;
+     }
+-    let src = std::str::from_utf8(&dg[start..end]).ok()?.parse().ok()?;
+     Some(Hy2Packet {
+-        session,
+-        src,
++        session: u32::from_be_bytes(dg[..4].try_into().ok()?),
++        id: u16::from_be_bytes(dg[4..6].try_into().ok()?),
++        index: dg[6],
++        total: dg[7],
++        dst,
+         payload: Bytes::copy_from_slice(&dg[end..]),
+     })
+ }
+ 
+-/// 从流读出完整 HEADERS 帧（buf 含已读前缀）
+-async fn read_h3_headers(
+-    recv: &mut quinn::RecvStream,
+-    buf: &mut Vec<u8>,
+-) -> Result<Vec<(String, String)>> {
+-    loop {
+-        if let Some((ty, payload, _)) = crate::h3_min::parse_frame(buf) {
+-            if ty != crate::h3_min::FRAME_HEADERS {
+-                return Err(Error::ProtoMsg(format!("h3min: 期望 HEADERS（{ty}）")));
+-            }
+-            return crate::h3_min::decode_header_block(&payload);
++struct HyFragmentSet {
++    created: tokio::time::Instant,
++    dst: DstAddr,
++    parts: Vec<Option<Bytes>>,
++    bytes: usize,
++}
++#[derive(Default)]
++struct HyFragments(HashMap<(u32, u16), HyFragmentSet>);
++impl HyFragments {
++    fn push(&mut self, mut pkt: Hy2Packet) -> Option<Hy2Packet> {
++        if pkt.total == 1 {
++            return Some(pkt);
+         }
+-        let mut chunk = [0u8; 1024];
+-        let n = recv
+-            .read(&mut chunk)
+-            .await
+-            .map_err(|e| Error::Io(std::io::Error::other(format!("{e:?}"))))?
+-            .unwrap_or(0);
+-        if n == 0 {
+-            return Err(Error::Proto("h3min: 流中断"));
++        self.0
++            .retain(|_, f| f.created.elapsed() < Duration::from_secs(10));
++        let key = (pkt.session, pkt.id);
++        if !self.0.contains_key(&key) && self.0.len() >= 64 {
++            return None;
++        }
++        let f = self.0.entry(key).or_insert_with(|| HyFragmentSet {
++            created: tokio::time::Instant::now(),
++            dst: pkt.dst.clone(),
++            parts: vec![None; pkt.total as usize],
++            bytes: 0,
++        });
++        if f.dst != pkt.dst
++            || f.parts.len() != pkt.total as usize
++            || f.parts[pkt.index as usize].is_some()
++            || f.bytes + pkt.payload.len() > 65507
++        {
++            self.0.remove(&key);
++            return None;
+         }
+-        buf.extend_from_slice(&chunk[..n]);
+-        if buf.len() > 16 * 1024 {
+-            return Err(Error::Proto("h3min: 头过大"));
++        f.bytes += pkt.payload.len();
++        f.parts[pkt.index as usize] = Some(pkt.payload);
++        if f.parts.iter().any(Option::is_none) {
++            return None;
++        }
++        let f = self.0.remove(&key)?;
++        let mut data = Vec::with_capacity(f.bytes);
++        for part in f.parts {
++            data.extend_from_slice(&part?);
+         }
++        pkt.payload = data.into();
++        pkt.total = 1;
++        pkt.index = 0;
++        Some(pkt)
++    }
++}
++
++fn send_udp_message(
++    conn: &quinn::Connection,
++    session: u32,
++    id: u16,
++    dst: &DstAddr,
++    payload: &[u8],
++) -> Result<()> {
++    if payload.len() > 65507 {
++        return Err(Error::Proto("hy2: oversized UDP"));
++    }
++    let addr = dst.to_string();
++    let max = conn
++        .max_datagram_size()
++        .ok_or(Error::Proto("hy2: datagrams disabled"))?;
++    let mut header = Vec::new();
++    header.extend_from_slice(&session.to_be_bytes());
++    header.extend_from_slice(&id.to_be_bytes());
++    header.extend_from_slice(&[0, 1]);
++    write_varint(&mut header, addr.len() as u64);
++    header.extend_from_slice(addr.as_bytes());
++    let chunk = max
++        .checked_sub(header.len())
++        .filter(|n| *n > 0)
++        .ok_or(Error::Proto("hy2: datagram too small"))?;
++    let total = payload.len().max(1).div_ceil(chunk);
++    if total > 255 {
++        return Err(Error::Proto("hy2: too many fragments"));
++    }
++    for index in 0..total {
++        let mut msg = header.clone();
++        msg[6] = index as u8;
++        msg[7] = total as u8;
++        msg.extend_from_slice(
++            &payload[(index * chunk).min(payload.len())..((index + 1) * chunk).min(payload.len())],
++        );
++        conn.send_datagram(msg.into()).map_err(hy_error)?;
+     }
++    Ok(())
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn udp_fragment_reassembly_is_bounded_and_address_consistent() {
++        let dst = DstAddr::ip([127, 0, 0, 1].into(), 53);
++        let packet = |id, index, dst: DstAddr| Hy2Packet {
++            session: 1,
++            id,
++            index,
++            total: 2,
++            dst,
++            payload: Bytes::from_static(b"data"),
++        };
++        let mut fragments = HyFragments::default();
++        assert!(fragments.push(packet(1, 1, dst.clone())).is_none());
++        assert_eq!(
++            fragments
++                .push(packet(1, 0, dst.clone()))
++                .unwrap()
++                .payload
++                .as_ref(),
++            b"datadata"
++        );
++        assert!(fragments.push(packet(2, 0, dst.clone())).is_none());
++        assert!(
++            fragments
++                .push(packet(2, 1, DstAddr::ip([127, 0, 0, 1].into(), 80)))
++                .is_none()
++        );
++        assert!(fragments.0.is_empty());
++        for id in 0..256 {
++            fragments.push(packet(id, 0, dst.clone()));
++        }
++        assert_eq!(fragments.0.len(), 64);
++    }
++
+     #[test]
+     fn varint_roundtrip() {
+         for v in [
+@@ -1078,7 +1227,7 @@ mod tests {
+         let udp = std::sync::Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+         let udp_addr = udp.local_addr().unwrap();
+         tokio::spawn(async move {
+-            let mut b = [0u8; 2048];
++            let mut b = [0u8; 65535];
+             while let Ok((n, from)) = udp.recv_from(&mut b).await {
+                 let mut r = b"echo:".to_vec();
+                 r.extend_from_slice(&b[..n]);
+diff --git a/crates/vp-protocol/src/tuic.rs b/crates/vp-protocol/src/tuic.rs
+index 2d85006..9cca3f7 100644
+--- a/crates/vp-protocol/src/tuic.rs
++++ b/crates/vp-protocol/src/tuic.rs
+@@ -2,19 +2,22 @@
+ //!
+ //! 通用命令：`[VER=0x05][TYPE][OPT...]`（全大端）
+ //! - Authenticate `0x00`（uni 流）：`UUID(16) TOKEN(32)`，TOKEN 由 TLS Keying Material
+-//!   导出（label=UUID 字符串，context=原始密码，RFC 5705）
++//!   导出（label=原始 UUID，context=原始密码，RFC 5705）
+ //! - Connect `0x01`（bi 流）：`ADDR_TYPE(1) ADDR PORT(2)`，无应答直接中继
+ //!   ADDR_TYPE：`0x00` 域名（首字节长度）/ `0x01` IPv4 / `0x02` IPv6 / `0xff` None
+ //! - Packet `0x02`（uni 流）：`ASSOC(2) PKT(2) FRAG_TOTAL(1) FRAG(1) SIZE(2) ADDR`
+-//!   SIZE = ADDR 编码长 + payload 长
++//!   SIZE = payload 长（不含 ADDR）
+ //! - Dissociate `0x03`（uni 流）：`ASSOC(2)`
+ //! - Heartbeat `0x04`（datagram）：空 OPT
+ //!
+-//! ALPN：`tuic`
++//! 默认 ALPN：`h3`（与参考客户端一致；协议本身不规定 ALPN）
+ 
++use std::collections::HashMap;
+ use std::net::SocketAddr;
+ use std::sync::Arc;
+ use std::sync::atomic::{AtomicU16, Ordering};
++use std::time::Duration;
++use tokio::task::{AbortHandle, JoinSet};
+ 
+ use async_trait::async_trait;
+ use bytes::Bytes;
+@@ -25,6 +28,13 @@ use vp_core::session::Session;
+ use vp_core::tunnel::{RelayHook, relay};
+ use vp_core::{Inbound, Outbound, PacketConn, ProxyStream, UdpPacket};
+ 
++const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
++const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
++const UDP_IDLE: Duration = Duration::from_secs(60);
++const MAX_CONNECTIONS: usize = 256;
++const MAX_STREAMS: usize = 64;
++const MAX_PENDING: usize = 32;
++const MAX_UDP_SESSIONS: usize = 64;
+ const VER: u8 = 0x05;
+ const T_AUTH: u8 = 0x00;
+ const T_CONNECT: u8 = 0x01;
+@@ -135,6 +145,7 @@ pub struct TuicOutbound {
+     skip_verify: bool,
+     _congestion_controller: Option<String>,
+     assoc_counter: AtomicU16,
++    native_udp: bool,
+ }
+ 
+ impl TuicOutbound {
+@@ -148,6 +159,11 @@ impl TuicOutbound {
+             skip_verify: cfg.skip_cert_verify,
+             _congestion_controller: cfg.congestion_controller.clone(),
+             assoc_counter: AtomicU16::new(1),
++            native_udp: match cfg.udp_relay_mode.as_deref().unwrap_or("native") {
++                "native" => true,
++                "quic" => false,
++                _ => return Err(Error::Config("tuic: invalid UDP relay mode".into())),
++            },
+         })
+     }
+ 
+@@ -221,7 +237,8 @@ impl Outbound for TuicOutbound {
+             conn,
+             assoc,
+             pkt: AtomicU16::new(1),
+-            _reply_assoc: None,
++            native: self.native_udp,
++            fragments: Fragments::default(),
+         }))
+     }
+ 
+@@ -235,113 +252,279 @@ struct TuicPacketConn {
+     conn: quinn::Connection,
+     assoc: u16,
+     pkt: AtomicU16,
+-    /// 服务端回包流
+-    _reply_assoc: Option<tokio::sync::Mutex<Option<quinn::RecvStream>>>,
++    native: bool,
++    fragments: Fragments,
+ }
+ 
+ #[async_trait]
+ impl PacketConn for TuicPacketConn {
+     async fn send(&self, pkt: &UdpPacket) -> Result<()> {
+-        let mut addr = Vec::with_capacity(24);
+-        encode_addr(
+-            &DstAddr {
+-                host: Host::Ip(pkt.dst.ip()),
+-                port: pkt.dst.port(),
+-            },
+-            &mut addr,
+-        );
+-        let size = addr.len() + pkt.data.len();
+-        let mut msg = Vec::with_capacity(2 + 8 + size);
+-        msg.push(VER);
+-        msg.push(T_PACKET);
+-        msg.extend_from_slice(&self.assoc.to_be_bytes());
+-        msg.extend_from_slice(&(self.pkt.fetch_add(1, Ordering::Relaxed)).to_be_bytes());
+-        msg.push(1); // frag total
+-        msg.push(0); // frag id
+-        msg.extend_from_slice(&(size as u16).to_be_bytes());
+-        msg.extend_from_slice(&addr);
+-        msg.extend_from_slice(&pkt.data);
+-        let mut uni = self
+-            .conn
+-            .open_uni()
+-            .await
+-            .map_err(|e| Error::Io(std::io::Error::other(format!("tuic pkt open_uni: {e}"))))?;
+-        uni.write_all(&msg)
+-            .await
+-            .map_err(|e| Error::Io(std::io::Error::other(format!("tuic pkt 写入: {e}"))))?;
+-        uni.finish()
+-            .map_err(|e| Error::Io(std::io::Error::other(format!("tuic pkt finish: {e}"))))?;
+-        Ok(())
++        send_packet(
++            &self.conn,
++            self.native,
++            self.assoc,
++            self.pkt.fetch_add(1, Ordering::Relaxed),
++            &DstAddr::ip(pkt.dst.ip(), pkt.dst.port()),
++            &pkt.data,
++        )
++        .await
+     }
+ 
+     async fn recv(&mut self) -> Result<UdpPacket> {
+-        // 简化实现：服务端把回包写在客户端打开的 bi 流之外的 uni 流不可等——
+-        // TUIC 服务端回包：对 native 模式走 datagram，对 quic 模式服务端开 uni 流。
+-        // 此处读取服务端 uni 流。
+         loop {
+-            let stream = self
+-                .conn
+-                .read_datagram()
+-                .await
+-                .map_err(|e| Error::Io(std::io::Error::other(format!("tuic datagram: {e}"))))?;
+-            // 尝试按 Packet 命令解析
+-            if stream.len() < 2 || stream[0] != VER {
++            let msg = tokio::select! {
++                dg = self.conn.read_datagram() => dg.map_err(quic_error)?.to_vec(),
++                uni = self.conn.accept_uni() => {
++                    let mut uni = uni.map_err(quic_error)?;
++                    tokio::time::timeout(HEADER_TIMEOUT, uni.read_to_end(65535 + 300))
++                        .await.map_err(|_| Error::Proto("tuic: packet timeout"))?
++                        .map_err(quic_error)?
++                }
++            };
++            if msg.len() < 2 || msg[..2] != [VER, T_PACKET] {
+                 continue;
+             }
+-            match stream[1] {
+-                T_PACKET => {
+-                    let Some(pkt) = parse_packet_opt(&stream[2..]) else {
+-                        continue;
+-                    };
+-                    if pkt.assoc != self.assoc {
+-                        continue;
+-                    }
+-                    return Ok(UdpPacket {
+-                        src: pkt.src,
+-                        dst: pkt.src,
+-                        data: pkt.payload,
+-                    });
+-                }
+-                _ => continue, // Heartbeat 等
++            let Some(fragment) = parse_packet_opt(&msg[2..]) else {
++                continue;
++            };
++            if fragment.assoc != self.assoc {
++                continue;
+             }
++            let Some(pkt) = self.fragments.push(fragment) else {
++                continue;
++            };
++            let src = resolve_udp(&pkt.dst).await?;
++            return Ok(UdpPacket {
++                src,
++                dst: src,
++                data: pkt.payload,
++            });
+         }
+     }
+ }
+ 
+ struct PacketOpt {
+     assoc: u16,
+-    src: SocketAddr,
++    id: u16,
++    total: u8,
++    index: u8,
++    dst: Option<DstAddr>,
+     payload: Bytes,
+ }
+ 
+-/// 解析 Packet OPT：ASSOC(2) PKT(2) FRAG_TOTAL(1) FRAG(1) SIZE(2) ADDR PAYLOAD
++struct Packet {
++    assoc: u16,
++    dst: DstAddr,
++    payload: Bytes,
++}
++
++// SIZE counts payload bytes only, not the address (TUIC v5 SPEC).
+ fn parse_packet_opt(opt: &[u8]) -> Option<PacketOpt> {
+-    if opt.len() < 8 {
++    if opt.len() < 9 {
+         return None;
+     }
+-    let assoc = u16::from_be_bytes([opt[0], opt[1]]);
+-    let frag_total = opt[4];
+-    if frag_total != 1 {
+-        return None; // 分片不支持
++    let total = opt[4];
++    let index = opt[5];
++    if total == 0 || index >= total {
++        return None;
+     }
+     let size = u16::from_be_bytes([opt[6], opt[7]]) as usize;
+-    let rest = &opt[8..];
+-    if rest.len() < size {
++    let (dst, used) = if opt[8] == 0xff {
++        if index == 0 {
++            return None;
++        }
++        (None, 1)
++    } else {
++        let (dst, used) = decode_addr(&opt[8..]).ok()?;
++        if dst.port == 0 {
++            return None;
++        }
++        (Some(dst), used)
++    };
++    if opt.len() != 8 + used + size {
+         return None;
+     }
+-    let body = &rest[..size];
+-    let (dst, used) = decode_addr(body).ok()?;
+-    let ip = match dst.host {
+-        Host::Ip(ip) => ip,
+-        Host::Domain(_) => return None,
+-    };
+     Some(PacketOpt {
+-        assoc,
+-        src: SocketAddr::new(ip, dst.port),
+-        payload: Bytes::copy_from_slice(&body[used..]),
++        assoc: u16::from_be_bytes([opt[0], opt[1]]),
++        id: u16::from_be_bytes([opt[2], opt[3]]),
++        total,
++        index,
++        dst,
++        payload: Bytes::copy_from_slice(&opt[8 + used..]),
+     })
+ }
+ 
++struct FragmentSet {
++    created: tokio::time::Instant,
++    dst: Option<DstAddr>,
++    parts: Vec<Option<Bytes>>,
++    bytes: usize,
++}
++
++#[derive(Default)]
++struct Fragments(HashMap<(u16, u16), FragmentSet>);
++
++impl Fragments {
++    fn push(&mut self, pkt: PacketOpt) -> Option<Packet> {
++        if pkt.total == 1 {
++            return Some(Packet {
++                assoc: pkt.assoc,
++                dst: pkt.dst?,
++                payload: pkt.payload,
++            });
++        }
++        self.0
++            .retain(|_, f| f.created.elapsed() < Duration::from_secs(10));
++        let key = (pkt.assoc, pkt.id);
++        if !self.0.contains_key(&key) && self.0.len() >= 64 {
++            return None;
++        }
++        let f = self.0.entry(key).or_insert_with(|| FragmentSet {
++            created: tokio::time::Instant::now(),
++            dst: None,
++            parts: vec![None; pkt.total as usize],
++            bytes: 0,
++        });
++        if f.parts.len() != pkt.total as usize
++            || f.parts[pkt.index as usize].is_some()
++            || f.bytes + pkt.payload.len() > 65507
++        {
++            self.0.remove(&key);
++            return None;
++        }
++        if pkt.index == 0 {
++            f.dst = pkt.dst;
++        }
++        f.bytes += pkt.payload.len();
++        f.parts[pkt.index as usize] = Some(pkt.payload);
++        if f.parts.iter().any(Option::is_none) {
++            return None;
++        }
++        let f = self.0.remove(&key)?;
++        let mut data = Vec::with_capacity(f.bytes);
++        for part in f.parts {
++            data.extend_from_slice(&part?);
++        }
++        Some(Packet {
++            assoc: pkt.assoc,
++            dst: f.dst?,
++            payload: data.into(),
++        })
++    }
++}
++
++// Established QUIC connections are tracked Work, not owned by the accept task.
++// Dropping ingress detaches only these join waiters; managed shutdown can drain the
++// connection tasks and then cancel/await their destructors deterministically.
++pub(crate) fn spawn_connection(
++    set: &mut JoinSet<()>,
++    future: impl std::future::Future<Output = ()> + Send + 'static,
++) {
++    let task = vp_core::task_scope::spawn(future);
++    set.spawn(async move {
++        let _ = task.await;
++    });
++}
++
++// JoinSet owns cancellation; the managed scope also awaits every child destructor.
++pub(crate) fn spawn_owned<T: Send + 'static>(
++    set: &mut JoinSet<T>,
++    future: impl std::future::Future<Output = T> + Send + 'static,
++) -> AbortHandle {
++    vp_core::task_scope::spawn_in(set, future)
++}
++
++pub(crate) fn connection_meta(sess: &Session, dst: &DstAddr, chain: &str) -> vp_core::ConnMeta {
++    vp_core::ConnMeta {
++        id: sess.id,
++        inbound: sess.inbound.clone(),
++        network: "tcp",
++        host: dst.host.to_string(),
++        dst_port: dst.port,
++        src: sess.src.map(|s| s.to_string()),
++        process: None,
++        rule: None,
++        chain: Some(chain.into()),
++        start: vp_common::now_millis(),
++    }
++}
++
++// Compare credential-derived tags through ring's public constant-time HMAC verification API.
++pub(crate) fn credentials_equal(expected: &[u8], received: &[u8]) -> bool {
++    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"vp-quic-credential-comparison-v1");
++    let tag = ring::hmac::sign(&key, expected);
++    ring::hmac::verify(&key, received, tag.as_ref()).is_ok()
++}
++
++fn quic_error(e: impl std::fmt::Display) -> Error {
++    Error::Io(std::io::Error::other(e.to_string()))
++}
++
++async fn resolve_udp(dst: &DstAddr) -> Result<SocketAddr> {
++    match &dst.host {
++        Host::Ip(ip) => Ok(SocketAddr::new(*ip, dst.port)),
++        Host::Domain(host) => tokio::time::timeout(
++            HEADER_TIMEOUT,
++            tokio::net::lookup_host((host.as_str(), dst.port)),
++        )
++        .await
++        .map_err(|_| Error::Proto("tuic: DNS timeout"))??
++        .next()
++        .ok_or(Error::Proto("tuic: no address")),
++    }
++}
++
++async fn send_packet(
++    conn: &quinn::Connection,
++    native: bool,
++    assoc: u16,
++    id: u16,
++    dst: &DstAddr,
++    payload: &[u8],
++) -> Result<()> {
++    if payload.len() > 65507 {
++        return Err(Error::Proto("tuic: oversized UDP"));
++    }
++    let mut addr = Vec::new();
++    encode_addr(dst, &mut addr);
++    let chunk = if native {
++        conn.max_datagram_size()
++            .ok_or(Error::Proto("tuic: datagrams disabled"))?
++            .checked_sub(10 + addr.len())
++            .filter(|n| *n > 0)
++            .ok_or(Error::Proto("tuic: datagram too small"))?
++    } else {
++        65507
++    };
++    let total = payload.len().max(1).div_ceil(chunk);
++    if total > 255 {
++        return Err(Error::Proto("tuic: too many fragments"));
++    }
++    for index in 0..total {
++        let part =
++            &payload[(index * chunk).min(payload.len())..((index + 1) * chunk).min(payload.len())];
++        let mut msg = vec![VER, T_PACKET];
++        msg.extend_from_slice(&assoc.to_be_bytes());
++        msg.extend_from_slice(&id.to_be_bytes());
++        msg.extend_from_slice(&[total as u8, index as u8]);
++        msg.extend_from_slice(&(part.len() as u16).to_be_bytes());
++        if index == 0 {
++            msg.extend_from_slice(&addr);
++        } else {
++            msg.push(0xff);
++        }
++        msg.extend_from_slice(part);
++        if native {
++            conn.send_datagram(msg.into()).map_err(quic_error)?;
++        } else {
++            let mut uni = conn.open_uni().await.map_err(quic_error)?;
++            uni.write_all(&msg).await.map_err(quic_error)?;
++            uni.finish().map_err(quic_error)?;
++        }
++    }
++    Ok(())
++}
++
+ fn tuic_client_config(skip_verify: bool) -> quinn::ClientConfig {
+     static VERIFY: std::sync::OnceLock<quinn::ClientConfig> = std::sync::OnceLock::new();
+     static NO_VERIFY: std::sync::OnceLock<quinn::ClientConfig> = std::sync::OnceLock::new();
+@@ -460,6 +643,17 @@ impl Inbound for TuicInbound {
+     }
+ 
+     async fn start(self: Arc<Self>, ctx: InboundCtx) -> Result<u16> {
++        if self.users.is_empty() || self.users.len() > 1024 {
++            return Err(Error::Config("tuic: 1..1024 users required".into()));
++        }
++        let mut ids = std::collections::HashSet::new();
++        for (uuid, password) in &self.users {
++            if password.is_empty() || !ids.insert(parse_uuid16(uuid)?) {
++                return Err(Error::Config(
++                    "tuic: empty password or duplicate UUID".into(),
++                ));
++            }
++        }
+         let certs: Vec<_> = rustls_pemfile::certs(&mut &self.cert_pem[..])
+             .collect::<std::result::Result<_, _>>()
+             .map_err(|e| Error::Config(format!("tuic 证书: {e}")))?;
+@@ -477,245 +671,316 @@ impl Inbound for TuicInbound {
+         ));
+         let mut t = quinn::TransportConfig::default();
+         t.datagram_receive_buffer_size(Some(1 << 20));
++        t.max_concurrent_bidi_streams((MAX_STREAMS as u32).into());
++        t.max_concurrent_uni_streams((MAX_STREAMS as u32).into());
++        t.max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()));
+         scfg.transport_config(Arc::new(t));
+ 
+-        let endpoint =
+-            quinn::Endpoint::server(scfg, (self.bind.as_str(), self.port).to_socket_addrs_dyn())
+-                .map_err(|e| Error::Io(std::io::Error::other(format!("tuic bind: {e}"))))?;
++        let endpoint = quinn::Endpoint::server(
++            scfg,
++            SocketAddr::new(
++                self.bind
++                    .parse()
++                    .map_err(|_| Error::Config("tuic: bind must be an IP address".into()))?,
++                self.port,
++            ),
++        )
++        .map_err(|e| Error::Io(std::io::Error::other(format!("tuic bind: {e}"))))?;
+         let bound = endpoint.local_addr().map_err(Error::Io)?.port();
+         let this = self.clone();
+-        tokio::spawn(async move {
+-            while let Some(incoming) = endpoint.accept().await {
+-                let Ok(conn) = incoming.await else { continue };
+-                let this = this.clone();
+-                let ctx = ctx.clone();
+-                tokio::spawn(async move {
+-                    if let Err(e) = this.serve_conn(conn, &ctx).await {
+-                        tracing::debug!("tuic 连接结束: {e}");
++        vp_core::task_scope::spawn_listener(self.tag.to_string(), async move {
++            let mut connections = JoinSet::new();
++            loop {
++                tokio::select! {
++                    incoming = endpoint.accept() => {
++                        let Some(incoming) = incoming else { break };
++                        if connections.len() >= MAX_CONNECTIONS { incoming.refuse(); continue; }
++                        let this = this.clone();
++                        let ctx = ctx.clone();
++                        let endpoint = endpoint.clone();
++                        spawn_connection(&mut connections, async move {
++                            let _endpoint = endpoint;
++                            if let Ok(Ok(conn)) = tokio::time::timeout(HEADER_TIMEOUT, incoming).await {
++                                let _close = CloseConnection(conn.clone());
++                                if let Err(e) = this.serve_conn(conn, &ctx).await {
++                                    tracing::debug!("tuic connection ended: {e}");
++                                }
++                            }
++                        });
+                     }
+-                });
++                    _ = connections.join_next(), if !connections.is_empty() => {}
++                }
+             }
+         });
+         Ok(bound)
+     }
+ }
+ 
+-trait ToAddrsDyn {
+-    fn to_socket_addrs_dyn(&self) -> SocketAddr;
+-}
+-impl ToAddrsDyn for (&str, u16) {
+-    fn to_socket_addrs_dyn(&self) -> SocketAddr {
+-        format!("{}:{}", self.0, self.1)
+-            .parse()
+-            .unwrap_or_else(|_| SocketAddr::new(std::net::IpAddr::V4([0, 0, 0, 0].into()), self.1))
++// Dropping the managed parent closes QUIC, and JoinSet drops abort all child relays.
++struct CloseConnection(quinn::Connection);
++impl Drop for CloseConnection {
++    fn drop(&mut self) {
++        self.0.close(0u32.into(), b"connection ended");
+     }
+ }
+ 
+-impl TuicInbound {
+-    /// UDP 会话：登记目标 + 建socket + 回包泵（datagram 模式回发）
+-    async fn udp_session_relay(
+-        conn: &quinn::Connection,
+-        udp_sessions: &mut std::collections::HashMap<
+-            u16,
+-            std::sync::Arc<tokio::sync::Mutex<std::net::SocketAddr>>,
+-        >,
+-        pkt: PacketOpt,
+-    ) -> Result<()> {
+-        let sess = udp_sessions
+-            .entry(pkt.assoc)
+-            .or_insert_with(|| {
+-                std::sync::Arc::new(tokio::sync::Mutex::new("127.0.0.1:0".parse().unwrap()))
+-            })
+-            .clone();
+-        let mut guard = sess.lock().await;
+-        if guard.port() == 0 {
+-            *guard = pkt.src;
++enum Command {
++    Auth([u8; 48]),
++    Connect(DstAddr, quinn::SendStream, quinn::RecvStream),
++    Packet(PacketOpt, bool),
++    Dissociate(u16),
++}
++
++async fn read_command(
++    mut recv: quinn::RecvStream,
++    send: Option<quinn::SendStream>,
++) -> Result<Command> {
++    let mut head = [0; 2];
++    recv.read_exact(&mut head).await.map_err(quic_error)?;
++    if head[0] != VER {
++        return Err(Error::Proto("tuic: version"));
++    }
++    match (head[1], send) {
++        (T_AUTH, None) => {
++            let body = recv.read_to_end(48).await.map_err(quic_error)?;
++            let body = body
++                .try_into()
++                .map_err(|_| Error::Proto("tuic: truncated authentication"))?;
++            Ok(Command::Auth(body))
+         }
+-        let target = *guard;
+-        drop(guard);
+-        let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+-        sock.connect(target).await?;
+-        let _ = sock.send(&pkt.payload).await;
+-        let conn2 = conn.clone();
+-        let assoc = pkt.assoc;
+-        tokio::spawn(async move {
+-            let mut rbuf = [0u8; 65535];
++        (T_CONNECT, Some(send)) => {
++            let mut addr = Vec::with_capacity(260);
+             loop {
+-                let recv = tokio::time::timeout(
+-                    std::time::Duration::from_secs(300),
+-                    sock.recv_from(&mut rbuf),
+-                )
+-                .await;
+-                let Ok(Ok((n, from))) = recv else { break };
+-                let mut addr = Vec::new();
+-                encode_addr(&DstAddr::ip(from.ip(), from.port()), &mut addr);
+-                let size = addr.len() + n;
+-                let mut msg = vec![VER, T_PACKET];
+-                msg.extend_from_slice(&assoc.to_be_bytes());
+-                msg.extend_from_slice(&1u16.to_be_bytes());
+-                msg.push(1);
+-                msg.push(0);
+-                msg.extend_from_slice(&(size as u16).to_be_bytes());
+-                msg.extend_from_slice(&addr);
+-                msg.extend_from_slice(&rbuf[..n]);
+-                if conn2.send_datagram(Bytes::from(msg)).is_err() {
+-                    break;
++                let mut byte = [0];
++                recv.read_exact(&mut byte).await.map_err(quic_error)?;
++                addr.push(byte[0]);
++                if let Ok((dst, _)) = decode_addr(&addr) {
++                    if dst.port == 0 {
++                        return Err(Error::Proto("tuic: zero port"));
++                    }
++                    return Ok(Command::Connect(dst, send, recv));
++                }
++                if addr.len() >= 259 {
++                    return Err(Error::Proto("tuic: invalid address"));
+                 }
+             }
+-        });
+-        Ok(())
++        }
++        (T_PACKET, None) => {
++            let opt = recv.read_to_end(65535 + 268).await.map_err(quic_error)?;
++            Ok(Command::Packet(
++                parse_packet_opt(&opt).ok_or(Error::Proto("tuic: invalid packet"))?,
++                false,
++            ))
++        }
++        (T_DISSOCIATE, None) => {
++            let mut body = [0; 2];
++            recv.read_exact(&mut body).await.map_err(quic_error)?;
++            Ok(Command::Dissociate(u16::from_be_bytes(body)))
++        }
++        _ => Err(Error::Proto("tuic: invalid command")),
+     }
++}
+ 
+-    /// 已认证的连接：认证（首个 uni 流）成功前不处理其它命令
+-    async fn serve_conn(&self, conn: quinn::Connection, ctx: &InboundCtx) -> Result<()> {
+-        // 并发接受 uni/bi 流与 datagram；认证在首个 uni 流上
+-        let authed = Arc::new(tokio::sync::Notify::new());
+-        let mut udp_sessions: std::collections::HashMap<
+-            u16,
+-            std::sync::Arc<tokio::sync::Mutex<std::net::SocketAddr>>,
+-        > = std::collections::HashMap::new();
+-
+-        // 期望 token 集合
+-        let expect: Vec<([u8; 16], [u8; 32])> = self
+-            .users
+-            .iter()
+-            .filter_map(|(uuid, pw)| {
+-                let u16b = parse_uuid16(uuid).ok()?;
+-                let t = token(&conn, &u16b, pw).ok()?;
+-                Some((u16b, t))
+-            })
+-            .collect();
++struct UdpSession {
++    sock: Arc<tokio::net::UdpSocket>,
++    abort: AbortHandle,
++    used: tokio::time::Instant,
++}
++impl Drop for UdpSession {
++    fn drop(&mut self) {
++        self.abort.abort();
++    }
++}
+ 
++impl TuicInbound {
++    async fn serve_conn(&self, conn: quinn::Connection, ctx: &InboundCtx) -> Result<()> {
++        // The only transition to authenticated is validated TLS-exporter credentials for THIS
++        // connection. Commands arriving first stay in a bounded queue with no destination I/O.
++        let deadline = tokio::time::sleep(AUTH_TIMEOUT);
++        tokio::pin!(deadline);
++        let mut authenticated = false;
++        let mut parsers = JoinSet::new();
++        let mut relays = JoinSet::new();
++        let mut pending = std::collections::VecDeque::new();
++        let mut sessions: HashMap<(u16, bool), UdpSession> = HashMap::new();
++        let mut modes = HashMap::new();
++        let mut fragments = Fragments::default();
++        let mut sweep = tokio::time::interval(Duration::from_secs(5));
+         loop {
+-            tokio::select! {
+-                uni = conn.accept_uni() => {
+-                    let Ok(mut uni) = uni else { break };
+-                    let mut head = [0u8; 2];
+-                    if uni.read_exact(&mut head).await.is_err() {
+-                        continue;
+-                    }
+-                    if head[0] != VER {
+-                        continue;
+-                    }
+-                    match head[1] {
+-                        T_AUTH => {
+-                            let mut body = [0u8; 48];
+-                            if uni.read_exact(&mut body).await.is_err() {
+-                                continue;
+-                            }
+-                            let mut uuid = [0u8; 16];
+-                            uuid.copy_from_slice(&body[..16]);
+-                            let mut tok = [0u8; 32];
+-                            tok.copy_from_slice(&body[16..]);
+-                            let ok = expect.iter().any(|(u, t)| *u == uuid && *t == tok);
+-                            tracing::debug!("tuic auth uuid={:02x?} ok={ok}", uuid);
+-                            if !ok {
+-                                conn.close(quinn::VarInt::from_u32(0x1f), b"auth failed");
+-                                break;
+-                            }
+-                            authed.notify_waiters();
+-                        }
+-                        T_PACKET => {
+-                            let mut opt = Vec::with_capacity(1500);
+-                            let mut lim = 0usize;
+-                            loop {
+-                                let mut b = [0u8; 1];
+-                                match uni.read(&mut b).await {
+-                                    Ok(None) | Err(_) => break,
+-                                    Ok(Some(_)) => {
+-                                        opt.push(b[0]);
+-                                        lim += 1;
+-                                        if lim > 65535 {
+-                                            break;
+-                                        }
+-                                    }
+-                                }
+-                            }
+-                            let Some(pkt) = parse_packet_opt(&opt) else { continue };
+-                            let _ = Self::udp_session_relay(&conn, &mut udp_sessions, pkt).await;
+-                        }
+-                        T_DISSOCIATE => {
+-                            let mut a = [0u8; 2];
+-                            if uni.read_exact(&mut a).await.is_ok() {
+-                                udp_sessions.remove(&u16::from_be_bytes(a));
+-                            }
++            let cmd = tokio::select! {
++                biased;
++                _ = &mut deadline, if !authenticated => {
++                    conn.close(0x1fu32.into(), b"authentication timeout");
++                    return Err(Error::Proto("tuic: authentication timeout"));
++                }
++                _ = conn.closed() => break,
++                _ = sweep.tick() => {
++                    sessions.retain(|_, s| s.used.elapsed() < UDP_IDLE);
++                    modes.retain(|id, _| sessions.keys().any(|(assoc, _)| id == assoc));
++                    fragments.0.retain(|_, f| f.created.elapsed() < Duration::from_secs(10));
++                    continue;
++                }
++                _ = relays.join_next(), if !relays.is_empty() => { continue; }
++                done = parsers.join_next(), if !parsers.is_empty() => {
++                    match done {
++                        Some(Ok(Ok(cmd))) => cmd,
++                        _ => {
++                            conn.close(0x1fu32.into(), b"invalid command");
++                            return Err(Error::Proto("tuic: invalid or timed out command"));
+                         }
+-                        _ => {}
+                     }
+                 }
+-                bi = conn.accept_bi() => {
+-                    let Ok((send, mut recv)) = bi else { break };
+-                    let mut head = [0u8; 2];
+-                    if recv.read_exact(&mut head).await.is_err() {
+-                        continue;
+-                    }
+-                    if head[0] != VER || head[1] != T_CONNECT {
+-                        continue;
+-                    }
+-                    // 读地址（增量）
+-                    let mut addr_buf: Vec<u8> = Vec::with_capacity(300);
+-                    let dst = loop {
+-                        match decode_addr(&addr_buf) {
+-                            Ok((d, _)) => break d,
+-                            Err(_) => {
+-                                let mut b = [0u8; 1];
+-                                if recv.read_exact(&mut b).await.is_err() {
+-                                    break DstAddr::ip([127,0,0,1].into(), 0);
+-                                }
+-                                addr_buf.push(b[0]);
+-                                if addr_buf.len() > 262 {
+-                                    break DstAddr::ip([127,0,0,1].into(), 0);
+-                                }
+-                            }
++                uni = conn.accept_uni(), if parsers.len() < MAX_STREAMS => {
++                    let Ok(uni) = uni else { break };
++                    spawn_owned(&mut parsers, async move {
++                        tokio::time::timeout(HEADER_TIMEOUT, read_command(uni, None)).await
++                            .map_err(|_| Error::Proto("tuic: header timeout"))?
++                    });
++                    continue;
++                }
++                bi = conn.accept_bi(), if parsers.len() < MAX_STREAMS && relays.len() < MAX_STREAMS => {
++                    let Ok((send, recv)) = bi else { break };
++                    spawn_owned(&mut parsers, async move {
++                        tokio::time::timeout(HEADER_TIMEOUT, read_command(recv, Some(send))).await
++                            .map_err(|_| Error::Proto("tuic: header timeout"))?
++                    });
++                    continue;
++                }
++                dg = conn.read_datagram() => {
++                    let Ok(dg) = dg else { break };
++                    if dg.len() < 2 || dg[..2] != [VER, T_PACKET] { continue; }
++                    let Some(pkt) = parse_packet_opt(&dg[2..]) else { continue };
++                    Command::Packet(pkt, true)
++                }
++            };
++            if let Command::Auth(body) = cmd {
++                let valid = !authenticated
++                    && self.users.iter().any(|(uuid, password)| {
++                        let Ok(uuid) = parse_uuid16(uuid) else {
++                            return false;
++                        };
++                        if uuid != body[..16] {
++                            return false;
+                         }
+-                    };
+-                    if dst.port == 0 {
+-                        continue;
+-                    }
+-                    let src = conn.remote_address();
+-                    let sess = Session::new_tcp(self.tag.clone(), Some(src), dst.clone());
+-                    let ctx2 = ctx.clone();
+-                    tokio::spawn(async move {
+-                        let direct = crate::direct::DirectOutbound::new(
+-                            Arc::new(vp_dns::Resolver::system()),
+-                            false,
++                        let Ok(expected) = token(&conn, &uuid, password) else {
++                            return false;
++                        };
++                        credentials_equal(&expected, &body[16..])
++                    });
++                if !valid {
++                    conn.close(0x1fu32.into(), b"authentication failed");
++                    return Err(Error::Proto("tuic: authentication failed or repeated"));
++                }
++                authenticated = true;
++            } else {
++                if pending.len() >= MAX_PENDING {
++                    conn.close(0x1fu32.into(), b"command limit");
++                    return Err(Error::Proto("tuic: pending command limit"));
++                }
++                pending.push_back(cmd);
++            }
++            if !authenticated {
++                continue;
++            }
++            while let Some(cmd) = pending.pop_front() {
++                match cmd {
++                    Command::Connect(dst, send, recv) => {
++                        if relays.len() >= MAX_STREAMS {
++                            continue;
++                        }
++                        let sess = Session::new_tcp(
++                            self.tag.clone(),
++                            Some(conn.remote_address()),
++                            dst.clone(),
+                         );
+-                        match direct.connect_stream(&sess, &dst).await {
+-                            Ok(remote) => {
++                        let ctx = ctx.clone();
++                        spawn_owned(&mut relays, async move {
++                            let direct = crate::direct::DirectOutbound::new(
++                                Arc::new(vp_dns::Resolver::system()),
++                                false,
++                            );
++                            if let Ok(Ok(remote)) = tokio::time::timeout(
++                                HEADER_TIMEOUT,
++                                direct.connect_stream(&sess, &dst),
++                            )
++                            .await
++                            {
+                                 let client: Box<dyn ProxyStream> =
+                                     Box::new(crate::hysteria2::QuicBiStream { send, recv });
+-                                let meta = vp_core::ConnMeta {
+-                                    id: sess.id,
+-                                    inbound: sess.inbound.clone(),
+-                                    network: "tcp",
+-                                    host: dst.host.to_string(),
+-                                    dst_port: dst.port,
+-                                    src: Some(src.to_string()),
+-                                    process: None,
+-                                    rule: None,
+-                                    chain: Some("tuic-server".into()),
+-                                    start: vp_common::now_millis(),
+-                                };
+-                                let hook = RelayHook {
+-                                    table: Some(ctx2.conns.clone()),
+-                                    meta: Some(meta),
+-                                    stats: Some(ctx2.stats.clone()),
+-                                };
+-                                let _ = relay(client, remote, hook).await;
++                                let _ = relay(
++                                    client,
++                                    remote,
++                                    RelayHook {
++                                        table: Some(ctx.conns.clone()),
++                                        meta: Some(connection_meta(&sess, &dst, "tuic-server")),
++                                        stats: Some(ctx.stats.clone()),
++                                    },
++                                )
++                                .await;
+                             }
+-                            Err(e) => {
+-                                tracing::debug!("tuic 出站失败: {e}");
++                        });
++                    }
++                    Command::Packet(fragment, native) => {
++                        let Some(pkt) = fragments.push(fragment) else {
++                            continue;
++                        };
++                        let Ok(target) = resolve_udp(&pkt.dst).await else {
++                            continue;
++                        };
++                        let key = (pkt.assoc, target.is_ipv6());
++                        if !sessions.contains_key(&key) {
++                            if sessions.len() >= MAX_UDP_SESSIONS {
++                                continue;
+                             }
++                            let bind = if target.is_ipv6() {
++                                "[::]:0"
++                            } else {
++                                "0.0.0.0:0"
++                            };
++                            let sock = Arc::new(tokio::net::UdpSocket::bind(bind).await?);
++                            let rx = sock.clone();
++                            let conn = conn.clone();
++                            let assoc = pkt.assoc;
++                            let native = *modes.entry(assoc).or_insert(native);
++                            let abort = spawn_owned(&mut relays, async move {
++                                let mut buf = vec![0; 65535];
++                                let mut id = 0u16;
++                                while let Ok((n, from)) = rx.recv_from(&mut buf).await {
++                                    id = id.wrapping_add(1);
++                                    if send_packet(
++                                        &conn,
++                                        native,
++                                        assoc,
++                                        id,
++                                        &DstAddr::ip(from.ip(), from.port()),
++                                        &buf[..n],
++                                    )
++                                    .await
++                                    .is_err()
++                                    {
++                                        break;
++                                    }
++                                }
++                            });
++                            sessions.insert(
++                                key,
++                                UdpSession {
++                                    sock,
++                                    abort,
++                                    used: tokio::time::Instant::now(),
++                                },
++                            );
+                         }
+-                    });
+-                }
+-                dg = conn.read_datagram() => {
+-                    let Ok(dg) = dg else { break };
+-                    if dg.len() >= 2 && dg[0] == VER && dg[1] == T_PACKET {
+-                        let Some(pkt) = parse_packet_opt(&dg[2..]) else { continue };
+-                        let _ = Self::udp_session_relay(&conn, &mut udp_sessions, pkt).await;
++                        let sess = sessions.get_mut(&key).unwrap();
++                        sess.used = tokio::time::Instant::now();
++                        let _ = sess.sock.send_to(&pkt.payload, target).await;
++                    }
++                    Command::Dissociate(id) => {
++                        sessions.retain(|(assoc, _), _| *assoc != id);
++                        modes.remove(&id);
++                        fragments.0.retain(|(assoc, _), _| *assoc != id);
+                     }
+-                    // Heartbeat 忽略
++                    Command::Auth(_) => unreachable!(),
+                 }
+             }
+         }
+@@ -727,6 +992,52 @@ impl TuicInbound {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn packet_size_and_fragment_bounds() {
++        let dst = DstAddr::ip([127, 0, 0, 1].into(), 53);
++        let mut opt = vec![0, 1, 0, 1, 1, 0, 0, 4];
++        encode_addr(&dst, &mut opt);
++        opt.extend_from_slice(b"test");
++        assert_eq!(parse_packet_opt(&opt).unwrap().payload.as_ref(), b"test");
++        opt[7] = 11; // Old, nonstandard SIZE included address bytes.
++        assert!(parse_packet_opt(&opt).is_none());
++        let mut fragments = Fragments::default();
++        assert!(
++            fragments
++                .push(PacketOpt {
++                    assoc: 1,
++                    id: 1,
++                    total: 2,
++                    index: 1,
++                    dst: None,
++                    payload: Bytes::from_static(b"world")
++                })
++                .is_none()
++        );
++        let packet = fragments
++            .push(PacketOpt {
++                assoc: 1,
++                id: 1,
++                total: 2,
++                index: 0,
++                dst: Some(dst.clone()),
++                payload: Bytes::from_static(b"hello"),
++            })
++            .unwrap();
++        assert_eq!(packet.payload.as_ref(), b"helloworld");
++        for id in 0..256 {
++            fragments.push(PacketOpt {
++                assoc: 1,
++                id,
++                total: 2,
++                index: 0,
++                dst: Some(dst.clone()),
++                payload: Bytes::from_static(b"hello"),
++            });
++        }
++        assert_eq!(fragments.0.len(), 64);
++    }
++
+     #[test]
+     fn addr_roundtrip() {
+         for d in [
+@@ -745,6 +1056,15 @@ mod tests {
+     /// TUIC v5 出入站自环（TCP Connect + UDP Packet native datagram 模式）
+     #[tokio::test]
+     async fn tuic_loopback() {
++        loopback_mode("native").await;
++    }
++
++    #[tokio::test]
++    async fn tuic_quic_mode_loopback() {
++        loopback_mode("quic").await;
++    }
++
++    async fn loopback_mode(mode: &str) {
+         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+         // TCP echo + UDP echo
+         let tcp_echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+@@ -764,7 +1084,7 @@ mod tests {
+         let udp_addr = udp_echo.local_addr().unwrap();
+         tokio::spawn(async move {
+             let udp_echo = std::sync::Arc::new(udp_echo);
+-            let mut b = [0u8; 2048];
++            let mut b = [0u8; 65535];
+             loop {
+                 let Ok((n, from)) = udp_echo.recv_from(&mut b).await else {
+                     break;
+@@ -803,7 +1123,7 @@ mod tests {
+             sni: None,
+             skip_cert_verify: true,
+             congestion_controller: None,
+-            udp_relay_mode: None,
++            udp_relay_mode: Some(mode.into()),
+         })
+         .unwrap();
+ 
+@@ -832,6 +1152,20 @@ mod tests {
+             .expect("udp 超时")
+             .unwrap();
+         assert_eq!(&resp.data[..], b"echo:tuic-udp");
++        let payload = vec![0x5a; 6000];
++        conn.send(&UdpPacket {
++            src: "127.0.0.1:0".parse().unwrap(),
++            dst: udp_addr,
++            data: payload.clone().into(),
++        })
++        .await
++        .unwrap();
++        let resp = tokio::time::timeout(Duration::from_secs(5), conn.recv())
++            .await
++            .unwrap()
++            .unwrap();
++        assert_eq!(&resp.data[..5], b"echo:");
++        assert_eq!(&resp.data[5..], &payload);
+     }
+ 
+     #[test]
+@@ -839,7 +1173,7 @@ mod tests {
+         let mut addr = Vec::new();
+         encode_addr(&DstAddr::ip("9.9.9.9".parse().unwrap(), 53), &mut addr);
+         let payload = b"hello";
+-        let size = addr.len() + payload.len();
++        let size = payload.len();
+         let mut opt = Vec::new();
+         opt.extend_from_slice(&0x0102u16.to_be_bytes()); // assoc
+         opt.extend_from_slice(&7u16.to_be_bytes()); // pkt
+@@ -850,7 +1184,7 @@ mod tests {
+         opt.extend_from_slice(payload);
+         let p = parse_packet_opt(&opt).unwrap();
+         assert_eq!(p.assoc, 0x0102);
+-        assert_eq!(p.src.to_string(), "9.9.9.9:53");
++        assert_eq!(p.dst.unwrap().to_string(), "9.9.9.9:53");
+         assert_eq!(&p.payload[..], b"hello");
+     }
+ }
+diff --git a/crates/vp-protocol/tests/quic_auth_negative.rs b/crates/vp-protocol/tests/quic_auth_negative.rs
+new file mode 100644
+index 0000000..8093e77
+--- /dev/null
++++ b/crates/vp-protocol/tests/quic_auth_negative.rs
+@@ -0,0 +1,662 @@
++//! Raw-peer authentication regression tests. Assertions observe the destination side;
++//! a client-side rejection by itself is not treated as proof of no forwarding.
++use std::{net::SocketAddr, sync::Arc, time::Duration};
++use tokio::{
++    net::{TcpListener, UdpSocket},
++    time::timeout,
++};
++use vp_core::{Inbound, InboundCtx};
++
++const UUID: [u8; 16] = [
++    0xb8, 0x31, 0x38, 0x1d, 0x63, 0x24, 0x4d, 0x53, 0xad, 0x4f, 0x8c, 0xda, 0x48, 0xb3, 0x08, 0x11,
++];
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++enum Protocol {
++    Tuic,
++    Hy2,
++}
++struct NoopRouter;
++#[async_trait::async_trait]
++impl vp_core::Router for NoopRouter {
++    async fn pick(&self, _: &vp_core::session::Session) -> vp_core::router::Resolution {
++        unreachable!()
++    }
++}
++struct Rig {
++    proto: Protocol,
++    port: u16,
++    password: String,
++    config: quinn::ClientConfig,
++    scope: Arc<vp_core::task_scope::TaskScope>,
++    conns: Arc<vp_core::ConnTable>,
++}
++impl Drop for Rig {
++    fn drop(&mut self) {
++        self.scope.cancel_all();
++    }
++}
++struct Raw {
++    _endpoint: quinn::Endpoint,
++    conn: quinn::Connection,
++    _controls: Vec<quinn::SendStream>,
++}
++impl Drop for Raw {
++    fn drop(&mut self) {
++        self.conn.close(0u32.into(), b"test done");
++    }
++}
++impl Rig {
++    async fn new(proto: Protocol) -> Self {
++        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
++        let password = format!("ephemeral-{:032x}", rand::random::<u128>());
++        let ctx = InboundCtx {
++            router: Arc::new(NoopRouter),
++            stats: Arc::default(),
++            conns: Arc::new(vp_core::ConnTable::new()),
++        };
++        let server: Arc<dyn Inbound> = match proto {
++            Protocol::Tuic => Arc::new(vp_protocol::tuic::TuicInbound::new(
++                "127.0.0.1",
++                0,
++                "negative",
++                vec![(
++                    "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
++                    password.clone(),
++                )],
++                cert.cert.pem().into_bytes(),
++                cert.key_pair.serialize_pem().into_bytes(),
++            )),
++            Protocol::Hy2 => Arc::new(vp_protocol::hysteria2::Hysteria2Inbound::new(
++                "127.0.0.1",
++                0,
++                "negative",
++                &password,
++                cert.cert.pem().into_bytes(),
++                cert.key_pair.serialize_pem().into_bytes(),
++            )),
++        };
++        let conns = ctx.conns.clone();
++        let scope = vp_core::task_scope::TaskScope::new();
++        let port = scope.run(server.start(ctx)).await.unwrap();
++        let mut roots = rustls::RootCertStore::empty();
++        roots.add(cert.cert.der().clone()).unwrap();
++        let mut tls = rustls::ClientConfig::builder()
++            .with_root_certificates(roots)
++            .with_no_client_auth();
++        tls.alpn_protocols = vec![b"h3".to_vec()];
++        let mut config = quinn::ClientConfig::new(Arc::new(
++            quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap(),
++        ));
++        let mut transport = quinn::TransportConfig::default();
++        transport.datagram_receive_buffer_size(Some(1 << 20));
++        config.transport_config(Arc::new(transport));
++        Self {
++            proto,
++            port,
++            password,
++            config,
++            scope,
++            conns,
++        }
++    }
++    async fn connect(&self) -> Raw {
++        let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
++        ep.set_default_client_config(self.config.clone());
++        let conn = ep
++            .connect(SocketAddr::from(([127, 0, 0, 1], self.port)), "localhost")
++            .unwrap()
++            .await
++            .unwrap();
++        let mut controls = Vec::new();
++        if self.proto == Protocol::Hy2 {
++            for data in [&[0u8, 4, 0][..], &[2][..], &[3][..]] {
++                let mut send = conn.open_uni().await.unwrap();
++                send.write_all(data).await.unwrap();
++                controls.push(send);
++            }
++        }
++        Raw {
++            _endpoint: ep,
++            conn,
++            _controls: controls,
++        }
++    }
++    fn auth_bytes(&self, conn: &quinn::Connection, correct: bool) -> Vec<u8> {
++        let password = if correct {
++            &self.password
++        } else {
++            "wrong-credential"
++        };
++        match self.proto {
++            Protocol::Tuic => {
++                let mut token = [0; 32];
++                conn.export_keying_material(&mut token, &UUID, password.as_bytes())
++                    .unwrap();
++                let mut auth = vec![5, 0];
++                auth.extend_from_slice(&UUID);
++                auth.extend_from_slice(&token);
++                auth
++            }
++            Protocol::Hy2 => headers(&[
++                (":method", "POST"),
++                (":scheme", "https"),
++                (":authority", "hysteria"),
++                (":path", "/auth"),
++                ("hysteria-auth", password),
++                ("hysteria-cc-rx", "0"),
++            ]),
++        }
++    }
++    async fn auth(&self, conn: &quinn::Connection, correct: bool) -> Option<Vec<u8>> {
++        let auth = self.auth_bytes(conn, correct);
++        if self.proto == Protocol::Tuic {
++            let Ok(mut send) = conn.open_uni().await else {
++                return None;
++            };
++            if send.write_all(&auth).await.is_err() {
++                return None;
++            }
++            let _ = send.finish();
++            None
++        } else {
++            let Ok((mut send, mut recv)) = conn.open_bi().await else {
++                return None;
++            };
++            if send.write_all(&auth).await.is_err() {
++                return None;
++            }
++            let _ = send.finish();
++            timeout(Duration::from_secs(1), recv.read_to_end(16384))
++                .await
++                .ok()?
++                .ok()
++        }
++    }
++    async fn tcp(
++        &self,
++        conn: &quinn::Connection,
++        dst: SocketAddr,
++    ) -> Option<(quinn::SendStream, quinn::RecvStream)> {
++        let Ok((mut send, recv)) = conn.open_bi().await else {
++            return None;
++        };
++        let mut req = if self.proto == Protocol::Tuic {
++            vec![5, 1, 1, 127, 0, 0, 1]
++        } else {
++            vec![0x44, 1]
++        };
++        if self.proto == Protocol::Tuic {
++            req.extend_from_slice(&dst.port().to_be_bytes());
++        } else {
++            let addr = dst.to_string();
++            varint(&mut req, addr.len() as u64);
++            req.extend_from_slice(addr.as_bytes());
++            req.push(0);
++        }
++        req.extend_from_slice(b"must-not-forward-before-auth");
++        if send.write_all(&req).await.is_err() {
++            return None;
++        }
++        Some((send, recv))
++    }
++    fn udp_bytes(&self, dst: SocketAddr) -> Vec<u8> {
++        if self.proto == Protocol::Tuic {
++            let mut msg = vec![5, 2, 0, 1, 0, 1, 1, 0, 0, 4, 1, 127, 0, 0, 1];
++            msg.extend_from_slice(&dst.port().to_be_bytes());
++            msg.extend_from_slice(b"test");
++            msg
++        } else {
++            let mut msg = vec![0, 0, 0, 1, 0, 1, 0, 1];
++            let addr = dst.to_string();
++            varint(&mut msg, addr.len() as u64);
++            msg.extend_from_slice(addr.as_bytes());
++            msg.extend_from_slice(b"test");
++            msg
++        }
++    }
++    fn udp(&self, conn: &quinn::Connection, dst: SocketAddr) {
++        let _ = conn.send_datagram(self.udp_bytes(dst).into());
++    }
++}
++fn varint(out: &mut Vec<u8>, n: u64) {
++    vp_protocol::hysteria2::write_varint(out, n);
++}
++fn pint(out: &mut Vec<u8>, n: usize, bits: u8, flags: u8) {
++    let max = (1usize << bits) - 1;
++    if n < max {
++        out.push(flags | n as u8);
++    } else {
++        out.push(flags | max as u8);
++        let mut n = n - max;
++        while n >= 128 {
++            out.push((n as u8 & 127) | 128);
++            n >>= 7;
++        }
++        out.push(n as u8);
++    }
++}
++fn headers(fields: &[(&str, &str)]) -> Vec<u8> {
++    let mut block = vec![0, 0];
++    for (name, value) in fields {
++        pint(&mut block, name.len(), 3, 0x20);
++        block.extend_from_slice(name.as_bytes());
++        pint(&mut block, value.len(), 7, 0);
++        block.extend_from_slice(value.as_bytes());
++    }
++    let mut frame = vec![1];
++    varint(&mut frame, block.len() as u64);
++    frame.extend_from_slice(&block);
++    frame
++}
++async fn targets() -> (TcpListener, UdpSocket) {
++    (
++        TcpListener::bind("127.0.0.1:0").await.unwrap(),
++        UdpSocket::bind("127.0.0.1:0").await.unwrap(),
++    )
++}
++async fn quiet(tcp: &TcpListener, udp: &UdpSocket) {
++    let mut buf = [0; 128];
++    assert!(
++        timeout(Duration::from_millis(100), tcp.accept())
++            .await
++            .is_err(),
++        "unauthorized target TCP connection"
++    );
++    assert!(
++        timeout(Duration::from_millis(100), udp.recv_from(&mut buf))
++            .await
++            .is_err(),
++        "unauthorized target UDP packet"
++    );
++}
++
++async fn missing_and_stalled(proto: Protocol) {
++    let rig = Rig::new(proto).await;
++    for partial in [false, true] {
++        let raw = rig.connect().await;
++        let (tcp, udp) = targets().await;
++        let _request = rig.tcp(&raw.conn, tcp.local_addr().unwrap()).await.unwrap();
++        rig.udp(&raw.conn, udp.local_addr().unwrap());
++        let _stalled = if partial {
++            if proto == Protocol::Tuic {
++                let mut s = raw.conn.open_uni().await.unwrap();
++                s.write_all(&[5, 0, 0]).await.unwrap();
++                Some(s)
++            } else {
++                let (mut s, _r) = raw.conn.open_bi().await.unwrap();
++                s.write_all(&[1, 0x7f]).await.unwrap();
++                Some(s)
++            }
++        } else {
++            None
++        };
++        quiet(&tcp, &udp).await;
++        timeout(Duration::from_secs(4), raw.conn.closed())
++            .await
++            .expect("unauthenticated connection must expire");
++        quiet(&tcp, &udp).await;
++    }
++}
++#[tokio::test]
++async fn tuic_missing_and_stalled_auth_never_forward() {
++    missing_and_stalled(Protocol::Tuic).await
++}
++#[tokio::test]
++async fn hy2_missing_and_stalled_auth_never_forward() {
++    missing_and_stalled(Protocol::Hy2).await
++}
++
++async fn incorrect_then_correct(proto: Protocol) {
++    let rig = Rig::new(proto).await;
++    let raw = rig.connect().await;
++    let (tcp, udp) = targets().await;
++    let _request = rig.tcp(&raw.conn, tcp.local_addr().unwrap()).await;
++    rig.udp(&raw.conn, udp.local_addr().unwrap());
++    let denied = rig.auth(&raw.conn, false).await;
++    if proto == Protocol::Hy2 {
++        assert!(denied.unwrap().windows(3).any(|w| w == b"404"));
++    }
++    quiet(&tcp, &udp).await;
++    let retry = rig.auth(&raw.conn, true).await;
++    if proto == Protocol::Hy2 {
++        assert!(retry.unwrap().windows(3).any(|w| w == b"404"));
++    }
++    let _retry_request = rig.tcp(&raw.conn, tcp.local_addr().unwrap()).await;
++    rig.udp(&raw.conn, udp.local_addr().unwrap());
++    quiet(&tcp, &udp).await;
++}
++#[tokio::test]
++async fn tuic_bad_auth_is_terminal() {
++    incorrect_then_correct(Protocol::Tuic).await
++}
++#[tokio::test]
++async fn hy2_bad_auth_is_terminal() {
++    incorrect_then_correct(Protocol::Hy2).await
++}
++
++async fn delayed_valid(proto: Protocol) {
++    let rig = Rig::new(proto).await;
++    let raw = rig.connect().await;
++    let (tcp, udp) = targets().await;
++    // Hold an unrelated header open: it cannot block the authentication stream.
++    let (mut stalled, _r) = raw.conn.open_bi().await.unwrap();
++    stalled.write_all(&[0x44]).await.unwrap();
++    let _request = rig.tcp(&raw.conn, tcp.local_addr().unwrap()).await.unwrap();
++    rig.udp(&raw.conn, udp.local_addr().unwrap());
++    quiet(&tcp, &udp).await;
++    let auth = rig.auth(&raw.conn, true).await;
++    if proto == Protocol::Hy2 {
++        assert!(auth.unwrap().windows(3).any(|w| w == b"233"));
++    }
++    let (_target, _) = timeout(Duration::from_secs(1), tcp.accept())
++        .await
++        .unwrap()
++        .unwrap();
++    if proto == Protocol::Hy2 {
++        rig.udp(&raw.conn, udp.local_addr().unwrap());
++    }
++    let mut buf = [0; 128];
++    let (n, _) = timeout(Duration::from_secs(1), udp.recv_from(&mut buf))
++        .await
++        .unwrap()
++        .unwrap();
++    assert_eq!(&buf[..n], b"test");
++    // A new unauthenticated connection cannot inherit the previous one's auth bit.
++    let other = rig.connect().await;
++    let (tcp2, udp2) = targets().await;
++    let _request = rig
++        .tcp(&other.conn, tcp2.local_addr().unwrap())
++        .await
++        .unwrap();
++    rig.udp(&other.conn, udp2.local_addr().unwrap());
++    quiet(&tcp2, &udp2).await;
++}
++#[tokio::test]
++async fn tuic_delayed_auth_gates_out_of_order_requests() {
++    delayed_valid(Protocol::Tuic).await
++}
++#[tokio::test]
++async fn hy2_delayed_auth_gates_out_of_order_requests() {
++    delayed_valid(Protocol::Hy2).await
++}
++
++#[tokio::test]
++async fn tuic_exporter_replay_from_another_connection_is_rejected() {
++    let rig = Rig::new(Protocol::Tuic).await;
++    let first = rig.connect().await;
++    let second = rig.connect().await;
++    let replay = rig.auth_bytes(&first.conn, true);
++    let mut s = second.conn.open_uni().await.unwrap();
++    s.write_all(&replay).await.unwrap();
++    s.finish().unwrap();
++    let (tcp, udp) = targets().await;
++    let _request = rig.tcp(&second.conn, tcp.local_addr().unwrap()).await;
++    rig.udp(&second.conn, udp.local_addr().unwrap());
++    quiet(&tcp, &udp).await;
++    timeout(Duration::from_secs(1), second.conn.closed())
++        .await
++        .unwrap();
++}
++
++async fn duplicate_auth(proto: Protocol) {
++    let rig = Rig::new(proto).await;
++    let raw = rig.connect().await;
++    rig.auth(&raw.conn, true).await;
++    // Synchronize successful initial auth with a target connection, then revoke via duplicate.
++    let (tcp0, _) = targets().await;
++    let _req = rig.tcp(&raw.conn, tcp0.local_addr().unwrap()).await;
++    let (_s, _) = timeout(Duration::from_secs(1), tcp0.accept())
++        .await
++        .unwrap()
++        .unwrap();
++    rig.auth(&raw.conn, true).await;
++    timeout(Duration::from_secs(1), raw.conn.closed())
++        .await
++        .unwrap();
++    let (tcp, udp) = targets().await;
++    let _req = rig.tcp(&raw.conn, tcp.local_addr().unwrap()).await;
++    rig.udp(&raw.conn, udp.local_addr().unwrap());
++    quiet(&tcp, &udp).await;
++}
++#[tokio::test]
++async fn tuic_duplicate_auth_revokes_connection() {
++    duplicate_auth(Protocol::Tuic).await
++}
++#[tokio::test]
++async fn hy2_duplicate_auth_revokes_connection() {
++    duplicate_auth(Protocol::Hy2).await
++}
++
++#[tokio::test]
++async fn hy2_invalid_method_duplicate_credential_and_oversized_padding_never_forward() {
++    let rig = Rig::new(Protocol::Hy2).await;
++    for method in ["GET", "POST"] {
++        let raw = rig.connect().await;
++        let (tcp, udp) = targets().await;
++        let _req = rig.tcp(&raw.conn, tcp.local_addr().unwrap()).await;
++        rig.udp(&raw.conn, udp.local_addr().unwrap());
++        let mut fields = vec![
++            (":method", method),
++            (":path", "/auth"),
++            (":scheme", "https"),
++            (":authority", "hysteria"),
++            ("hysteria-auth", rig.password.as_str()),
++        ];
++        if method == "POST" {
++            fields.push(("hysteria-auth", rig.password.as_str()));
++        }
++        let (mut s, mut r) = raw.conn.open_bi().await.unwrap();
++        s.write_all(&headers(&fields)).await.unwrap();
++        s.finish().unwrap();
++        let reply = r.read_to_end(16384).await.unwrap();
++        assert!(reply.windows(3).any(|w| w == b"404"));
++        quiet(&tcp, &udp).await;
++    }
++    let raw = rig.connect().await;
++    rig.auth(&raw.conn, true).await;
++    let (tcp, udp) = targets().await;
++    let (mut send, _recv) = raw.conn.open_bi().await.unwrap();
++    let addr = tcp.local_addr().unwrap().to_string();
++    let mut req = vec![0x44, 1];
++    varint(&mut req, addr.len() as u64);
++    req.extend_from_slice(addr.as_bytes());
++    varint(&mut req, u32::MAX as u64);
++    send.write_all(&req).await.unwrap();
++    quiet(&tcp, &udp).await;
++}
++
++async fn pending_limit(proto: Protocol) {
++    let rig = Rig::new(proto).await;
++    let raw = rig.connect().await;
++    let (tcp, udp) = targets().await;
++    let mut requests = Vec::new();
++    for _ in 0..33 {
++        if let Some(request) = rig.tcp(&raw.conn, tcp.local_addr().unwrap()).await {
++            requests.push(request);
++        }
++    }
++    timeout(Duration::from_secs(1), raw.conn.closed())
++        .await
++        .expect("bounded pre-auth request queue must reject excess requests before auth deadline");
++    quiet(&tcp, &udp).await;
++}
++#[tokio::test]
++async fn tuic_pre_auth_queue_is_bounded() {
++    pending_limit(Protocol::Tuic).await;
++}
++#[tokio::test]
++async fn hy2_pre_auth_queue_is_bounded() {
++    pending_limit(Protocol::Hy2).await;
++}
++
++#[tokio::test]
++async fn empty_credentials_and_invalid_bind_are_rejected() {
++    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
++    let ctx = || InboundCtx {
++        router: Arc::new(NoopRouter),
++        stats: Arc::default(),
++        conns: Arc::new(vp_core::ConnTable::new()),
++    };
++    for (bind, users) in [
++        ("127.0.0.1", vec![]),
++        ("127.0.0.1", vec![("bad-uuid".into(), "ephemeral".into())]),
++        (
++            "127.0.0.1",
++            vec![("b831381d-6324-4d53-ad4f-8cda48b30811".into(), "".into())],
++        ),
++        (
++            "not-an-ip",
++            vec![(
++                "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
++                "ephemeral".into(),
++            )],
++        ),
++    ] {
++        let inbound = vp_protocol::tuic::TuicInbound::new(
++            bind,
++            0,
++            "invalid",
++            users,
++            cert.cert.pem().into_bytes(),
++            cert.key_pair.serialize_pem().into_bytes(),
++        );
++        assert!(Arc::new(inbound).start(ctx()).await.is_err());
++    }
++    for (bind, password) in [("127.0.0.1", ""), ("not-an-ip", "ephemeral")] {
++        let inbound = vp_protocol::hysteria2::Hysteria2Inbound::new(
++            bind,
++            0,
++            "invalid",
++            password,
++            cert.cert.pem().into_bytes(),
++            cert.key_pair.serialize_pem().into_bytes(),
++        );
++        assert!(Arc::new(inbound).start(ctx()).await.is_err());
++    }
++}
++
++#[tokio::test]
++async fn tuic_authentication_requires_complete_single_frame() {
++    let rig = Rig::new(Protocol::Tuic).await;
++    for trailing in [true, false] {
++        let raw = rig.connect().await;
++        let (tcp, udp) = targets().await;
++        let _request = rig.tcp(&raw.conn, tcp.local_addr().unwrap()).await;
++        rig.udp(&raw.conn, udp.local_addr().unwrap());
++        let mut frame = rig.auth_bytes(&raw.conn, true);
++        if trailing {
++            frame.push(0);
++        } else {
++            frame.truncate(30);
++        }
++        let mut send = raw.conn.open_uni().await.unwrap();
++        send.write_all(&frame).await.unwrap();
++        send.finish().unwrap();
++        timeout(Duration::from_secs(1), raw.conn.closed())
++            .await
++            .unwrap();
++        quiet(&tcp, &udp).await;
++    }
++}
++
++async fn managed_shutdown(proto: Protocol) {
++    use tokio::io::AsyncReadExt;
++    let rig = Rig::new(proto).await;
++    let raw = rig.connect().await;
++    rig.auth(&raw.conn, true).await;
++    let (tcp, udp) = targets().await;
++    let _request = rig.tcp(&raw.conn, tcp.local_addr().unwrap()).await.unwrap();
++    let (mut target, _) = timeout(Duration::from_secs(1), tcp.accept())
++        .await
++        .unwrap()
++        .unwrap();
++    rig.udp(&raw.conn, udp.local_addr().unwrap());
++    let mut buf = [0; 128];
++    let (_, udp_source) = timeout(Duration::from_secs(1), udp.recv_from(&mut buf))
++        .await
++        .unwrap()
++        .unwrap();
++    timeout(Duration::from_secs(1), async {
++        while rig.conns.is_empty() {
++            tokio::task::yield_now().await;
++        }
++    })
++    .await
++    .unwrap();
++    let report = rig
++        .scope
++        .shutdown(Duration::ZERO, Duration::from_secs(2))
++        .await;
++    assert_eq!(
++        report.remaining_tasks, 0,
++        "QUIC work must be owned by managed scope"
++    );
++    assert_eq!(report.panics, 0);
++    assert!(rig.conns.is_empty(), "canceled relay must unregister");
++    timeout(Duration::from_secs(1), raw.conn.closed())
++        .await
++        .unwrap();
++    let mut payload = Vec::new();
++    timeout(Duration::from_secs(1), target.read_to_end(&mut payload))
++        .await
++        .unwrap()
++        .unwrap();
++    let _released = UdpSocket::bind(udp_source)
++        .await
++        .expect("UDP association socket must be released on shutdown");
++    timeout(Duration::from_secs(1), async {
++        loop {
++            if let Ok(socket) = UdpSocket::bind(("127.0.0.1", rig.port)).await {
++                drop(socket);
++                break;
++            }
++            tokio::task::yield_now().await;
++        }
++    })
++    .await
++    .expect("QUIC listener port must be released");
++}
++#[tokio::test]
++async fn tuic_managed_shutdown_releases_connections_and_udp() {
++    managed_shutdown(Protocol::Tuic).await;
++}
++#[tokio::test]
++async fn hy2_managed_shutdown_releases_connections_and_udp() {
++    managed_shutdown(Protocol::Hy2).await;
++}
++
++async fn graceful_drain(proto: Protocol) {
++    let rig = Rig::new(proto).await;
++    let raw = rig.connect().await;
++    rig.auth(&raw.conn, true).await;
++    let (tcp, _) = targets().await;
++    let _request = rig.tcp(&raw.conn, tcp.local_addr().unwrap()).await;
++    let (_target, _) = timeout(Duration::from_secs(1), tcp.accept())
++        .await
++        .unwrap()
++        .unwrap();
++    let shutdown = rig
++        .scope
++        .shutdown(Duration::from_secs(1), Duration::from_secs(1));
++    let complete = async {
++        tokio::time::sleep(Duration::from_millis(50)).await;
++        assert!(
++            raw.conn.close_reason().is_none(),
++            "stopping ingress must not prematurely kill established QUIC work"
++        );
++        raw.conn.close(0u32.into(), b"graceful test completion");
++    };
++    let (report, _) = tokio::join!(shutdown, complete);
++    assert!(report.drained);
++    assert_eq!(report.forced_tasks, 0);
++    assert_eq!(report.remaining_tasks, 0);
++    assert!(rig.conns.is_empty());
++}
++#[tokio::test]
++async fn tuic_managed_listener_drains_existing_connections() {
++    graceful_drain(Protocol::Tuic).await;
++}
++#[tokio::test]
++async fn hy2_managed_listener_drains_existing_connections() {
++    graceful_drain(Protocol::Hy2).await;
++}
+diff --git a/crates/vp-protocol/tests/quic_server_interop.rs b/crates/vp-protocol/tests/quic_server_interop.rs
+new file mode 100644
+index 0000000..1bc08cd
+--- /dev/null
++++ b/crates/vp-protocol/tests/quic_server_interop.rs
+@@ -0,0 +1,242 @@
++//! Independent peer tests. Run with an integrity-verified official sing-box release:
++//! VP_SING_BOX=/path/to/sing-box cargo test -p vp-protocol --test quic_server_interop -- --ignored
++//! No downloaded binaries or credentials are committed. Every listener is loopback-only.
++use std::{
++    net::SocketAddr,
++    path::PathBuf,
++    process::{Child, Command, Stdio},
++    sync::Arc,
++    time::Duration,
++};
++use tokio::{
++    io::{AsyncReadExt, AsyncWriteExt},
++    net::{TcpListener, TcpStream, UdpSocket},
++    task::JoinSet,
++};
++use vp_core::{Inbound, InboundCtx};
++
++struct NoopRouter;
++#[async_trait::async_trait]
++impl vp_core::Router for NoopRouter {
++    async fn pick(&self, _: &vp_core::session::Session) -> vp_core::router::Resolution {
++        unreachable!("server currently uses direct outbound")
++    }
++}
++
++struct Peer {
++    child: Child,
++    dir: PathBuf,
++}
++impl Drop for Peer {
++    fn drop(&mut self) {
++        let _ = self.child.kill();
++        let _ = self.child.wait();
++        let _ = std::fs::remove_dir_all(&self.dir);
++    }
++}
++
++async fn read_socks_address(stream: &mut TcpStream) -> SocketAddr {
++    let mut head = [0; 4];
++    stream.read_exact(&mut head).await.unwrap();
++    assert_eq!(head[..3], [5, 0, 0], "SOCKS reply");
++    match head[3] {
++        1 => {
++            let mut a = [0; 6];
++            stream.read_exact(&mut a).await.unwrap();
++            SocketAddr::from(([a[0], a[1], a[2], a[3]], u16::from_be_bytes([a[4], a[5]])))
++        }
++        4 => {
++            let mut a = [0; 18];
++            stream.read_exact(&mut a).await.unwrap();
++            SocketAddr::new(
++                std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&a[..16]).unwrap()).into(),
++                u16::from_be_bytes([a[16], a[17]]),
++            )
++        }
++        other => panic!("unexpected SOCKS address {other}"),
++    }
++}
++
++async fn socks(socks_port: u16, command: u8, dst: SocketAddr) -> (TcpStream, SocketAddr) {
++    let mut stream = TcpStream::connect(("127.0.0.1", socks_port)).await.unwrap();
++    stream.write_all(&[5, 1, 0]).await.unwrap();
++    let mut reply = [0; 2];
++    stream.read_exact(&mut reply).await.unwrap();
++    assert_eq!(reply, [5, 0]);
++    let mut req = vec![5, command, 0, 1, 127, 0, 0, 1];
++    req.extend_from_slice(&dst.port().to_be_bytes());
++    stream.write_all(&req).await.unwrap();
++    let bound = read_socks_address(&mut stream).await;
++    (stream, bound)
++}
++
++async fn interop(protocol: &str, mode: Option<&str>) {
++    let bin =
++        std::env::var_os("VP_SING_BOX").expect("VP_SING_BOX must identify verified official peer");
++    let version = Command::new(&bin).arg("version").output().unwrap();
++    assert!(version.status.success());
++    assert!(
++        String::from_utf8_lossy(&version.stdout).contains("sing-box version 1.14.4"),
++        "test peer must be pinned 1.14.4"
++    );
++    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
++    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
++    let password = format!("test-only-{:032x}", rand::random::<u128>());
++    let ctx = InboundCtx {
++        router: Arc::new(NoopRouter),
++        stats: Arc::default(),
++        conns: Arc::new(vp_core::ConnTable::new()),
++    };
++    let server: Arc<dyn Inbound> = match protocol {
++        "tuic" => Arc::new(vp_protocol::tuic::TuicInbound::new(
++            "127.0.0.1",
++            0,
++            "interop",
++            vec![(uuid.into(), password.clone())],
++            cert.cert.pem().into_bytes(),
++            cert.key_pair.serialize_pem().into_bytes(),
++        )),
++        "hysteria2" => Arc::new(vp_protocol::hysteria2::Hysteria2Inbound::new(
++            "127.0.0.1",
++            0,
++            "interop",
++            &password,
++            cert.cert.pem().into_bytes(),
++            cert.key_pair.serialize_pem().into_bytes(),
++        )),
++        _ => unreachable!(),
++    };
++    let port = server.start(ctx).await.unwrap();
++    let socks_reserve = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let socks_port = socks_reserve.local_addr().unwrap().port();
++    drop(socks_reserve);
++    let dir = std::env::temp_dir().join(format!(
++        "vp-quic-interop-{}-{:016x}",
++        std::process::id(),
++        rand::random::<u64>()
++    ));
++    std::fs::create_dir(&dir).unwrap();
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::PermissionsExt;
++        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
++    }
++    std::fs::write(dir.join("cert.pem"), cert.cert.pem()).unwrap();
++    let mut outbound = serde_json::json!({"type":protocol,"tag":"proxy","server":"127.0.0.1","server_port":port,"password":password,
++        "tls":{"enabled":true,"server_name":"localhost","certificate_path":dir.join("cert.pem"),"alpn":["h3"]}});
++    if protocol == "tuic" {
++        outbound["uuid"] = uuid.into();
++        outbound["congestion_control"] = "cubic".into();
++        outbound["udp_relay_mode"] = mode.unwrap().into();
++    }
++    let config = serde_json::json!({"log":{"level":"error"},"inbounds":[{"type":"socks","listen":"127.0.0.1","listen_port":socks_port}],"outbounds":[outbound]});
++    std::fs::write(
++        dir.join("config.json"),
++        serde_json::to_vec(&config).unwrap(),
++    )
++    .unwrap();
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::PermissionsExt;
++        std::fs::set_permissions(
++            dir.join("config.json"),
++            std::fs::Permissions::from_mode(0o600),
++        )
++        .unwrap();
++    }
++    let child = Command::new(&bin)
++        .args(["run", "-c"])
++        .arg(dir.join("config.json"))
++        .stdin(Stdio::null())
++        .stdout(Stdio::null())
++        .stderr(Stdio::inherit())
++        .spawn()
++        .unwrap();
++    let mut peer = Peer { child, dir };
++    tokio::time::timeout(Duration::from_secs(5), async {
++        loop {
++            assert!(
++                peer.child.try_wait().unwrap().is_none(),
++                "reference peer exited during startup"
++            );
++            if TcpStream::connect(("127.0.0.1", socks_port)).await.is_ok() {
++                break;
++            }
++            tokio::time::sleep(Duration::from_millis(20)).await;
++        }
++    })
++    .await
++    .unwrap();
++    let mut tasks = JoinSet::new();
++    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let tcp_addr = tcp.local_addr().unwrap();
++    tasks.spawn(async move {
++        let (mut s, _) = tcp.accept().await.unwrap();
++        let (mut rd, mut wr) = s.split();
++        tokio::io::copy(&mut rd, &mut wr).await.unwrap();
++    });
++    let (mut stream, _) = socks(socks_port, 1, tcp_addr).await;
++    let payload = b"independent-peer-TCP-payload";
++    stream.write_all(payload).await.unwrap();
++    let mut reply = vec![0; payload.len()];
++    stream.read_exact(&mut reply).await.unwrap();
++    assert_eq!(reply, payload);
++    stream.shutdown().await.unwrap();
++    let mut eof = [0];
++    assert_eq!(
++        stream.read(&mut eof).await.unwrap(),
++        0,
++        "half-close preserves return stream"
++    );
++
++    let client_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
++    let (_association, relay) = socks(socks_port, 3, client_udp.local_addr().unwrap()).await;
++    // One association, two destinations, repeated packets, and fragmentation-sized payloads.
++    // Source port must remain stable per association instead of allocating one per packet.
++    let mut expected_source = None;
++    for i in 0..4 {
++        let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
++        let target_addr = target.local_addr().unwrap();
++        let body = vec![0x31 + i; if i % 2 == 0 { 73 } else { 6000 }];
++        let mut message = vec![0, 0, 0, 1, 127, 0, 0, 1];
++        message.extend_from_slice(&target_addr.port().to_be_bytes());
++        message.extend_from_slice(&body);
++        client_udp.send_to(&message, relay).await.unwrap();
++        let mut buf = vec![0; 65535];
++        let (n, source) = target.recv_from(&mut buf).await.unwrap();
++        assert_eq!(&buf[..n], &body);
++        if let Some(expected) = expected_source {
++            assert_eq!(source, expected, "UDP association changed source socket");
++        }
++        expected_source = Some(source);
++        target.send_to(&buf[..n], source).await.unwrap();
++        let (n, _) = client_udp.recv_from(&mut buf).await.unwrap();
++        assert_eq!(&buf[10..n], &body, "UDP reply from independent peer");
++    }
++    eprintln!(
++        "PASS independent sing-box 1.14.4 -> vp_core {protocol} {}: TCP echo/half-close, UDP two-way repeated/multi-target/stable-association, 6000-byte fragmentation",
++        mode.unwrap_or("datagram")
++    );
++}
++
++#[tokio::test]
++#[ignore = "requires verified official sing-box 1.14.4"]
++async fn sing_box_tuic_native_tcp_udp() {
++    tokio::time::timeout(Duration::from_secs(20), interop("tuic", Some("native")))
++        .await
++        .unwrap();
++}
++#[tokio::test]
++#[ignore = "requires verified official sing-box 1.14.4"]
++async fn sing_box_tuic_quic_tcp_udp() {
++    tokio::time::timeout(Duration::from_secs(20), interop("tuic", Some("quic")))
++        .await
++        .unwrap();
++}
++#[tokio::test]
++#[ignore = "requires verified official sing-box 1.14.4"]
++async fn sing_box_hysteria2_tcp_udp() {
++    tokio::time::timeout(Duration::from_secs(20), interop("hysteria2", None))
++        .await
++        .unwrap();
++}
+-- 
+2.52.0
+

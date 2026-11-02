@@ -1,0 +1,2742 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Reviewed semantic refinements for generated VP wire contracts",
+  "$comment": "Source overlay: intersected with schemars-derived DTO shapes. Never replace a generated shape or weaken Rust runtime validation. Additional constraints include bounds, public-ID patterns and required explicit nullable output fields.",
+  "$defs": {
+    "OpaqueId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,128}$"
+    },
+    "SecretRef": {
+      "type": "string",
+      "pattern": "^secret:[A-Za-z0-9_-]{1,128}$",
+      "description": "Vault lookup only; never inline secret material."
+    },
+    "SafeCode": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]{1,128}$"
+    },
+    "Revision": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "SafeArg": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "count"
+            },
+            "value": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "flag"
+            },
+            "value": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "code"
+            },
+            "value": {
+              "$ref": "#/$defs/SafeCode"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        }
+      ]
+    },
+    "CapabilityKey": {
+      "type": "string",
+      "enum": [
+        "preset.tuic",
+        "preset.trojan-tls",
+        "preset.hysteria2",
+        "preset.vmess-ws",
+        "preset.vmess-tcp",
+        "preset.vmess-http",
+        "preset.vmess-quic",
+        "preset.shadowsocks",
+        "preset.vmess-h2-tls",
+        "preset.vmess-ws-tls",
+        "preset.vless-h2-tls",
+        "preset.vless-ws-tls",
+        "preset.trojan-h2-tls",
+        "preset.trojan-ws-tls",
+        "preset.vmess-httpupgrade-tls",
+        "preset.vless-httpupgrade-tls",
+        "preset.trojan-httpupgrade-tls",
+        "preset.vless-reality-vision",
+        "preset.vless-h2-reality",
+        "preset.anytls",
+        "preset.socks-auth",
+        "preset.direct-forward"
+      ]
+    },
+    "ProductError": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "CONFIG_UNKNOWN_FIELD",
+            "CONFIG_INVALID",
+            "CONFIG_UNSUPPORTED",
+            "INPUT_TOO_LARGE",
+            "INVALID_UTF8",
+            "CAPABILITY_UNCERTIFIED",
+            "CAPABILITY_UNAVAILABLE",
+            "AUTH_REQUIRED",
+            "AUTH_FAILED",
+            "PERMISSION_DENIED",
+            "REVISION_CONFLICT",
+            "IDEMPOTENCY_CONFLICT",
+            "PLAN_EXPIRED",
+            "CONFIRMATION_REQUIRED",
+            "LISTENER_BIND_FAILED",
+            "TLS_TRUST_FAILED",
+            "SECRET_NOT_FOUND",
+            "SECRET_RESULT_UNAVAILABLE",
+            "IMPORT_UNSUPPORTED",
+            "EXPORT_LOSSY",
+            "UPGRADE_INCOMPATIBLE",
+            "SIGNATURE_INVALID",
+            "ROLLBACK_FAILED",
+            "RECOVERY_REQUIRED",
+            "OPERATION_NOT_CANCELABLE",
+            "OPERATION_CANCELED",
+            "ABI_INCOMPATIBLE",
+            "HOOK_REQUIRED",
+            "QUEUE_FULL",
+            "TIMEOUT",
+            "CLOSED",
+            "INTERNAL"
+          ]
+        },
+        "messageKey": {
+          "$ref": "#/$defs/SafeCode"
+        },
+        "safeArgs": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/SafeArg"
+          }
+        },
+        "fieldPath": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "stage": {
+          "type": "string",
+          "enum": [
+            "decode",
+            "validate",
+            "authenticate",
+            "plan",
+            "apply",
+            "start",
+            "verify",
+            "stop",
+            "recover",
+            "upgrade",
+            "export"
+          ]
+        },
+        "capabilityKey": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CapabilityKey"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "remediation": {
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "reauthenticate",
+                "reload_snapshot",
+                "review_fields",
+                "grant_permission",
+                "retry",
+                "update_product",
+                "restore_backup",
+                "contact_support"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "diagnosticId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OpaqueId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "code",
+        "messageKey",
+        "safeArgs",
+        "fieldPath",
+        "retryable",
+        "stage",
+        "capabilityKey",
+        "remediation",
+        "diagnosticId"
+      ]
+    },
+    "Endpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "host": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        }
+      },
+      "required": [
+        "host",
+        "port"
+      ]
+    },
+    "ShadowsocksCipher": {
+      "type": "string",
+      "enum": [
+        "aes-128-gcm",
+        "aes-256-gcm",
+        "chacha20-ietf-poly1305",
+        "xchacha20-ietf-poly1305",
+        "2022-blake3-aes-128-gcm",
+        "2022-blake3-aes-256-gcm",
+        "2022-blake3-chacha20-poly1305"
+      ]
+    },
+    "Protocol": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "tuic"
+            },
+            "congestionControl": {
+              "type": "string",
+              "enum": [
+                "cubic",
+                "new_reno",
+                "bbr"
+              ]
+            },
+            "udpRelayMode": {
+              "type": "string",
+              "enum": [
+                "native",
+                "quic"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "congestionControl",
+            "udpRelayMode"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "trojan"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "hysteria2"
+            },
+            "obfuscationRef": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SecretRef"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "obfuscationRef"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "vmess"
+            },
+            "cipher": {
+              "type": "string",
+              "enum": [
+                "auto",
+                "aes-128-gcm",
+                "chacha20-poly1305",
+                "none"
+              ]
+            },
+            "alterId": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65535
+            }
+          },
+          "required": [
+            "kind",
+            "cipher",
+            "alterId"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "shadowsocks"
+            },
+            "method": {
+              "$ref": "#/$defs/ShadowsocksCipher"
+            }
+          },
+          "required": [
+            "kind",
+            "method"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "vless"
+            },
+            "flow": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "enum": [
+                    "xtls-rprx-vision"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "flow"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "anytls"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "socks5"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "EarlyData": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "headerName": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9-]+$"
+        }
+      },
+      "required": [
+        "maxBytes",
+        "headerName"
+      ]
+    },
+    "Transport": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "tcp"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "ws"
+            },
+            "path": {
+              "type": "string",
+              "pattern": "^/",
+              "maxLength": 2048
+            },
+            "host": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "earlyData": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/EarlyData"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "path",
+            "host",
+            "earlyData"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "http"
+            },
+            "path": {
+              "type": "string",
+              "pattern": "^/",
+              "maxLength": 2048
+            },
+            "host": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "path",
+            "host"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "h2"
+            },
+            "path": {
+              "type": "string",
+              "pattern": "^/",
+              "maxLength": 2048
+            },
+            "host": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "path",
+            "host"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "http_upgrade"
+            },
+            "path": {
+              "type": "string",
+              "pattern": "^/",
+              "maxLength": 2048
+            },
+            "host": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "path",
+            "host"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "quic"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "TlsTrust": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "system"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "custom_ca"
+            },
+            "certificateRef": {
+              "$ref": "#/$defs/OpaqueId"
+            }
+          },
+          "required": [
+            "kind",
+            "certificateRef"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "spki_sha256"
+            },
+            "pins": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Fa-f0-9]{64}$"
+              }
+            }
+          },
+          "required": [
+            "kind",
+            "pins"
+          ]
+        }
+      ],
+      "description": "Server authentication trust policy. spki_sha256 pins hash the DER SubjectPublicKeyInfo, NOT the full certificate. Certificate-fingerprint URI fields cannot be mapped to this variant."
+    },
+    "ClientSecurity": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "none"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "tls"
+            },
+            "serverName": {
+              "type": "string"
+            },
+            "alpn": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "trust": {
+              "$ref": "#/$defs/TlsTrust"
+            },
+            "clientHelloFingerprint": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9_-]{1,64}$"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "TLS ClientHello/browser profile name (for example chrome), NEVER a certificate digest or SPKI pin. Compiler must preserve or reject unsupported choices."
+            }
+          },
+          "required": [
+            "kind",
+            "serverName",
+            "alpn",
+            "trust",
+            "clientHelloFingerprint"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "reality"
+            },
+            "serverName": {
+              "type": "string"
+            },
+            "publicKey": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{43}$"
+            },
+            "shortId": {
+              "type": "string",
+              "pattern": "^(?:[0-9A-Fa-f]{2}){0,8}$"
+            },
+            "clientHelloFingerprint": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9_-]{1,64}$"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "TLS ClientHello/browser profile name (for example chrome), NEVER a certificate digest or SPKI pin. Compiler must preserve or reject unsupported choices."
+            }
+          },
+          "required": [
+            "kind",
+            "serverName",
+            "publicKey",
+            "shortId",
+            "clientHelloFingerprint"
+          ]
+        }
+      ]
+    },
+    "NodeProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "id": {
+          "$ref": "#/$defs/OpaqueId"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "endpoint": {
+          "$ref": "#/$defs/Endpoint"
+        },
+        "protocol": {
+          "$ref": "#/$defs/Protocol"
+        },
+        "transport": {
+          "$ref": "#/$defs/Transport"
+        },
+        "security": {
+          "$ref": "#/$defs/ClientSecurity"
+        },
+        "credentialRef": {
+          "$ref": "#/$defs/SecretRef"
+        },
+        "requirements": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CapabilityKey"
+          },
+          "description": "Hints only. Compiler MUST derive and validate exact capabilities from model fields; caller cannot bypass capability gating by omitting requirements."
+        },
+        "sourceRef": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OpaqueId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "id",
+        "name",
+        "endpoint",
+        "protocol",
+        "transport",
+        "security",
+        "credentialRef",
+        "requirements",
+        "sourceRef"
+      ]
+    },
+    "BindAddress": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "address": {
+          "type": "string"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        }
+      },
+      "required": [
+        "address",
+        "port"
+      ]
+    },
+    "ListenerUser": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/OpaqueId"
+        },
+        "credentialRef": {
+          "$ref": "#/$defs/SecretRef"
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "credentialRef",
+        "enabled"
+      ]
+    },
+    "ServerProtocol": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "proxy"
+            },
+            "protocol": {
+              "$ref": "#/$defs/Protocol"
+            },
+            "users": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/ListenerUser"
+              }
+            }
+          },
+          "required": [
+            "kind",
+            "protocol",
+            "users"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "direct"
+            },
+            "target": {
+              "$ref": "#/$defs/Endpoint"
+            },
+            "traffic": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "tcp",
+                  "udp"
+                ]
+              }
+            },
+            "allowedSources": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "kind",
+            "target",
+            "traffic",
+            "allowedSources"
+          ]
+        }
+      ]
+    },
+    "ServerSecurity": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "none"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "tls"
+            },
+            "certificateRef": {
+              "$ref": "#/$defs/OpaqueId"
+            },
+            "privateKeyRef": {
+              "$ref": "#/$defs/SecretRef"
+            },
+            "alpn": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "kind",
+            "certificateRef",
+            "privateKeyRef",
+            "alpn"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "reality"
+            },
+            "privateKeyRef": {
+              "$ref": "#/$defs/SecretRef"
+            },
+            "serverNames": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "shortIds": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "handshakeTarget": {
+              "$ref": "#/$defs/Endpoint"
+            }
+          },
+          "required": [
+            "kind",
+            "privateKeyRef",
+            "serverNames",
+            "shortIds",
+            "handshakeTarget"
+          ]
+        }
+      ]
+    },
+    "ServerListener": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "id": {
+          "$ref": "#/$defs/OpaqueId"
+        },
+        "name": {
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "bind": {
+          "$ref": "#/$defs/BindAddress"
+        },
+        "protocol": {
+          "$ref": "#/$defs/ServerProtocol"
+        },
+        "transport": {
+          "$ref": "#/$defs/Transport"
+        },
+        "security": {
+          "$ref": "#/$defs/ServerSecurity"
+        },
+        "requirements": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CapabilityKey"
+          },
+          "description": "Hints only. Compiler MUST derive and validate exact capabilities from model fields; caller cannot bypass capability gating by omitting requirements."
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "id",
+        "name",
+        "enabled",
+        "bind",
+        "protocol",
+        "transport",
+        "security",
+        "requirements"
+      ]
+    },
+    "SubscriptionSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "id": {
+          "$ref": "#/$defs/OpaqueId"
+        },
+        "name": {
+          "type": "string"
+        },
+        "urlRef": {
+          "$ref": "#/$defs/SecretRef"
+        },
+        "format": {
+          "type": "string",
+          "enum": [
+            "uri_list",
+            "base64_uri_list",
+            "vp_nodes",
+            "clash_nodes",
+            "sing_box_outbounds"
+          ]
+        },
+        "refreshIntervalSeconds": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 300,
+              "maximum": 4294967295
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "allowPrivateNetwork": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "id",
+        "name",
+        "urlRef",
+        "format",
+        "refreshIntervalSeconds",
+        "allowPrivateNetwork"
+      ]
+    },
+    "SubscriptionStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sourceId": {
+          "$ref": "#/$defs/OpaqueId"
+        },
+        "revision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "lastAttemptAt": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lastSuccessAt": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lastError": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProductError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "nodeCount": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      },
+      "required": [
+        "sourceId",
+        "revision",
+        "lastAttemptAt",
+        "lastSuccessAt",
+        "lastError",
+        "nodeCount"
+      ]
+    },
+    "ProductConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "minimumReaderVersion": {
+          "const": 1
+        },
+        "nodes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/NodeProfile"
+          }
+        },
+        "listeners": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ServerListener"
+          }
+        },
+        "subscriptions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SubscriptionSource"
+          }
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "minimumReaderVersion",
+        "nodes",
+        "listeners",
+        "subscriptions"
+      ]
+    },
+    "CompatibilityRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "minimum": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "maximum": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        }
+      },
+      "required": [
+        "minimum",
+        "maximum"
+      ]
+    },
+    "VersionPair": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "major": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "minor": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        }
+      },
+      "required": [
+        "major",
+        "minor"
+      ]
+    },
+    "ReleaseIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "releaseId": {
+          "$ref": "#/$defs/OpaqueId"
+        },
+        "productVersion": {
+          "type": "string"
+        },
+        "adapterVersion": {
+          "type": "string"
+        },
+        "coreCommit": {
+          "type": "string",
+          "pattern": "^[A-Fa-f0-9]{40}$"
+        },
+        "patchsetHash": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[A-Fa-f0-9]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "buildTarget": {
+          "type": "string"
+        },
+        "toolchain": {
+          "type": "string"
+        },
+        "schemaRead": {
+          "$ref": "#/$defs/CompatibilityRange"
+        },
+        "schemaWrite": {
+          "$ref": "#/$defs/CompatibilityRange"
+        },
+        "abi": {
+          "$ref": "#/$defs/VersionPair"
+        },
+        "api": {
+          "$ref": "#/$defs/VersionPair"
+        },
+        "evidenceManifestHash": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[A-Fa-f0-9]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "releaseId",
+        "productVersion",
+        "adapterVersion",
+        "coreCommit",
+        "patchsetHash",
+        "buildTarget",
+        "toolchain",
+        "schemaRead",
+        "schemaWrite",
+        "abi",
+        "api",
+        "evidenceManifestHash"
+      ]
+    },
+    "BuildInfo": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "release": {
+          "$ref": "#/$defs/ReleaseIdentity"
+        },
+        "requiredFeatures": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "development": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "release",
+        "requiredFeatures",
+        "development"
+      ]
+    },
+    "CapabilityDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/CapabilityKey"
+        },
+        "direction": {
+          "type": "string",
+          "enum": [
+            "inbound",
+            "outbound"
+          ]
+        },
+        "protocol": {
+          "type": "string",
+          "enum": [
+            "tuic",
+            "trojan",
+            "hysteria2",
+            "vmess",
+            "shadowsocks",
+            "vless",
+            "anytls",
+            "socks5",
+            "direct"
+          ]
+        },
+        "transport": {
+          "type": "string",
+          "enum": [
+            "tcp",
+            "ws",
+            "http",
+            "h2",
+            "http_upgrade",
+            "quic"
+          ]
+        },
+        "security": {
+          "type": "string",
+          "enum": [
+            "none",
+            "tls",
+            "reality"
+          ]
+        },
+        "cipher": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ShadowsocksCipher"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "traffic": {
+          "type": "string",
+          "enum": [
+            "tcp",
+            "udp"
+          ]
+        },
+        "ipFamily": {
+          "type": "string",
+          "enum": [
+            "ipv4",
+            "ipv6"
+          ]
+        },
+        "platform": {
+          "type": "string",
+          "enum": [
+            "linux-service",
+            "android",
+            "ios",
+            "macos",
+            "windows"
+          ]
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "unimplemented",
+            "blocked",
+            "experimental",
+            "certified",
+            "deprecated"
+          ]
+        },
+        "reason": {
+          "$ref": "#/$defs/SafeCode"
+        },
+        "evidenceIds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/OpaqueId"
+          }
+        },
+        "releaseIdentity": {
+          "$ref": "#/$defs/ReleaseIdentity"
+        }
+      },
+      "required": [
+        "key",
+        "direction",
+        "protocol",
+        "transport",
+        "security",
+        "cipher",
+        "traffic",
+        "ipFamily",
+        "platform",
+        "status",
+        "reason",
+        "evidenceIds",
+        "releaseIdentity"
+      ]
+    },
+    "PresetDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "key": {
+          "$ref": "#/$defs/CapabilityKey"
+        },
+        "name": {
+          "type": "string"
+        },
+        "protocol": {
+          "type": "string",
+          "enum": [
+            "tuic",
+            "trojan",
+            "hysteria2",
+            "vmess",
+            "shadowsocks",
+            "vless",
+            "anytls",
+            "socks5",
+            "direct"
+          ]
+        },
+        "transport": {
+          "type": "string",
+          "enum": [
+            "tcp",
+            "ws",
+            "http",
+            "h2",
+            "http_upgrade",
+            "quic"
+          ]
+        },
+        "security": {
+          "type": "string",
+          "enum": [
+            "none",
+            "tls",
+            "reality"
+          ]
+        },
+        "ciphers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ShadowsocksCipher"
+          }
+        },
+        "scope": {
+          "type": "string",
+          "enum": [
+            "required_public_baseline",
+            "explicit_decision_required",
+            "included",
+            "excluded_by_user_decision"
+          ]
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "unimplemented",
+            "blocked",
+            "experimental",
+            "certified",
+            "deprecated"
+          ]
+        },
+        "reason": {
+          "$ref": "#/$defs/SafeCode"
+        }
+      },
+      "required": [
+        "id",
+        "key",
+        "name",
+        "protocol",
+        "transport",
+        "security",
+        "ciphers",
+        "scope",
+        "status",
+        "reason"
+      ]
+    },
+    "PresetCatalog": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "presets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PresetDefinition"
+          }
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "presets"
+      ]
+    },
+    "ConnectionIntent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "disconnected"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "connected"
+            },
+            "nodeId": {
+              "$ref": "#/$defs/OpaqueId"
+            }
+          },
+          "required": [
+            "kind",
+            "nodeId"
+          ]
+        }
+      ]
+    },
+    "RuntimePhase": {
+      "type": "string",
+      "enum": [
+        "idle",
+        "preparing",
+        "awaiting_permission",
+        "starting",
+        "verifying",
+        "connected",
+        "degraded",
+        "reconnecting",
+        "stopping",
+        "failed",
+        "recovering"
+      ]
+    },
+    "HealthObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "not_run",
+            "passed",
+            "failed",
+            "not_applicable"
+          ]
+        },
+        "observedAt": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "evidenceId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OpaqueId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "detailKey": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SafeCode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "status",
+        "observedAt",
+        "evidenceId",
+        "detailKey"
+      ]
+    },
+    "RuntimeHealth": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "core": {
+          "$ref": "#/$defs/HealthObservation"
+        },
+        "takeover": {
+          "$ref": "#/$defs/HealthObservation"
+        },
+        "tunnel": {
+          "$ref": "#/$defs/HealthObservation"
+        },
+        "dns": {
+          "$ref": "#/$defs/HealthObservation"
+        },
+        "ipv4": {
+          "$ref": "#/$defs/HealthObservation"
+        },
+        "ipv6": {
+          "$ref": "#/$defs/HealthObservation"
+        },
+        "forwarding": {
+          "$ref": "#/$defs/HealthObservation"
+        },
+        "requiredProbes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "core",
+              "takeover",
+              "tunnel",
+              "dns",
+              "ipv4",
+              "ipv6",
+              "forwarding"
+            ]
+          }
+        }
+      },
+      "required": [
+        "core",
+        "takeover",
+        "tunnel",
+        "dns",
+        "ipv4",
+        "ipv6",
+        "forwarding",
+        "requiredProbes"
+      ]
+    },
+    "RuntimeSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "instanceId": {
+          "type": "string"
+        },
+        "generation": {
+          "$ref": "#/$defs/Revision"
+        },
+        "sequence": {
+          "$ref": "#/$defs/Revision"
+        },
+        "observedAt": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "validUntil": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "desired": {
+          "$ref": "#/$defs/ConnectionIntent"
+        },
+        "phase": {
+          "$ref": "#/$defs/RuntimePhase"
+        },
+        "configRevision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Revision"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "desiredRevision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Revision"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "nodeId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OpaqueId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "operationId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OpaqueId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "health": {
+          "$ref": "#/$defs/RuntimeHealth"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProductError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "instanceId",
+        "generation",
+        "sequence",
+        "observedAt",
+        "validUntil",
+        "desired",
+        "phase",
+        "configRevision",
+        "desiredRevision",
+        "nodeId",
+        "operationId",
+        "health",
+        "error"
+      ]
+    },
+    "ListenerObservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "listenerId": {
+          "$ref": "#/$defs/OpaqueId"
+        },
+        "generation": {
+          "$ref": "#/$defs/Revision"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "configured",
+            "disabled",
+            "starting",
+            "ready",
+            "degraded",
+            "failed",
+            "stopped"
+          ]
+        },
+        "bound": {
+          "type": "boolean"
+        },
+        "authenticationLoaded": {
+          "type": "boolean"
+        },
+        "forwarding": {
+          "$ref": "#/$defs/HealthObservation"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProductError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "listenerId",
+        "generation",
+        "status",
+        "bound",
+        "authenticationLoaded",
+        "forwarding",
+        "error"
+      ]
+    },
+    "RuntimeEventPayload": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "snapshot"
+            },
+            "snapshot": {
+              "$ref": "#/$defs/RuntimeSnapshot"
+            }
+          },
+          "required": [
+            "kind",
+            "snapshot"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "phase_changed"
+            },
+            "phase": {
+              "$ref": "#/$defs/RuntimePhase"
+            },
+            "error": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ProductError"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "phase",
+            "error"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "listener_changed"
+            },
+            "listener": {
+              "$ref": "#/$defs/ListenerObservation"
+            }
+          },
+          "required": [
+            "kind",
+            "listener"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "resync_required"
+            },
+            "lastRetainedSequence": {
+              "$ref": "#/$defs/Revision"
+            }
+          },
+          "required": [
+            "kind",
+            "lastRetainedSequence"
+          ]
+        }
+      ]
+    },
+    "RuntimeEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "instanceId": {
+          "type": "string"
+        },
+        "generation": {
+          "$ref": "#/$defs/Revision"
+        },
+        "sequence": {
+          "$ref": "#/$defs/Revision"
+        },
+        "operationId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OpaqueId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "revision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Revision"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "payload": {
+          "$ref": "#/$defs/RuntimeEventPayload"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "instanceId",
+        "generation",
+        "sequence",
+        "operationId",
+        "revision",
+        "payload"
+      ]
+    },
+    "OperationSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/OpaqueId"
+        },
+        "planId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OpaqueId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "queued",
+            "running",
+            "awaiting_confirmation",
+            "succeeded",
+            "failed",
+            "canceled",
+            "rolling_back",
+            "rolled_back",
+            "recovery_required"
+          ]
+        },
+        "stage": {
+          "type": "string",
+          "enum": [
+            "validate",
+            "stage",
+            "stop_old",
+            "start_new",
+            "verify",
+            "commit",
+            "rollback",
+            "recover"
+          ]
+        },
+        "cancellable": {
+          "type": "boolean"
+        },
+        "completedSteps": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "totalSteps": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "baseRevision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "targetRevision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Revision"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProductError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "planId",
+        "status",
+        "stage",
+        "cancellable",
+        "completedSteps",
+        "totalSteps",
+        "baseRevision",
+        "targetRevision",
+        "error"
+      ]
+    },
+    "ChangeSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "resourceId": {
+          "type": "string"
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "create",
+            "update",
+            "delete"
+          ]
+        },
+        "messageKey": {
+          "$ref": "#/$defs/SafeCode"
+        }
+      },
+      "required": [
+        "resourceId",
+        "action",
+        "messageKey"
+      ]
+    },
+    "ChangePlanSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/OpaqueId"
+        },
+        "planHash": {
+          "type": "string",
+          "pattern": "^[A-Fa-f0-9]{64}$"
+        },
+        "baseRevision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "expiresAt": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ChangeSummary"
+          }
+        },
+        "impact": {
+          "type": "string",
+          "enum": [
+            "no_runtime_change",
+            "route_hot_swap",
+            "controlled_restart",
+            "privileged_system_change"
+          ]
+        },
+        "requiredPermissions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SafeCode"
+          }
+        },
+        "recoveryAvailable": {
+          "type": "boolean"
+        },
+        "recoveryDescriptionKey": {
+          "$ref": "#/$defs/SafeCode"
+        }
+      },
+      "required": [
+        "id",
+        "planHash",
+        "baseRevision",
+        "expiresAt",
+        "changes",
+        "impact",
+        "requiredPermissions",
+        "recoveryAvailable",
+        "recoveryDescriptionKey"
+      ]
+    },
+    "ImportEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "disposition": {
+          "type": "string",
+          "enum": [
+            "accepted",
+            "needs_review",
+            "rejected",
+            "duplicate"
+          ]
+        },
+        "node": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NodeProfile"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "duplicateOf": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OpaqueId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProductError"
+          }
+        },
+        "preview": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImportNodePreview"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "index",
+        "disposition",
+        "node",
+        "duplicateOf",
+        "diagnostics",
+        "preview"
+      ]
+    },
+    "ImportReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "entries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ImportEntry"
+          }
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProductError"
+          }
+        },
+        "hasUnimportedFields": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "entries",
+        "diagnostics",
+        "hasUnimportedFields"
+      ]
+    },
+    "CommandEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "requestId": {
+          "$ref": "#/$defs/OpaqueId"
+        },
+        "idempotencyKey": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OpaqueId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "expectedRevision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Revision"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "method": {
+          "$ref": "#/$defs/CommandMethod"
+        },
+        "payload": {}
+      },
+      "required": [
+        "schemaVersion",
+        "requestId",
+        "idempotencyKey",
+        "expectedRevision",
+        "method",
+        "payload"
+      ]
+    },
+    "SuccessEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "requestId": {
+          "$ref": "#/$defs/OpaqueId"
+        },
+        "operationId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OpaqueId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "result": {}
+      },
+      "required": [
+        "schemaVersion",
+        "requestId",
+        "operationId",
+        "result"
+      ]
+    },
+    "FailureEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "requestId": {
+          "$ref": "#/$defs/OpaqueId"
+        },
+        "operationId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OpaqueId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "error": {
+          "$ref": "#/$defs/ProductError"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "requestId",
+        "operationId",
+        "error"
+      ]
+    },
+    "ResultEnvelope": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/SuccessEnvelope"
+        },
+        {
+          "$ref": "#/$defs/FailureEnvelope"
+        }
+      ]
+    },
+    "DraftSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/OpaqueId"
+        },
+        "revision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "baseRevision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "config": {
+          "$ref": "#/$defs/ProductConfig"
+        }
+      },
+      "required": [
+        "id",
+        "revision",
+        "baseRevision",
+        "config"
+      ]
+    },
+    "ManagementSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": {
+          "const": 1
+        },
+        "desiredRevision": {
+          "$ref": "#/$defs/Revision"
+        },
+        "observedRevision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Revision"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "listeners": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ListenerObservation"
+          }
+        },
+        "operations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/OperationSummary"
+          }
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "desiredRevision",
+        "observedRevision",
+        "listeners",
+        "operations"
+      ]
+    },
+    "PreviewProtocol": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "tuic"
+            },
+            "congestionControl": {
+              "type": "string",
+              "enum": [
+                "cubic",
+                "new_reno",
+                "bbr"
+              ]
+            },
+            "udpRelayMode": {
+              "type": "string",
+              "enum": [
+                "native",
+                "quic"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "congestionControl",
+            "udpRelayMode"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "trojan"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "hysteria2"
+            },
+            "obfuscationRef": {
+              "const": null
+            }
+          },
+          "required": [
+            "kind",
+            "obfuscationRef"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "vmess"
+            },
+            "cipher": {
+              "type": "string",
+              "enum": [
+                "auto",
+                "aes-128-gcm",
+                "chacha20-poly1305",
+                "none"
+              ]
+            },
+            "alterId": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65535
+            }
+          },
+          "required": [
+            "kind",
+            "cipher",
+            "alterId"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "shadowsocks"
+            },
+            "method": {
+              "$ref": "#/$defs/ShadowsocksCipher"
+            }
+          },
+          "required": [
+            "kind",
+            "method"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "vless"
+            },
+            "flow": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "enum": [
+                    "xtls-rprx-vision"
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "flow"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "anytls"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "socks5"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ],
+      "description": "Secret-reference-free import preview protocol. Hysteria2 obfuscationRef must be null; hasObfuscation is a separate boolean."
+    },
+    "ImportNodePreview": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "endpoint": {
+          "$ref": "#/$defs/Endpoint"
+        },
+        "protocol": {
+          "$ref": "#/$defs/PreviewProtocol"
+        },
+        "transport": {
+          "$ref": "#/$defs/Transport"
+        },
+        "security": {
+          "$ref": "#/$defs/ClientSecurity"
+        },
+        "hasObfuscation": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "endpoint",
+        "protocol",
+        "transport",
+        "security",
+        "hasObfuscation"
+      ]
+    },
+    "ExplicitConfirmation": {
+      "type": "boolean",
+      "const": true
+    },
+    "CredentialSummary": {
+      "allOf": [
+        {
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "revision": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "createdAt": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          }
+        }
+      ]
+    },
+    "CredentialInventory": {
+      "allOf": [
+        {
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "supportedKinds": {
+              "type": "array",
+              "maxItems": 11,
+              "uniqueItems": true
+            },
+            "credentials": {
+              "type": "array",
+              "maxItems": 128
+            }
+          }
+        }
+      ]
+    },
+    "PublicationSummary": {
+      "allOf": [
+        {
+          "properties": {
+            "schemaVersion": {
+              "const": 1
+            },
+            "revision": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "sourceRevision": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "createdAt": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "updatedAt": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "lastSuccessfulReadAt": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "lastSuccessfulReadAt"
+          ]
+        }
+      ]
+    },
+    "PublicationTokenStatus": {
+      "allOf": [
+        {
+          "properties": {
+            "issuedAt": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "expiresAt": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "issuedAt",
+            "expiresAt"
+          ]
+        }
+      ]
+    }
+  }
+}

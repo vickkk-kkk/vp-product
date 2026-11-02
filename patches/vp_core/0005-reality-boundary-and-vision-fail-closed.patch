@@ -1,0 +1,568 @@
+diff --git a/crates/vp-protocol/src/vless_vision.rs b/crates/vp-protocol/src/vless_vision.rs
+index 8b6c2418b379c8c499b5d21dd3e6c050d847ba56..1c510cacf149558306d358f63ebd4d1aa9b7b8f5 100644
+--- a/crates/vp-protocol/src/vless_vision.rs
++++ b/crates/vp-protocol/src/vless_vision.rs
+@@ -1,6 +1,10 @@
+-//! XTLS-rprx-vision 真实流控（Vision 握手填充与帧化直通）。
++//! Legacy experimental Vision framing; NOT a conforming Vision transport.
+ //!
+-//! 规范对标 Xray-core / sing-box：
++//! The legacy stream below omits the first-frame UUID and cannot detach the
++//! outer TLS record layer for command 2. Its `Direct` state only stops local
++//! framing; it does not implement XTLS direct copy. Production VLESS negotiation
++//! must call `validate_flow` and fail closed until those requirements are met.
++//! Existing framing description (not evidence of protocol interoperability):
+ //! 1. VLESS Addons 线格式：`0x0A 0x10 xtls-rprx-vision`（18 字节 protobuf 编码）。
+ //! 2. 握手阶段 5 字节帧结构：`[Command: 1B][ContentLen: 2B be][PaddingLen: 2B be][Content][Padding]`。
+ //!    - Command 0x00: PaddingContinue
+@@ -18,6 +22,37 @@ pub const VISION_FLOW_BYTES: &[u8] = b"\x0a\x10xtls-rprx-vision";
+ pub const CMD_PADDING_CONTINUE: u8 = 0x00;
+ pub const CMD_PADDING_END: u8 = 0x01;
+ 
++/// Reject unsupported flow requests before dialing, writing a success response,
++/// or connecting a server-side destination. Never silently downgrade a flow.
++pub fn validate_flow(flow: Option<&str>) -> vp_common::Result<()> {
++    match flow {
++        None | Some("") => Ok(()),
++        Some("xtls-rprx-vision") => Err(vp_common::Error::Unsupported(
++            "VLESS Vision requires UUID framing and an authenticated TLS/raw-stream transition; this backend does not implement them".into(),
++        )),
++        Some(_) => Err(vp_common::Error::Unsupported(
++            "unsupported VLESS flow".into(),
++        )),
++    }
++}
++
++#[cfg(test)]
++mod flow_tests {
++    use super::validate_flow;
++
++    #[test]
++    fn unsupported_flows_are_never_downgraded() {
++        assert!(validate_flow(None).is_ok());
++        assert!(validate_flow(Some("")).is_ok());
++        for flow in ["xtls-rprx-vision", "XTLS-RPRX-VISION", " ", "future-flow"] {
++            assert!(matches!(
++                validate_flow(Some(flow)),
++                Err(vp_common::Error::Unsupported(_))
++            ));
++        }
++    }
++}
++
+ /// 判断载荷是否为 TLS 握手层 ClientHello（内层 TLS）
+ pub fn is_tls_client_hello(buf: &[u8]) -> bool {
+     // 至少 9 字节：Record Header(5B: [0x16, 0x03, 0x01..0x03, len(2B)]) + Handshake Header(4B: [0x01, len(3B)])
+diff --git a/crates/vp-transport/tests/reality_rustls_boundary.rs b/crates/vp-transport/tests/reality_rustls_boundary.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..b409ddbfc1b0046bc8654e2cadc6729889570ca0
+--- /dev/null
++++ b/crates/vp-transport/tests/reality_rustls_boundary.rs
+@@ -0,0 +1,507 @@
++//! Test-only feasibility experiment, NOT a deployable REALITY server.
++//!
++//! Establishes a narrow fact: an unchanged authenticated classic-X25519
++//! ClientHello can be resumed by rustls with a per-connection REALITY-style
++//! certificate. The certificate's Ed25519 public key is authenticated by
++//! HMAC-SHA512, while TLS CertificateVerify is a real Ed25519 signature.
++//! No custom TLS key schedule, record encryption, DER patching, camouflage target,
++//! fallback forwarding, Vision, ML-DSA, or independent implementation is involved.
++//! Reference behavior was inspected at XTLS/Xray-core commit
++//! 0afec66085a85191e9dd2a4a6646c7c9a94688d1, transport/internet/reality/reality.go.
++//! This independently authored test uses only existing locked dependencies.
++
++use std::io;
++use std::sync::Arc;
++use std::time::{Duration, SystemTime, UNIX_EPOCH};
++
++use rcgen::{CertificateParams, KeyPair, RemoteKeyPair, SignatureAlgorithm};
++use ring::{aead, hkdf, hmac};
++use rustls::pki_types::PrivatePkcs8KeyDer;
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use tokio::net::{TcpListener, TcpStream};
++use tokio_rustls::server::StartHandshake;
++use vp_transport::utls::{Fingerprint, UtlsConfig, utls_connect};
++use x25519_dalek::{PublicKey, StaticSecret};
++
++type AnyError = Box<dyn std::error::Error + Send + Sync>;
++const NAME: &str = "reality-test.example.invalid";
++const SHORT_ID: [u8; 8] = [0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0];
++const MAX_HELLO: usize = 16_384;
++
++struct Reader<'a>(&'a [u8]);
++impl<'a> Reader<'a> {
++    fn take(&mut self, n: usize) -> Result<&'a [u8], &'static str> {
++        let (head, tail) = self.0.split_at_checked(n).ok_or("truncated hello")?;
++        self.0 = tail;
++        Ok(head)
++    }
++    fn byte(&mut self) -> Result<u8, &'static str> {
++        Ok(self.take(1)?[0])
++    }
++    fn word(&mut self) -> Result<usize, &'static str> {
++        let b = self.take(2)?;
++        Ok(u16::from_be_bytes([b[0], b[1]]) as usize)
++    }
++    fn vector(&mut self) -> Result<&'a [u8], &'static str> {
++        let n = self.word()?;
++        self.take(n)
++    }
++}
++
++// Deliberately limited to our classic-X25519 test client. This is not a complete
++// TLS parser and is never used by production listener construction.
++fn authenticate_fixture(
++    hello: &[u8],
++    secret: &StaticSecret,
++    expected_name: &str,
++    expected_short_id: &[u8; 8],
++    now: u64,
++) -> Result<[u8; 32], &'static str> {
++    if hello.len() > MAX_HELLO || hello.len() < 71 || hello[0] != 1 {
++        return Err("invalid hello");
++    }
++    let declared = ((hello[1] as usize) << 16) | ((hello[2] as usize) << 8) | hello[3] as usize;
++    if declared != hello.len() - 4 {
++        return Err("invalid handshake length");
++    }
++    let mut r = Reader(&hello[4..]);
++    if r.take(2)? != [3, 3] {
++        return Err("invalid legacy version");
++    }
++    let random = r.take(32)?;
++    if r.byte()? != 32 {
++        return Err("invalid session id length");
++    }
++    let session_id = r.take(32)?;
++    let suites = r.vector()?;
++    if suites.is_empty() || suites.len() % 2 != 0 {
++        return Err("invalid suites");
++    }
++    if r.byte()? != 1 || r.byte()? != 0 {
++        return Err("invalid compression");
++    }
++    let mut extensions = Reader(r.vector()?);
++    if !r.0.is_empty() {
++        return Err("trailing hello bytes");
++    }
++    let mut seen = std::collections::HashSet::new();
++    let mut sni = None;
++    let mut public = None;
++    let mut tls13 = false;
++    while !extensions.0.is_empty() {
++        let ty = extensions.word()?;
++        if !seen.insert(ty) {
++            return Err("duplicate extension");
++        }
++        let data = extensions.vector()?;
++        let mut e = Reader(data);
++        match ty {
++            0 => {
++                let mut names = Reader(e.vector()?);
++                if !e.0.is_empty() || names.byte()? != 0 {
++                    return Err("invalid sni");
++                }
++                sni = Some(names.vector()?);
++                if !names.0.is_empty() {
++                    return Err("duplicate sni");
++                }
++            }
++            43 => {
++                let size = e.byte()? as usize;
++                let versions = e.take(size)?;
++                if size % 2 != 0 || !e.0.is_empty() {
++                    return Err("invalid versions");
++                }
++                tls13 = versions.chunks_exact(2).any(|v| v == [3, 4]);
++            }
++            51 => {
++                let mut shares = Reader(e.vector()?);
++                if !e.0.is_empty() {
++                    return Err("invalid key shares");
++                }
++                while !shares.0.is_empty() {
++                    let group = shares.word()?;
++                    let bytes = shares.vector()?;
++                    if group == 29 {
++                        if public.is_some() {
++                            return Err("duplicate x25519 share");
++                        }
++                        public =
++                            Some(<[u8; 32]>::try_from(bytes).map_err(|_| "invalid x25519 share")?);
++                    }
++                }
++            }
++            _ => {}
++        }
++    }
++    if !tls13 || sni != Some(expected_name.as_bytes()) {
++        return Err("version or sni rejected");
++    }
++    let shared = secret.diffie_hellman(&PublicKey::from(public.ok_or("missing x25519 share")?));
++    if !shared.was_contributory() {
++        return Err("noncontributory key exchange");
++    }
++    struct KeyLength;
++    impl hkdf::KeyType for KeyLength {
++        fn len(&self) -> usize {
++            32
++        }
++    }
++    let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, &random[..20]).extract(shared.as_bytes());
++    let mut key = [0; 32];
++    prk.expand(&[b"REALITY"], KeyLength)
++        .map_err(|_| "hkdf")?
++        .fill(&mut key)
++        .map_err(|_| "hkdf")?;
++    let mut aad = hello.to_vec();
++    aad[39..71].fill(0);
++    let mut payload = session_id.to_vec();
++    let cipher = aead::LessSafeKey::new(
++        aead::UnboundKey::new(&aead::AES_256_GCM, &key).map_err(|_| "aead")?,
++    );
++    let nonce = aead::Nonce::try_assume_unique_for_key(&random[20..]).map_err(|_| "nonce")?;
++    let plain = cipher
++        .open_in_place(nonce, aead::Aad::from(aad), &mut payload)
++        .map_err(|_| "authentication rejected")?;
++    if plain.len() != 16 || plain[3] != 0 || &plain[8..] != expected_short_id {
++        return Err("short id or reserved field rejected");
++    }
++    let stamp = u32::from_be_bytes(plain[4..8].try_into().map_err(|_| "timestamp")?) as u64;
++    if now.abs_diff(stamp) > 30 {
++        return Err("timestamp rejected");
++    }
++    Ok(key)
++}
++
++async fn read_fixture_hello(stream: &mut TcpStream) -> Result<(Vec<u8>, Vec<u8>), AnyError> {
++    let mut records = Vec::new();
++    let mut hello = Vec::new();
++    for _ in 0..32 {
++        let mut header = [0; 5];
++        stream.read_exact(&mut header).await?;
++        let size = u16::from_be_bytes([header[3], header[4]]) as usize;
++        if header[0] != 22
++            || header[1] != 3
++            || !(1..=3).contains(&header[2])
++            || size == 0
++            || size > MAX_HELLO
++            || hello.len() + size > MAX_HELLO
++        {
++            return Err("invalid fixture TLS record".into());
++        }
++        let offset = hello.len();
++        hello.resize(offset + size, 0);
++        stream.read_exact(&mut hello[offset..]).await?;
++        records.extend_from_slice(&header);
++        records.extend_from_slice(&hello[offset..]);
++        if hello.len() >= 4 {
++            let size = ((hello[1] as usize) << 16) | ((hello[2] as usize) << 8) | hello[3] as usize;
++            if size + 4 > MAX_HELLO {
++                return Err("oversized fixture hello".into());
++            }
++            if hello.len() >= size + 4 {
++                if hello.len() != size + 4 {
++                    return Err("extra fixture handshake".into());
++                }
++                return Ok((records, hello));
++            }
++        }
++    }
++    Err("too many fixture records".into())
++}
++
++// rcgen owns the ASN.1 serialization. Only the certificate signature field uses
++// the protocol's HMAC construction; the TLS signing key remains genuine Ed25519.
++struct CertificateMac {
++    public: Vec<u8>,
++    signature: Vec<u8>,
++}
++impl RemoteKeyPair for CertificateMac {
++    fn public_key(&self) -> &[u8] {
++        &self.public
++    }
++    fn sign(&self, _: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
++        Ok(self.signature.clone())
++    }
++    fn algorithm(&self) -> &'static SignatureAlgorithm {
++        &rcgen::PKCS_ED25519
++    }
++}
++
++fn per_connection_config(auth: &[u8; 32], alpn: &[u8]) -> Result<rustls::ServerConfig, AnyError> {
++    let pair = KeyPair::generate_for(&rcgen::PKCS_ED25519)?;
++    let public = pair.public_key_raw().to_vec();
++    let signature = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA512, auth), &public)
++        .as_ref()
++        .to_vec();
++    let cert_key = KeyPair::from_remote(Box::new(CertificateMac { public, signature }))?;
++    let cert = CertificateParams::new(vec![NAME.to_string()])?.self_signed(&cert_key)?;
++    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
++        rustls::crypto::ring::default_provider(),
++    ))
++    .with_protocol_versions(&[&rustls::version::TLS13])?
++    .with_no_client_auth()
++    .with_single_cert(
++        vec![cert.der().clone()],
++        PrivatePkcs8KeyDer::from(pair.serialize_der()).into(),
++    )?;
++    config.send_tls13_tickets = 0;
++    config.alpn_protocols = if alpn.is_empty() {
++        vec![]
++    } else {
++        vec![alpn.to_vec()]
++    };
++    Ok(config)
++}
++
++#[derive(Clone, Copy, Debug)]
++enum Case {
++    Valid,
++    FragmentedReplay,
++    WrongKey,
++    WrongShortId,
++    WrongSni,
++    Stale,
++    WrongCertificateMac,
++    TranscriptTamper,
++}
++
++async fn case(case: Case, alpn: &[u8]) {
++    let mut private_bytes = [0; 32];
++    vp_common::rand_bytes(&mut private_bytes);
++    let secret = StaticSecret::from(private_bytes);
++    let public = PublicKey::from(&secret);
++    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let address = listener.local_addr().unwrap();
++    let server_alpn = alpn.to_vec();
++    let server = tokio::spawn(async move {
++        let action = async move {
++            let (mut stream, _) = listener.accept().await?;
++            let (mut records, hello) = read_fixture_hello(&mut stream).await?;
++            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
++            let mut auth = authenticate_fixture(
++                &hello,
++                &secret,
++                NAME,
++                &SHORT_ID,
++                now + if matches!(case, Case::Stale) { 120 } else { 0 },
++            )?;
++            if matches!(case, Case::WrongCertificateMac) {
++                auth[0] ^= 1;
++            }
++            if matches!(case, Case::TranscriptTamper) {
++                // Alter random AFTER authentication. TLS Finished must detect
++                // this; a successful pre-auth result never authorizes payload.
++                records[11] ^= 1;
++            }
++            if matches!(case, Case::FragmentedReplay) {
++                records.clear();
++                for part in [&hello[..17], &hello[17..]] {
++                    records.extend_from_slice(&[22, 3, 3]);
++                    records.extend_from_slice(&(part.len() as u16).to_be_bytes());
++                    records.extend_from_slice(part);
++                }
++            }
++            // The TLS transcript sees exactly the original encrypted session id.
++            let mut acceptor = rustls::server::Acceptor::default();
++            let mut input = io::Cursor::new(records.as_slice());
++            while (input.position() as usize) < records.len() {
++                if acceptor.read_tls(&mut input)? == 0 {
++                    return Err("acceptor made no progress".into());
++                }
++            }
++            let accepted = acceptor
++                .accept()
++                .map_err(|(e, _)| e)?
++                .ok_or("missing accepted hello")?;
++            assert_eq!(accepted.client_hello().server_name(), Some(NAME));
++            let start = StartHandshake::from_parts(accepted, stream);
++            let mut tls = start
++                .into_stream(Arc::new(per_connection_config(&auth, &server_alpn)?))
++                .await?;
++            assert_eq!(
++                tls.get_ref().1.alpn_protocol(),
++                if server_alpn.is_empty() {
++                    None
++                } else {
++                    Some(server_alpn.as_slice())
++                }
++            );
++            let mut bytes = [0; 10];
++            tls.read_exact(&mut bytes).await?;
++            if &bytes != b"loopback!!" {
++                return Err("unexpected payload".into());
++            }
++            tls.write_all(&bytes).await?;
++            tls.flush().await?;
++            Ok::<(), AnyError>(())
++        };
++        tokio::time::timeout(Duration::from_secs(5), action)
++            .await
++            .unwrap()
++    });
++    let mut public_bytes = *public.as_bytes();
++    if matches!(case, Case::WrongKey) {
++        let mut other = [0; 32];
++        vp_common::rand_bytes(&mut other);
++        public_bytes = *PublicKey::from(&StaticSecret::from(other)).as_bytes();
++    }
++    let mut short_id = SHORT_ID;
++    if matches!(case, Case::WrongShortId) {
++        short_id[0] ^= 1;
++    }
++    let config = UtlsConfig {
++        fingerprint: Fingerprint::Chrome,
++        server_name: Some(
++            if matches!(case, Case::WrongSni) {
++                "wrong.example.invalid"
++            } else {
++                NAME
++            }
++            .into(),
++        ),
++        alpn: if alpn.is_empty() {
++            vec![]
++        } else {
++            vec![String::from_utf8(alpn.to_vec()).unwrap()]
++        },
++        skip_cert_verify: false,
++        reality: Some(vp_transport::RealityConfig {
++            public_key: public_bytes,
++            short_id,
++            spider_x: None,
++        }),
++    };
++    let action = async {
++        let stream = TcpStream::connect(address).await?;
++        let mut tls = utls_connect(stream, NAME, &config).await?;
++        tls.write_all(b"loopback!!").await?;
++        tls.flush().await?;
++        let mut received = [0; 10];
++        tls.read_exact(&mut received).await?;
++        if &received != b"loopback!!" {
++            return Err("unexpected echo".into());
++        }
++        Ok::<(), AnyError>(())
++    };
++    let client_result = tokio::time::timeout(Duration::from_secs(5), action)
++        .await
++        .unwrap();
++    let server_result = server.await.unwrap();
++    if matches!(case, Case::Valid | Case::FragmentedReplay) {
++        client_result.unwrap();
++        server_result.unwrap();
++    } else {
++        let client_error = client_result.expect_err("invalid credentials accepted by client");
++        let server_error =
++            server_result.expect_err("invalid credentials delivered application bytes");
++        let expected = match case {
++            Case::WrongKey => Some("authentication rejected"),
++            Case::WrongShortId => Some("short id or reserved field rejected"),
++            Case::WrongSni => Some("version or sni rejected"),
++            Case::Stale => Some("timestamp rejected"),
++            _ => None,
++        };
++        if let Some(expected) = expected {
++            assert_eq!(
++                server_error.to_string(),
++                expected,
++                "wrong failure stage for {case:?}"
++            );
++        }
++        if matches!(case, Case::WrongCertificateMac) {
++            assert!(
++                client_error.to_string().contains("HMAC-SHA512"),
++                "wrong certificate failure stage: {client_error}"
++            );
++        }
++    }
++}
++
++#[tokio::test]
++async fn rustls_can_complete_authenticated_reality_fixture() {
++    case(Case::Valid, b"").await;
++}
++#[tokio::test]
++async fn rustls_can_negotiate_h2_alpn_not_an_h2_profile_test() {
++    case(Case::Valid, b"h2").await;
++}
++#[tokio::test]
++async fn wrong_static_key_is_rejected_before_tls_resume() {
++    case(Case::WrongKey, b"").await;
++}
++#[tokio::test]
++async fn wrong_short_id_is_rejected_before_tls_resume() {
++    case(Case::WrongShortId, b"").await;
++}
++#[tokio::test]
++async fn wrong_sni_is_rejected_before_tls_resume() {
++    case(Case::WrongSni, b"").await;
++}
++#[tokio::test]
++async fn stale_timestamp_is_rejected_before_tls_resume() {
++    case(Case::Stale, b"").await;
++}
++#[tokio::test]
++async fn wrong_certificate_mac_is_rejected_by_client() {
++    case(Case::WrongCertificateMac, b"").await;
++}
++
++#[tokio::test]
++async fn fragmented_hello_can_resume_without_transcript_mutation() {
++    case(Case::FragmentedReplay, b"").await;
++}
++
++#[tokio::test]
++async fn authenticated_hello_does_not_bypass_tls_transcript_verification() {
++    case(Case::TranscriptTamper, b"").await;
++}
++
++#[tokio::test]
++async fn truncated_and_mutated_fixture_hellos_are_rejected() {
++    let mut bytes = [0; 32];
++    vp_common::rand_bytes(&mut bytes);
++    let secret = StaticSecret::from(bytes);
++    let public_key = *PublicKey::from(&secret).as_bytes();
++    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let addr = listener.local_addr().unwrap();
++    let client = tokio::spawn(async move {
++        let cfg = UtlsConfig {
++            fingerprint: Fingerprint::Chrome,
++            server_name: Some(NAME.into()),
++            alpn: vec![],
++            skip_cert_verify: false,
++            reality: Some(vp_transport::RealityConfig {
++                public_key,
++                short_id: SHORT_ID,
++                spider_x: None,
++            }),
++        };
++        let stream = TcpStream::connect(addr).await.unwrap();
++        assert!(utls_connect(stream, NAME, &cfg).await.is_err());
++    });
++    let capture = async {
++        let (mut stream, _) = listener.accept().await.unwrap();
++        read_fixture_hello(&mut stream).await.unwrap().1
++    };
++    let hello = tokio::time::timeout(Duration::from_secs(5), capture)
++        .await
++        .unwrap();
++    client.await.unwrap();
++    let now = SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .unwrap()
++        .as_secs();
++    assert!(authenticate_fixture(&hello, &secret, NAME, &SHORT_ID, now).is_ok());
++    for length in 0..hello.len() {
++        assert!(authenticate_fixture(&hello[..length], &secret, NAME, &SHORT_ID, now).is_err());
++    }
++    for offset in 0..hello.len() {
++        let mut changed = hello.clone();
++        changed[offset] ^= 1;
++        assert!(
++            authenticate_fixture(&changed, &secret, NAME, &SHORT_ID, now).is_err(),
++            "mutation at byte {offset} accepted"
++        );
++    }
++}

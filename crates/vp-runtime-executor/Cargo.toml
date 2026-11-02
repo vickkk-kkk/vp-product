@@ -1,0 +1,28 @@
+[package]
+name = "vp-product-runtime-executor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+vp-product-domain.workspace = true
+vp-product-control.workspace = true
+vp-product-compiler.workspace = true
+vp-product-storage.workspace = true
+vp-product-core-adapter = { workspace = true, features = ["managed-runtime"] }
+serde.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true
+fs2 = "=0.4.3"
+
+[dev-dependencies]
+vp-product-api.workspace = true
+axum = { version = "=0.8.4", features = ["json", "tokio", "http1"] }
+tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "time"] }
+tower = { version = "=0.5.2", features = ["util"] }
+tempfile = "=3.19.1"
+sha2 = "=0.10.8"
+
+[lints]
+workspace = true

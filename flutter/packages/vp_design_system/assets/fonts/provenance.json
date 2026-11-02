@@ -1,0 +1,11 @@
+{
+  "family": "Noto Sans SC",
+  "license": "SIL Open Font License 1.1",
+  "observedAt": "2026-10-30",
+  "source": "https://raw.githubusercontent.com/google/fonts/main/ofl/notosanssc/NotoSansSC%5Bwght%5D.ttf",
+  "metadataSource": "https://raw.githubusercontent.com/google/fonts/main/ofl/notosanssc/METADATA.pb",
+  "metadataUpstreamCommit": "523d033d6cb47f4a80c58a35753646f5c3608a78",
+  "sha256": "a3041811a78c361b1de50f953c805e0244951c21c5bd412f7232ef0d899af0da",
+  "licenseSha256": "1c05c68c34f9708415aada51f17e1b0092d2cea709bf4a94cd38114f9e73d7d9",
+  "note": "Unmodified font bundled for same-origin Chinese UI rendering. Source main observed content pinned by SHA256; metadata upstream commit is not a claimed google/fonts commit."
+}

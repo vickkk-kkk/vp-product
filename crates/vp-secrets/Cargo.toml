@@ -1,0 +1,43 @@
+[package]
+name = "vp-product-secrets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+private-tls = ["vp-product-control/private-tls"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+vp-product-domain.workspace = true
+vp-product-control.workspace = true
+vp-product-runtime-executor.workspace = true
+zeroize.workspace = true
+sha2 = "=0.10.8"
+aes-gcm = { version = "=0.10.3", default-features = false, features = ["aes", "alloc", "zeroize"] }
+# Feature unification enables best-effort erasure of expanded cipher/hash keys.
+aes = { version = "=0.8.4", features = ["zeroize"] }
+ghash = { version = "=0.5.1", features = ["zeroize"] }
+polyval = { version = "=0.6.2", features = ["zeroize"] }
+getrandom = "=0.3.4"
+rustix = { version = "=1.1.6", features = ["fs", "process"] }
+
+[dev-dependencies]
+rcgen = { version = "=0.13.2", default-features = false, features = ["ring", "crypto"] }
+base64 = "=0.22.1"
+vp-product-core-adapter = { workspace = true, features = ["managed-runtime"] }
+vp-product-compiler.workspace = true
+vp-product-storage.workspace = true
+serde_json.workspace = true
+tempfile = "=3.19.1"
+
+[lints]
+workspace = true
+
+[[test]]
+name = "tls_import"
+harness = false
+required-features = ["private-tls"]

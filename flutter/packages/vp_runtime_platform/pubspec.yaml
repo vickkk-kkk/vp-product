@@ -1,0 +1,15 @@
+name: vp_runtime_platform
+description: VP product runtime platform boundary.
+version: 0.1.0
+publish_to: none
+environment:
+  sdk: ">=3.10.0 <4.0.0"
+  flutter: ">=3.38.0"
+dependencies:
+  flutter:
+    sdk: flutter
+  vp_contracts:
+    path: ../vp_contracts
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
