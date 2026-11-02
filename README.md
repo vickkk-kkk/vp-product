@@ -2,7 +2,7 @@
 
 统一管理客户端、Linux 服务端、Web 控制台与部署工具。客户端基于 `vpn-parser` fork 演进，服务端优先使用 `vp_core`；组件可以独立开发，产品版本在这里统一锁定。
 
-**当前阶段：工程整合中，尚无可直接安装的正式发行版。** 本源码版本包含真实客户端 submodule、服务端 Rust 基线、管理 Web 与安装工具。源码已归集，不等于整套产品已完成构建或运行验收。既有原型与测试结果不会自动视为新产品验收结果。
+**当前阶段：工程整合中，尚无可直接安装的正式发行版。** 本源码版本包含真实客户端 submodule、服务端 Rust 基线、管理 Web 与安装工具。这是按精确提交组织的源码检查点，不是可直接安装的二进制发行版；源码已归集，不等于整套产品已完成构建或运行验收。既有原型与测试结果不会自动视为新产品验收结果。
 
 主仓：[vickkk-kkk/vp-product](https://github.com/vickkk-kkk/vp-product)（私有） · 客户端 fork：[vickkk-kkk/vpn-parser](https://github.com/vickkk-kkk/vpn-parser)（公开）。源码、发布与验证是不同状态，详见 [当前快照](docs/source-snapshot.md)。
 
@@ -31,7 +31,7 @@ flowchart TB
 
 | 入口 | 负责什么 | 本轮落地状态 |
 | --- | --- | --- |
-| `client/` | 客户端 fork；桌面界面、共享业务层及未来移动端适配 | 已绑定上游基线；改造已发布到候选分支，未合并且未推进 gitlink |
+| `client/` | 客户端 fork；桌面界面、共享业务层及未来移动端适配 | 已绑定定制源码检查点 `51ccda91…`；共享层、parser 与更新器保护已纳入 |
 | `crates/`、`contracts/` | 服务端 Rust workspace 与共享管理契约 | 已纳入源码；新目录完整构建与运行验收待完成 |
 | `flutter/apps/vp_admin/` | Web 管理端，保留所需 `flutter/packages/` | 已纳入源码及所需五个共享包；不含旧 Flutter 客户端 |
 | `tools/install/` | 安装、打包、升级与运维工具 | 已纳入源码；无正式线上安装发行版 |

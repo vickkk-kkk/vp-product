@@ -31,4 +31,6 @@
 
 ## 已有验证的准确范围
 
-客户端候选改造已发布到 `work/client-foundation` 分支的 `7464ca00f0b85f350c37f0dffc4bf8b1f1471a56`，尚未合并；主仓 submodule 仍固定上游基线。独立 core/facade 范围通过常规 Cargo、Rust 1.88 执行的 24 个测试（12 原有 + 6 配置 + 6 DTO/parser）。另外，原始 fork 根目录已用 Rust 1.88、根 features=[] 正常编译 Linux headless 测试 harness，在同一个隐私修复测试 ELF 上，8 个指定测试通过（3 个诊断测试 + 原有 5 个纯内核辅助逻辑、验证器和版本分类测试）。测试对应同一已发布候选源码，代码、锁文件和测试 ELF 摘要未变；没有运行实时 collector、网络请求、主程序、GUI 或引擎运行时。候选日志修复仅覆盖 `collector/mod.rs`，存储与 UI 错误未改变，不代表全应用隐私整改；24 个独立 core/facade 测试对应的源码未被该修复改变。编译告警保留，不宣称 warning-clean。两项验证均不是完整测试套件、GUI 或原生 VPN 验收；GUI、移动端及平台验证仍待完成。主仓源码归集的静态检查与合成测试见 [当前快照](source-snapshot.md)。
+客户端定制源码检查点已固定为 `51ccda91cae9c68ca4725a44dd836e985a611db1`，来自 `work/client-foundation`，包含完整 parser 抽取与更新器保护。实际 workspace 的 core 测试先前 **71/71 通过**；更新器保护提交经 Rust 1.88 的 Linux 根目录 headless harness（根 features=[]）常规增量编译，**11 个指定纯逻辑测试通过**（原有 8 项 + 3 项更新器保护测试）。没有运行实时 collector、网络请求、主程序、GUI 或引擎运行时；告警保留，不宣称 warning-clean。
+
+About 界面相关变更仅通过静态审查，未进行 GUI 编译。日志修复仅覆盖 `collector/mod.rs` 的诊断日志，存储与 UI 错误未改变。主仓已锁定定制源码，但完整测试套件、GUI、移动端与原生 VPN 验收尚未完成；源码检查点不等于正式二进制发行版。详见 [当前快照](source-snapshot.md)。

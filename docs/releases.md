@@ -13,9 +13,11 @@
 
 客户端上游基线：`cf3bfcf8fc70518e75d036bd4db72fcee8713541`。这只是初始来源，不是未来永远不变的发布指针；实际绑定以主仓的 gitlink 为准。
 
+固定主仓提交与客户端 gitlink 可以形成可复现的源码检查点；它不自动成为二进制发行版，也不能替代 GUI、原生 VPN 和平台验收。
+
 ## 更新客户端 submodule
 
-以下步骤仅在真实 submodule 已建立且工作树干净时使用。先在客户端 fork 完成代码提交、审查和所需验证；不要自动追踪浮动分支。
+以下步骤仅在真实 submodule 已建立且工作树干净时使用。先在客户端 fork 的 `work/client-foundation` 开发线上完成代码提交、审查和所需验证；不要自动追踪浮动分支。主仓使用 detached checkout 固定精确提交，不通过 `git pull` 上游来更新定制客户端。
 
 ```sh
 git -C client status --short
