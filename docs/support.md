@@ -31,6 +31,12 @@
 
 ## 已有验证的准确范围
 
-客户端定制源码检查点已固定为 `51ccda91cae9c68ca4725a44dd836e985a611db1`，来自 `work/client-foundation`，包含完整 parser 抽取与更新器保护。实际 workspace 的 core 测试先前 **71/71 通过**；更新器保护提交经 Rust 1.88 的 Linux 根目录 headless harness（根 features=[]）常规增量编译，**11 个指定纯逻辑测试通过**（原有 8 项 + 3 项更新器保护测试）。没有运行实时 collector、网络请求、主程序、GUI 或引擎运行时；告警保留，不宣称 warning-clean。
+客户端定制源码检查点固定为 `d1a72b2a871295bbd556cf36728ebc56cfb784e1`，包含完整 parser、更新器保护、移动端导入与字体资产，以及六套共享配置编译器。
+
+- 实际 workspace core 默认测试 **102 项通过**：76 单元 + 26 集成；其中一个隔离 golden 测试比较六套编译器与旧实现的合成输出。
+- Rust 1.88、根 features=[] 的 Linux headless harness 常规增量编译后，**11 个指定纯逻辑测试通过**；移动端共享逻辑在新 core 上重跑 **15 项通过**。
+- ab_glyph 对 **63 个字形**的软件栅格检查通过，仅验证字体资产，不是 egui 或原生平台渲染验收。
+
+共享六套配置编译器不等于六个移动端原生运行时已经可用。没有运行实时 collector、网络请求、主程序、GUI 或引擎运行时；告警保留，不宣称 warning-clean。
 
 About 界面相关变更仅通过静态审查，未进行 GUI 编译。日志修复仅覆盖 `collector/mod.rs` 的诊断日志，存储与 UI 错误未改变。主仓已锁定定制源码，但完整测试套件、GUI、移动端与原生 VPN 验收尚未完成；源码检查点不等于正式二进制发行版。详见 [当前快照](source-snapshot.md)。

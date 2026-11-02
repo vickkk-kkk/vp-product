@@ -31,7 +31,7 @@ flowchart TB
 
 | 入口 | 负责什么 | 本轮落地状态 |
 | --- | --- | --- |
-| `client/` | 客户端 fork；桌面界面、共享业务层及未来移动端适配 | 已绑定定制源码检查点 `51ccda91…`；共享层、parser 与更新器保护已纳入 |
+| `client/` | 客户端 fork；桌面界面、共享业务层及未来移动端适配 | 已绑定定制源码检查点 `d1a72b2a…`；共享层、parser、移动端导入与六套配置编译器已纳入；非六引擎原生运行验收 |
 | `crates/`、`contracts/` | 服务端 Rust workspace 与共享管理契约 | 已纳入源码；新目录完整构建与运行验收待完成 |
 | `flutter/apps/vp_admin/` | Web 管理端，保留所需 `flutter/packages/` | 已纳入源码及所需五个共享包；不含旧 Flutter 客户端 |
 | `tools/install/` | 安装、打包、升级与运维工具 | 已纳入源码；无正式线上安装发行版 |
