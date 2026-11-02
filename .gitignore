@@ -1,0 +1,28 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+# Reproducible intermediates
+**/target/
+**/build/
+**/.dart_tool/
+**/__pycache__/
+*.pyc
+# Runtime state and downloaded artifacts
+.local/
+.cache/
+*.sqlite
+*.sqlite3
+*.db
+# Rebuilt pinned core checkout
+/integration/vp_core/
+# Operating system/editor state
+.DS_Store
+.idea/
+/.local-cache/
+/.toolchains/
+/flutter/evidence/
