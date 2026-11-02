@@ -5,7 +5,7 @@
 ## 已纳入范围
 
 - 私有主仓：`vickkk-kkk/vp-product`。
-- 公开客户端 fork：`vickkk-kkk/vpn-parser`；gitlink 固定 `cf3bfcf8fc70518e75d036bd4db72fcee8713541`，模式 `160000`。这是上游基线，尚不包含未提交的共享业务层改造。
+- 公开客户端 fork：`vickkk-kkk/vpn-parser`；gitlink 固定 `cf3bfcf8fc70518e75d036bd4db72fcee8713541`，模式 `160000`。这是上游基线；共享业务层改造已发布到 `work/client-foundation` 分支，提交 [`7464ca00f0b85f350c37f0dffc4bf8b1f1471a56`](https://github.com/vickkk-kkk/vpn-parser/commit/7464ca00f0b85f350c37f0dffc4bf8b1f1471a56)，尚未合并，主仓 gitlink 也未推进。
 - 服务端与共享库：根 Cargo workspace、`crates/`、`contracts/`、核心锁与补丁。
 - 管理 Web：`flutter/apps/vp_admin/` 和 `vp_contracts`、`vp_design_system`、`vp_features`、`vp_runtime_platform`、`vp_api_client` 五个共享包。
 - 部署工具：`tools/install/` 的本地 bundle 与生命周期源码，以及 `tools/core/` 的核心重建工具。没有由此安装或部署服务。
@@ -22,12 +22,17 @@
 
 | 对象 | 已有检查 | 不代表什么 |
 | --- | --- | --- |
-| 客户端 submodule | URL、完整提交、`160000` 模式核对 | 不代表客户端改造已推送或已编译 |
-| 客户端共享业务层改造 | 字节一致的独立快照中，18 个纯逻辑测试通过 | 不是完整 fork、桌面运行或移动端构建验收 |
+| 客户端 submodule | URL、完整提交、`160000` 模式核对 | 不代表已绑定候选改造或完成完整客户端编译 |
+| 客户端共享业务层改造 | 独立 core/facade 范围以常规 Cargo、Rust 1.88 执行，24 个测试通过（12 原有 + 6 配置 + 6 DTO/parser） | 不是完整 workspace、GUI 或原生 VPN 验收；完整客户端与平台验证仍待完成 |
+| 原始 fork 根目录 Linux headless 测试 | Rust 1.88 常规编译测试 harness，根 features=[]；同一个隐私修复测试 ELF 上，8 个指定测试通过（3 个诊断测试 + 原有 5 个纯内核辅助逻辑、验证器和版本分类测试） | 不是 GUI 构建、完整测试套件或平台验收；未启动主程序、应用或引擎运行时 |
 | 导入源码 | 源文件摘要、Python AST、TOML/JSON、核心补丁哈希检查 | 不是 Rust/Web 构建或部署验证 |
 | 核心流水线工具 | 20 个合成 Git 仓库单元测试通过 | 不是实际核心补丁重放或协议互通 |
 
-归集目录下尚未完成 Rust 构建、真实核心重放、Flutter 构建/API 联调、协议互通、移动平台验收和部署。秘密特征扫描及文件审查不能作为绝无秘密或已完成安全认证的保证。
+当前候选包含 `collector/mod.rs` 的诊断日志修复；其父提交为初始业务层候选 `e0e6f247431dd0444d39ee3dc782949e14414439`。修复仅覆盖该模块日志，存储与 UI 错误未改变，不代表全应用隐私整改。没有运行实时 collector、网络请求、主程序或 GUI。24 个独立 core/facade 测试对应的源码未被该日志修复改变。
+
+客户端验证对应已发布候选 `7464ca00f0b85f350c37f0dffc4bf8b1f1471a56` 的源码；8 个指定测试使用同一测试 ELF，测试前后代码、锁文件和 ELF 摘要保持一致。编译告警已保留，不宣称 warning-clean。主仓 gitlink 仍未推进。
+
+服务端归集目录下尚未完成 Rust 构建与真实核心重放；Flutter 构建/API 联调、客户端 GUI 构建、协议互通、移动平台验收和部署也仍待完成。秘密特征扫描及文件审查不能作为绝无秘密或已完成安全认证的保证。
 
 ## 公开测试材料例外
 

@@ -31,7 +31,7 @@ flowchart TB
 
 | 入口 | 负责什么 | 本轮落地状态 |
 | --- | --- | --- |
-| `client/` | 客户端 fork；桌面界面、共享业务层及未来移动端适配 | 已绑定上游基线提交，尚不含未提交的客户端改造 |
+| `client/` | 客户端 fork；桌面界面、共享业务层及未来移动端适配 | 已绑定上游基线；改造已发布到候选分支，未合并且未推进 gitlink |
 | `crates/`、`contracts/` | 服务端 Rust workspace 与共享管理契约 | 已纳入源码；新目录完整构建与运行验收待完成 |
 | `flutter/apps/vp_admin/` | Web 管理端，保留所需 `flutter/packages/` | 已纳入源码及所需五个共享包；不含旧 Flutter 客户端 |
 | `tools/install/` | 安装、打包、升级与运维工具 | 已纳入源码；无正式线上安装发行版 |
