@@ -5,7 +5,7 @@
 ## 已纳入范围
 
 - 私有主仓：`vickkk-kkk/vp-product`。
-- 公开客户端 fork：`vickkk-kkk/vpn-parser`；gitlink 固定 [`d1a72b2a871295bbd556cf36728ebc56cfb784e1`](https://github.com/vickkk-kkk/vpn-parser/commit/d1a72b2a871295bbd556cf36728ebc56cfb784e1)，模式 `160000`。该提交来自 `work/client-foundation`，包含共享业务层、完整 parser 抽取、更新器保护、移动端导入与字体资产，以及六套共享配置编译器；上游来源基线仍为 `cf3bfcf8fc70518e75d036bd4db72fcee8713541`。
+- 公开客户端 fork：`vickkk-kkk/vpn-parser`；gitlink 固定 [`09f1bbbe02d39be13a6119059845485a1d06738d`](https://github.com/vickkk-kkk/vpn-parser/commit/09f1bbbe02d39be13a6119059845485a1d06738d)，模式 `160000`。该提交来自 `work/client-foundation`，包含共享业务层、完整 parser 抽取、更新器保护、移动端导入与字体资产，以及六套共享配置编译器和移动端配置预览；上游来源基线仍为 `cf3bfcf8fc70518e75d036bd4db72fcee8713541`。
 - 服务端与共享库：根 Cargo workspace、`crates/`、`contracts/`、核心锁与补丁。
 - 管理 Web：`flutter/apps/vp_admin/` 和 `vp_contracts`、`vp_design_system`、`vp_features`、`vp_runtime_platform`、`vp_api_client` 五个共享包。
 - 部署工具：`tools/install/` 的本地 bundle 与生命周期源码，以及 `tools/core/` 的核心重建工具。没有由此安装或部署服务。
@@ -24,17 +24,19 @@
 | --- | --- | --- |
 | 客户端 submodule | URL、完整提交、`160000` 模式核对 | 已绑定定制源码，不代表完成 GUI 或平台验收 |
 | 客户端共享业务层改造 | 实际 workspace 的 core 默认测试 102 项通过（76 单元 + 26 集成），其中一个隔离 golden 测试对比六套编译器与旧实现的合成配置输出 | 不是完整 workspace、GUI 或原生 VPN 验收；完整客户端与平台验证仍待完成 |
-| 原始 fork 根目录 Linux headless 测试 | Rust 1.88 常规编译测试 harness，根 features=[]；当前编译器提交经过常规增量编译，11 个指定纯逻辑测试通过（原有 8 项 + 3 项更新器保护测试） | 不是 GUI 构建、完整测试套件或平台验收；未启动主程序、应用或引擎运行时 |
-| 移动端共享逻辑 | 新 core 上重跑 15 项移动端测试通过 | 不是 Android/iOS 原生 VPN 或设备验收 |
+| 原始 fork 根目录 Linux headless 测试 | Rust 1.88 常规编译测试 harness，根 features=[]；此前编译器提交经过常规增量编译，11 个指定纯逻辑测试通过（原有 8 项 + 3 项更新器保护测试）；相关代码未被本次预览改动改变 | 不是 GUI 构建、完整测试套件或平台验收；未启动主程序、应用或引擎运行时 |
+| 移动端共享逻辑 | 移动端默认纯逻辑测试 27 项通过（12 配置预览 + 15 既有）；67 包依赖图未变 | 不是 Android/iOS 原生 VPN 或设备验收 |
 | 字体资产 | ab_glyph 对 63 个字形的软件栅格检查通过 | 不是 egui 渲染、界面截图或原生平台验收 |
 | 导入源码 | 源文件摘要、Python AST、TOML/JSON、核心补丁哈希检查 | 不是 Rust/Web 构建或部署验证 |
 | 核心流水线工具 | 20 个合成 Git 仓库单元测试通过 | 不是实际核心补丁重放或协议互通 |
 
-当前源码检查点为 `d1a72b2a871295bbd556cf36728ebc56cfb784e1`。实际 workspace 的 core 默认测试 102 项通过，根目录 Linux headless 常规增量编译后 11 个指定测试通过，移动端共享逻辑在新 core 上重跑 15 项测试通过。六套配置编译器已抽到共享层；这不等于六个引擎已接入移动端原生运行时。隔离 golden 测试只比较合成配置输出，不运行真实引擎。没有运行实时 collector、网络请求、主程序、GUI 或引擎运行时；编译告警保留，不宣称 warning-clean。
+当前源码检查点为 `09f1bbbe02d39be13a6119059845485a1d06738d`。此前实际 workspace 的 core 默认测试 102 项、根目录 Linux headless 的 11 个指定测试已通过，相关代码未被本次预览改动改变。当前移动端默认纯逻辑测试 27 项通过（12 配置预览 + 15 既有），67 包依赖图未变。六套配置编译器已抽到共享层；这不等于六个引擎已接入移动端原生运行时。隔离 golden 测试只比较合成配置输出，不运行真实引擎。没有运行实时 collector、网络请求、主程序、GUI 或引擎运行时；编译告警保留，不宣称 warning-clean。
+
+移动端源码已接入显式引擎与节点选择、经检查但不可直接运行的配置预览，以及凭据默认隐藏、明确选择后显示的交互。这些仅有源码接线与纯逻辑测试，不是 GUI、平台安全存储或原生运行验收。
 
 更新器保护已发布并纳入锁定提交；About 界面相关变更仅完成静态审查，尚未进行 GUI 编译。已有 `collector/mod.rs` 诊断日志修复仅覆盖该模块日志，存储与 UI 错误未改变，不代表全应用隐私整改。
 
-主仓通过精确 gitlink 绑定定制源码，后续 clone 将获取这个可复现的开发源码检查点。它不是可安装的二进制发行版，也不代表 GUI、原生 VPN 或完整平台验收通过。
+主仓通过精确 gitlink 绑定定制源码，后续 clone 将获取这个可复现的开发源码检查点。它是本轮源码交接检查点，不是可安装的二进制发行版；实际平台验证仍待所需授权与环境，不代表 GUI、原生 VPN 或完整平台验收通过。
 
 服务端归集目录下尚未完成 Rust 构建与真实核心重放；Flutter 构建/API 联调、客户端 GUI 构建、协议互通、移动平台验收和部署也仍待完成。秘密特征扫描及文件审查不能作为绝无秘密或已完成安全认证的保证。
 
