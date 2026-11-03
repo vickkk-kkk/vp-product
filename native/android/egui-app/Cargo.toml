@@ -1,0 +1,23 @@
+[package]
+name = "vp-egui-android-runtime-app"
+version = "0.1.0-dev.1"
+edition = "2021"
+publish = false
+
+[lib]
+name = "vp_client_android"
+crate-type = ["cdylib"]
+
+[target.'cfg(target_os = "android")'.dependencies]
+vp-client-mobile-ui = { path = "../../../client/crates/vp-client-mobile-ui", default-features = false, features = ["rendering"] }
+vp-client-core = { path = "../../../client/crates/vp-client-core" }
+vp-product-import = { path = "../../../crates/vp-import" }
+vp-product-domain = { path = "../../../crates/vp-domain" }
+vp-egui-android-jni = { path = "../egui-jni" }
+chrono = { version = "=0.4.45", default-features = false, features = ["clock", "std"] }
+uuid = { version = "=1.24.0", features = ["v4"] }
+eframe = { version = "=0.31.1", default-features = false, features = ["default_fonts", "glow", "android-native-activity"] }
+winit = { version = "=0.30.13", default-features = false, features = ["rwh_06", "android-native-activity"] }
+
+[workspace]
+resolver = "2"

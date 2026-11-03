@@ -18,9 +18,10 @@ The optional Gradle library module stages these sources and merges
 `AndroidManifest.xml`, declaring a non-exported consent Activity and the
 permission-protected service. It is enabled only by the client build's explicit
 `vpEguiRuntimeRoot` property. The host also needs the JNI host library and matching
-vp_core adapter library. This module does **not** connect the consent Activity to the UI, map imported
-profiles into the typed payload, or implement six engines. None of those missing
-steps should be inferred from a successful Kotlin compilation.
+vp_core adapter library. The experimental `egui-app` Rust entry now connects
+the UI to this bridge and maps a selected strict URI into a typed payload. It
+only attempts vp_core and does not implement six engines. None of this should be
+inferred to be working from a successful Kotlin compilation.
 
 `vp-product-import::mobile::encode_ephemeral` now produces an ABI-v2 request
 from a selected strict import, explicit numeric bootstrap and proxied-user DNS,
@@ -47,3 +48,5 @@ constructor requires the caller to keep the Activity/AndroidApp alive for the
 entire bridge lifetime. A locked offline host compile and two input/pointer
 tests pass; no JVM round-trip or Android target build has been performed.
 The Gradle module and APK manifest merge have not yet been built.
+The egui runtime entry and rendering UI have only passed source parsing and
+dependency-lock resolution, not Android compilation or device execution.
