@@ -93,3 +93,15 @@ not an artifact-exact SBOM. Registry notice candidates have been collected, but
 `ring` 0.16.20 uses a composite license file rather than a Cargo SPDX license
 expression; nested and native code still require review. VP-Core's missing
 complete upstream license and copyright notice remain an open distribution gate.
+
+## External-vantage client candidate
+
+The precompiled `vp-public-lab-client` accepts a private 0600 client export and
+an explicitly supplied server IPv4. After explicit credential-use and
+Cloudflare-probe confirmations, it attempts HTTPS status checks through all
+three listeners. It prints protocol and `passed` or `not_verified` only.
+`not_verified` cannot distinguish authentication rejection from connectivity
+failure. This client reuses VP-Core and is **not** independent interoperability
+evidence. Moving the credential export to another machine requires specific
+authorization and a secure channel; never move the vault master key for this.
+No external client or public VPS test has yet been completed.

@@ -32,8 +32,10 @@ UDP or IPv6. The test CA is private and short-lived. The process runs in the
 foreground and does not currently support restart or upgrade. Do not claim
 these unsupported functions passed.
 
-Validate each listener with a genuine compatible client and the product's
-own created credentials. Positive authentication and an independent HTTPS
+Use the packaged `vp-lab client` from an authorized external machine to
+validate all three listeners with the product-created credentials; this uses the
+same core and is not independent client interoperability. Where available, also
+use a genuinely independent compatible client. Positive authentication and an independent HTTPS
 request through each tunnel must both be measured. Where safely possible,
 verify wrong credentials are rejected and verify forbidden targets are blocked.
 Distinguish a local process check from a request entering over the public VPS

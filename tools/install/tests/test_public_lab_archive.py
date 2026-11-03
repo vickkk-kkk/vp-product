@@ -7,7 +7,7 @@ class PublicLabArchiveTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix='vp-archive-test-')
         self.root = pathlib.Path(self.temp.name)
         with tarfile.open(os.environ['VP_PUBLIC_LAB_CANDIDATE'], 'r:gz') as archive:
-            expected={'README.zh-CN.md','vp-lab','vp-public-lab','vp-core-server-worker-v2','manifest.json','NOT_FOR_DISTRIBUTION.txt'}
+            expected={'README.zh-CN.md','vp-lab','vp-public-lab','vp-core-server-worker-v2','vp-public-lab-client','manifest.json','NOT_FOR_DISTRIBUTION.txt'}
             self.assertEqual(set(archive.getnames()), expected)
             self.assertTrue(all(m.isfile() for m in archive.getmembers()))
             archive.extractall(self.root, filter='data')
@@ -67,6 +67,16 @@ class PublicLabArchiveTest(unittest.TestCase):
             self.assertIn('BIND_UNAVAILABLE',result.stderr)
             self.assertEqual(list(session.iterdir()),[])
         finally: occupied.close()
+    def test_client_entry_requires_explicit_confirmation(self):
+        before=set(self.root.iterdir()); result=self.command('client')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('CONFIRMATION_REQUIRED',result.stderr)
+        self.assertEqual(before,set(self.root.iterdir()))
+    def test_client_build_identity_is_nonfixture_and_offline(self):
+        result=self.command('client','--check-build')
+        self.assertEqual(result.returncode,0,result.stderr)
+        info=json.loads(result.stdout)
+        self.assertFalse(info['testFixture']);self.assertFalse(info['networkAccess']);self.assertFalse(info['writesState'])
     def test_tampering_and_unsafe_permissions_refused(self):
         worker=self.root/'vp-core-server-worker-v2';worker.chmod(0o722)
         self.assertNotEqual(self.command('check').returncode,0)

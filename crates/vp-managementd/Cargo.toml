@@ -62,3 +62,8 @@ version = "=0.3.4"
 
 [dev-dependencies]
 tempfile = "=3.19.1"
+
+[[bin]]
+name = "vp-public-lab-client"
+path = "src/bin/public_lab_client.rs"
+required-features = ["experimental-public"]
