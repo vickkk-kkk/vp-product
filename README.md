@@ -12,7 +12,7 @@
 
 本分支包含一个前台运行的 VP-Core 服务端实验入口，目标是让测试者下载预编译包后直接验收。实验预发布版仅供测试，**尚未在 VPS 完成验证**。
 
-- 实验范围：Trojan TLS/TCP、VLESS WebSocket/TLS 和 Shadowsocks AES-128-GCM/TCP；出站限制为明确允许的 IPv4 TCP 目标。
+- 实验范围：Trojan TLS/TCP、VLESS WebSocket/TLS、Shadowsocks AES-128-GCM/TCP，以及开发分支中可选的 VMess WebSocket/TLS；出站限制为明确允许的 IPv4 TCP 目标。已发布的 v0.1.0-lab.1 仍只有前三种。
 - 当前边界：只支持新建隔离会话和前台运行；自动重启、升级、通用 VPN、UDP 和 IPv6 尚未实现。
 - [实验部署入口与安全说明](docs/implementation/PUBLIC_LAB_CANDIDATE.md) · [单 IP 探测设计](docs/implementation/SINGLE_IP_PROBE_EXPERIMENT.md) · [VPS 验收草案](docs/implementation/VPS_ACCEPTANCE_DRAFT.md)
 - 核心代码按 `core-lock.json` 与 `patches/vp_core/` 锁定；开发构建需要按 [核心流水线说明](tools/core/README.md) 重建核心工作树。客户端仍由 `client/` submodule 固定。

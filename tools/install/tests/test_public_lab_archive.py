@@ -50,6 +50,14 @@ class PublicLabArchiveTest(unittest.TestCase):
         self.assertNotEqual(result.returncode,0)
         self.assertIn('BIND_UNAVAILABLE',result.stderr)
         self.assertEqual(list(session.iterdir()),[])
+    def test_optional_vmess_port_is_forwarded_and_conflicts_are_rejected(self):
+        session=self.root/'session'; session.mkdir(mode=0o700)
+        result=self.command('run','--session-root',str(session),'--bind-ip','192.0.2.1',
+            '--trojan-port','34111','--vless-port','34112','--ss-port','34113','--vmess-port','34111',
+            '--confirm-test-access','--confirm-cloudflare-probe')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('INVALID_ARGUMENT',result.stderr)
+        self.assertEqual(list(session.iterdir()),[])
     def test_full_run_arguments_reach_occupied_port_check_without_state(self):
         route=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
         try:
