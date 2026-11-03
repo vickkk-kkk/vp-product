@@ -84,6 +84,7 @@ class AndroidNetworkMonitor(context: Context, private val observer: (SelectedNet
             }
             phase == Phase.ACTIVE && healthy
         } catch (_: Exception) {
+            phase = Phase.CLOSING
             selected = null; emitLocked(null)
             try { manager.unregisterNetworkCallback(callback) } catch (_: Exception) { }
             phase = Phase.UNCERTAIN; failLocked(); false
