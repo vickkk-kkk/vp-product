@@ -21,6 +21,24 @@ discards an instance-close error, so `Bind` requires a separate `confirmClosed`
 callback. An unconfirmed stop blocks another start. The Android UI does not bind
 this experiment and still reports sing-box unavailable.
 
+Binding requires an initially confirmed stopped engine/TUN, a config validator,
+and exclusive ownership of the server. The package refuses a second binding of
+the same server for the process lifetime; it cannot stop code outside this
+package from using a retained server pointer. Stopping during startup requests
+context cancellation and upstream interruption, then waits for startup and the
+interrupt attempt before another stop and independent confirmation. Neither Go
+context cancellation nor upstream interruption guarantees a hung start returns.
+Because upstream discards its instance reference and ignores close errors, a
+later stop might not recover leaked resources; an unconfirmed state requires
+host-level recovery and must never be reported as stopped. The host also remains
+responsible for eventual full CommandServer/recorder destruction.
+
+The validator must be pure, must reject unsupported routes, listeners, DNS,
+storage and insecure TLS, and must not retain or log the supplied configuration.
+The same immutable string that passed validation is sent to the starter. The
+caller must not mutate its byte buffer while `Start` is making its private copy.
+Neither a production validator nor Android platform implementation exists yet.
+
 `go test` without tags tests only the local lifecycle with synthetic callbacks;
 it does not compile sing-box or prove upstream behavior. Source was formatted
 and parsed with Go 1.26.10. Tests were attempted but stopped at the temporary

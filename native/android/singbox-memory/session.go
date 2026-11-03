@@ -12,11 +12,12 @@ import (
 )
 
 var (
-	ErrInvalid   = errors.New("invalid request")
-	ErrBusy      = errors.New("session busy")
-	ErrStart     = errors.New("start failed; cleanup required")
-	ErrStop      = errors.New("stop not confirmed")
-	ErrCancelled = errors.New("request cancelled")
+	ErrInvalid     = errors.New("invalid request")
+	ErrBusy        = errors.New("session busy")
+	ErrStart       = errors.New("start failed; cleanup required")
+	ErrStop        = errors.New("stop not confirmed")
+	ErrStopPending = errors.New("stop requested while starting")
+	ErrCancelled   = errors.New("request cancelled")
 )
 
 type State uint8
@@ -33,23 +34,27 @@ const (
 // copies; callers must not assume memory erasure. The started state is NOT a
 // connectivity, DNS, TUN or leak verification.
 type Session struct {
-	mu    sync.Mutex
-	state State
-	start func(context.Context, string) error
-	stop  func() error
+	mu              sync.Mutex
+	state           State
+	start           func(context.Context, string) error
+	stop            func() error
+	validate        func(string) error
+	cancelRequested bool
+	interruptDone   chan struct{}
+	cancelStart     context.CancelFunc
 }
 
-func newSession(start func(context.Context, string) error, stop func() error) (*Session, error) {
-	if start == nil || stop == nil {
+func newSession(start func(context.Context, string) error, stop func() error, validate func(string) error) (*Session, error) {
+	if start == nil || stop == nil || validate == nil {
 		return nil, ErrInvalid
 	}
-	return &Session{start: start, stop: stop}, nil
+	return &Session{start: start, stop: stop, validate: validate}, nil
 }
 
 // NewVerified refuses to treat a successful stop call as proof of cleanup.
 // The host must independently verify that its exact engine and TUN are absent.
-func NewVerified(start func(context.Context, string) error, stop func() error, confirmClosed func() bool) (*Session, error) {
-	if stop == nil || confirmClosed == nil {
+func NewVerified(start func(context.Context, string) error, stop func() error, confirmClosed func() bool, validate func(string) error) (*Session, error) {
+	if stop == nil || confirmClosed == nil || validate == nil {
 		return nil, ErrInvalid
 	}
 	return newSession(start, func() error {
@@ -60,7 +65,7 @@ func NewVerified(start func(context.Context, string) error, stop func() error, c
 			return ErrStop
 		}
 		return nil
-	})
+	}, validate)
 }
 func (s *Session) State() State { s.mu.Lock(); defer s.mu.Unlock(); return s.state }
 
@@ -69,7 +74,18 @@ func (s *Session) State() State { s.mu.Lock(); defer s.mu.Unlock(); return s.sta
 // Cancellation is checked before calling the backend, but does not guarantee
 // interruption of a backend already starting; the caller must stop explicitly.
 func (s *Session) Start(ctx context.Context, config []byte) (err error) {
-	if ctx == nil || len(config) == 0 || len(config) > 1_048_576 || !utf8.Valid(config) || !json.Valid(config) {
+	if ctx == nil || len(config) == 0 || len(config) > 1_048_576 {
+		return ErrInvalid
+	}
+	// Validate and start from the same private copy, never from a mutable caller
+	// buffer after validation. Best-effort clear; upstream Go strings can remain.
+	snapshot := append([]byte(nil), config...)
+	defer clear(snapshot)
+	if !utf8.Valid(snapshot) || !json.Valid(snapshot) {
+		return ErrInvalid
+	}
+	content := string(snapshot)
+	if invokeValidate(s.validate, content) {
 		return ErrInvalid
 	}
 	if ctx.Err() != nil {
@@ -85,16 +101,50 @@ func (s *Session) Start(ctx context.Context, config []byte) (err error) {
 		return ErrCancelled
 	}
 	s.state = Starting
+	s.cancelRequested = false
+	s.interruptDone = nil
+	runCtx, cancel := context.WithCancel(ctx)
+	s.cancelStart = cancel
 	s.mu.Unlock()
-	failed := invokeStart(s.start, ctx, string(config))
+	failed := invokeStart(s.start, runCtx, content)
 	s.mu.Lock()
+	if s.cancelRequested {
+		s.cancelStart = nil
+		cancel()
+		done := s.interruptDone
+		s.state = Stopping
+		s.mu.Unlock()
+		// The interrupt can race ahead of the actual start. Wait for both the
+		// start and interrupt to return, then stop and verify again.
+		<-done
+		stopFailed := invokeStop(s.stop)
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if stopFailed {
+			s.state = StopUncertain
+			return ErrStop
+		}
+		s.state = Idle
+		return ErrCancelled
+	}
 	defer s.mu.Unlock()
 	if failed {
+		s.cancelStart = nil
+		cancel()
 		s.state = StopUncertain
 		return ErrStart
 	}
 	s.state = StartedUnverified
 	return nil
+}
+
+func invokeValidate(f func(string) error, config string) (failed bool) {
+	defer func() {
+		if recover() != nil {
+			failed = true
+		}
+	}()
+	return f(config) != nil
 }
 
 // Stop is explicit. Failure leaves the session blocked until a later Stop
@@ -105,9 +155,28 @@ func (s *Session) Stop() (err error) {
 		s.mu.Unlock()
 		return nil
 	}
+	if s.state == Starting {
+		if !s.cancelRequested {
+			s.cancelRequested = true
+			if s.cancelStart != nil {
+				s.cancelStart()
+			}
+			done := make(chan struct{})
+			s.interruptDone = done
+			// Upstream CloseService first requests start interruption. Its
+			// result is not treated as teardown proof; final cleanup follows.
+			go func() { invokeStop(s.stop); close(done) }()
+		}
+		s.mu.Unlock()
+		return ErrStopPending
+	}
 	if s.state != StartedUnverified && s.state != StopUncertain {
 		s.mu.Unlock()
 		return ErrBusy
+	}
+	if s.cancelStart != nil {
+		s.cancelStart()
+		s.cancelStart = nil
 	}
 	s.state = Stopping
 	s.mu.Unlock()
