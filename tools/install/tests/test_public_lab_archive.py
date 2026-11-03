@@ -1,5 +1,5 @@
 """Run against an explicitly provided local lab candidate archive, not a release test."""
-import json, os, pathlib, socket, subprocess, tarfile, tempfile, unittest
+import hashlib, json, os, pathlib, socket, subprocess, tarfile, tempfile, unittest
 
 @unittest.skipUnless(os.environ.get('VP_PUBLIC_LAB_CANDIDATE'), 'candidate archive not supplied')
 class PublicLabArchiveTest(unittest.TestCase):
@@ -15,6 +15,11 @@ class PublicLabArchiveTest(unittest.TestCase):
     def tearDown(self): self.temp.cleanup()
     def command(self, *args):
         return subprocess.run([str(self.launcher), *args], capture_output=True, text=True, timeout=30)
+    def test_license_evidence_hash_matches_manifest(self):
+        manifest=json.loads((self.root/'manifest.json').read_text())
+        evidence=(self.root/'license-candidate-evidence.tar.gz').read_bytes()
+        self.assertEqual(hashlib.sha256(evidence).hexdigest(),manifest['license_evidence_sha256'])
+        self.assertTrue((self.root/'LICENSE_STATUS.zh-CN.md').is_file())
     def test_check_runs_and_does_not_claim_certification(self):
         result=self.command('check')
         self.assertEqual(result.returncode,0, result.stderr)
