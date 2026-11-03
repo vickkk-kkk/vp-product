@@ -7,7 +7,7 @@ class PublicLabArchiveTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix='vp-archive-test-')
         self.root = pathlib.Path(self.temp.name)
         with tarfile.open(os.environ['VP_PUBLIC_LAB_CANDIDATE'], 'r:gz') as archive:
-            expected={'README.zh-CN.md','vp-lab','vp-public-lab','vp-core-server-worker-v2','vp-public-lab-client','manifest.json','NOT_FOR_DISTRIBUTION.txt'}
+            expected={'README.zh-CN.md','LICENSE_STATUS.zh-CN.md','license-candidate-evidence.tar.gz','vp-lab','vp-public-lab','vp-core-server-worker-v2','vp-public-lab-client','manifest.json','NOT_FOR_DISTRIBUTION.txt'}
             self.assertEqual(set(archive.getnames()), expected)
             self.assertTrue(all(m.isfile() for m in archive.getmembers()))
             archive.extractall(self.root, filter='data')
