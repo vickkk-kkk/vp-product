@@ -72,6 +72,15 @@ class PublicLabArchiveTest(unittest.TestCase):
         self.assertNotEqual(result.returncode,0)
         self.assertIn('CONFIRMATION_REQUIRED',result.stderr)
         self.assertEqual(before,set(self.root.iterdir()))
+    def test_invalid_client_file_never_echoes_secret(self):
+        private=self.root/'private.json'; marker='synthetic-sensitive-test-value'
+        private.write_text('{"trojanPassword":"'+marker+'"}')
+        private.chmod(0o600)
+        result=self.command('client','--credentials-file',str(private),'--server-ip','192.0.2.1',
+                            '--confirm-credential-use','--confirm-cloudflare-probe')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('INVALID_CLIENT_FILE',result.stderr)
+        self.assertNotIn(marker,result.stdout+result.stderr)
     def test_client_build_identity_is_nonfixture_and_offline(self):
         result=self.command('client','--check-build')
         self.assertEqual(result.returncode,0,result.stderr)
