@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """Build a local-only experimental lab archive, not a distributable release."""
-import argparse, hashlib, io, json, os, pathlib, stat, subprocess, tarfile, tempfile
+import argparse, hashlib, io, json, os, pathlib, re, stat, subprocess, tarfile, tempfile
 from vp_elf_abi import inspect_reviewed_elf
 
 p = argparse.ArgumentParser()
 p.add_argument('--lab', required=True, type=pathlib.Path)
 p.add_argument('--worker', required=True, type=pathlib.Path)
 p.add_argument('--output', required=True, type=pathlib.Path)
+p.add_argument('--source-commit', required=True)
+p.add_argument('--source-tree', required=True)
 a = p.parse_args()
+if any(not re.fullmatch(r'[0-9a-f]{40}', value) for value in (a.source_commit,a.source_tree)):
+    raise ValueError('source commit and tree must be full Git object IDs')
 
 def capture(path):
     metadata = inspect_reviewed_elf(path)
@@ -85,9 +89,10 @@ if [ "$MODE" = check ]; then
 fi
 exec "$D/vp-public-lab" --worker "$D/vp-core-server-worker-v2" --worker-sha256 '@WORKER_HASH@' "$@"
 '''.replace('@LAB_HASH@', lm['sha256']).replace('@WORKER_HASH@', wm['sha256']).replace('@FLOOR@', floor).encode()
-manifest = json.dumps({'kind':'LOCAL_ONLY_NOT_A_RELEASE','architecture':'x86_64','minimum_glibc':floor,'binaries':{'vp-public-lab':lm,'vp-core-server-worker-v2':wm},'warning':'Development builds; no VPS validation; license inventory incomplete.'}, indent=2).encode()+b'\n'
+manifest = json.dumps({'kind':'LOCAL_ONLY_NOT_A_RELEASE','architecture':'x86_64','minimum_glibc':floor,'declared_source_commit':a.source_commit,'declared_source_tree':a.source_tree,'source_identity_note':'Caller must independently verify source tree and build provenance.','binaries':{'vp-public-lab':lm,'vp-core-server-worker-v2':wm},'warning':'Development builds; no VPS validation; license inventory incomplete.'}, indent=2).encode()+b'\n'
 notice = b'LOCAL EXPERIMENT ONLY. NOT A RELEASE. DO NOT DISTRIBUTE. License inventory and upstream license evidence are incomplete. No VPS validation has been performed.\n'
-files = [('vp-lab',launcher,0o700),('vp-public-lab',lab,0o700),('vp-core-server-worker-v2',worker,0o700),('manifest.json',manifest,0o600),('NOT_FOR_DISTRIBUTION.txt',notice,0o600)]
+readme = (pathlib.Path(__file__).parent / 'PUBLIC_LAB_README.zh-CN.md').read_bytes()
+files = [('README.zh-CN.md',readme,0o600),('vp-lab',launcher,0o700),('vp-public-lab',lab,0o700),('vp-core-server-worker-v2',worker,0o700),('manifest.json',manifest,0o600),('NOT_FOR_DISTRIBUTION.txt',notice,0o600)]
 fd = os.open(a.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
 try:
     with os.fdopen(fd, 'wb') as out, tarfile.open(fileobj=out, mode='w:gz') as tar:
