@@ -5,13 +5,35 @@ import android.content.Intent
 import android.net.VpnService
 import android.os.Build
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONObject
 
 /** Explicit in-process boundary for the egui host. No Intent carries credentials.
  * Call prepareIntent on the Activity/UI thread and start only after user consent. */
 object EguiVpnBridge {
+    internal val consentInFlight = AtomicBoolean(false)
+    @Volatile internal var consentResult: String = "unknown"
     @JvmStatic fun prepareIntent(context: Context): Intent? = VpnService.prepare(context)
     @JvmStatic fun available(): Boolean = NativeRuntime.available()
+
+    /** User-initiated only. Consent never starts a tunnel automatically. */
+    @JvmStatic fun requestConsent(context: Context): Boolean {
+        if (!NativeRuntime.available() || !consentInFlight.compareAndSet(false, true)) return false
+        consentResult = "pending"
+        return try {
+            val intent = Intent(context, EguiVpnConsentActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(intent)
+            true
+        } catch (_: Exception) {
+            consentResult = "unavailable"
+            consentInFlight.set(false)
+            false
+        }
+    }
+
+    @JvmStatic fun consentStatus(context: Context): String = try {
+        if (VpnService.prepare(context) == null) "granted" else consentResult
+    } catch (_: Exception) { "unavailable" }
 
     @Synchronized @JvmStatic fun startWithPayload(context: Context, payload: String): Boolean {
         if (VpVpnService.current != null || VpVpnService.pendingStart != null) return false
