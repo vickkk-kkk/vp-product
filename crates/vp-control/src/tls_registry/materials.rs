@@ -420,7 +420,7 @@ impl<'a> TlsMaterialAdmission<'a> {
                         self.pair(certificate_ref, private_key_ref, 65536, 65536)?;
                         for user in users.iter().filter(|u| u.enabled) { self.password(&user.credential_ref, 4096)?; }
                     }
-                    (Protocol::Vless { flow: None }, Transport::Ws { .. }, ServerSecurity::Tls { certificate_ref, private_key_ref, .. }) => {
+                    (Protocol::Vless { flow: None } | Protocol::Vmess { cipher: vp_product_domain::VmessCipher::Auto, alter_id: 0 }, Transport::Ws { .. }, ServerSecurity::Tls { certificate_ref, private_key_ref, .. }) => {
                         self.pair(certificate_ref, private_key_ref, 65536, 65536)?;
                         for user in users.iter().filter(|u| u.enabled) {
                             self.experimental_server_credential_at(&user.credential_ref, &NodeCredentialKind::Uuid {}, 4096, self.deadline, &|| false)?;
@@ -516,6 +516,7 @@ impl<'a> TlsMaterialAdmission<'a> {
                     let allowed = matches!(
                         (protocol, &listener.transport, &listener.security, kind),
                         (Protocol::Vless { flow: None }, Transport::Ws { .. }, ServerSecurity::Tls { .. }, NodeCredentialKind::Uuid {})
+                        | (Protocol::Vmess { cipher: vp_product_domain::VmessCipher::Auto, alter_id: 0 }, Transport::Ws { .. }, ServerSecurity::Tls { .. }, NodeCredentialKind::Uuid {})
                         | (Protocol::Shadowsocks { method: ShadowsocksCipher::Aes128Gcm }, Transport::Tcp {}, ServerSecurity::None {}, NodeCredentialKind::Shadowsocks { method: ShadowsocksCipher::Aes128Gcm })
                     );
                     if !allowed { return Err(ControlError::PermissionDenied); }

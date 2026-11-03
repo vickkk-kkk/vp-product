@@ -9,7 +9,7 @@ successful local unit test as a successful VPS deployment.
 ## What this experiment covers
 
 - One fresh, isolated foreground instance with Trojan TLS/TCP, VLESS WebSocket
-  over TLS, and Shadowsocks AES-128-GCM/TCP.
+  over TLS, Shadowsocks AES-128-GCM/TCP, and optional VMess WebSocket/TLS.
 - Exact, explicitly listed public IPv4 and port destinations only. Domains,
   IPv6, UDP and arbitrary public destinations are not supported by this profile.
 - A short-lived test CA and leaf certificate, generated for `vp-lab.invalid`.
@@ -57,7 +57,7 @@ platform compatibility. A bundle must also check architecture, libc, kernel
 and all file hashes before executing its binaries.
 
 After consent, the foreground command takes `--session-root`, `--worker`,
-`--worker-sha256`, `--bind-ip`, three explicit TCP ports, any additional
+`--worker-sha256`, `--bind-ip`, three explicit TCP ports, an optional fourth VMess port, any additional
 `--target IPV4:PORT` destinations, `--confirm-test-access`, and either
 `--confirm-cloudflare-probe` or the complete custom probe parameters and
 `--confirm-custom-probe`. Run `vp-public-lab --help` for the full argument list.
@@ -98,8 +98,8 @@ complete upstream license and copyright notice remain an open distribution gate.
 
 The precompiled `vp-public-lab-client` accepts a private 0600 client export and
 an explicitly supplied server IPv4. After explicit credential-use and
-Cloudflare-probe confirmations, it attempts HTTPS status checks through all
-three listeners. It prints protocol and `passed` or `not_verified` only.
+Cloudflare-probe confirmations, it attempts HTTPS status checks through the three default listeners and the optional
+VMess listener. It prints protocol and `passed` or `not_verified` only.
 `not_verified` cannot distinguish authentication rejection from connectivity
 failure. This client reuses VP-Core and is **not** independent interoperability
 evidence. Moving the credential export to another machine requires specific

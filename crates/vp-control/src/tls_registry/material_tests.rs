@@ -768,7 +768,7 @@ fn experimental_typed_credential_read_does_not_widen_trojan_admission() {
 #[cfg(feature = "experimental-public")]
 #[test]
 fn public_material_staging_is_plan_bound_and_typed() {
-    for case in 0..3 {
+    for case in 0..4 {
         let m = material(true, 2024, 2026);
         let c = clock();
         let (mut l, v, op) = staged(&m, &c);
@@ -776,11 +776,12 @@ fn public_material_staging_is_plan_bound_and_typed() {
         let (protocol, kind, secret) = match case {
             0 => (Protocol::Trojan {}, NodeCredentialKind::Password {}, b"synthetic-password".to_vec()),
             1 => (Protocol::Vless { flow: None }, NodeCredentialKind::Uuid {}, b"12345678-1234-1234-1234-123456789abc".to_vec()),
+            3 => (Protocol::Vmess { cipher: VmessCipher::Auto, alter_id: 0 }, NodeCredentialKind::Uuid {}, b"12345678-1234-1234-1234-123456789abc".to_vec()),
             _ => (Protocol::Shadowsocks { method: ShadowsocksCipher::Aes128Gcm }, NodeCredentialKind::Shadowsocks { method: ShadowsocksCipher::Aes128Gcm }, b"synthetic-ss-password".to_vec()),
         };
         l.e.state.secrets.credentials.values_mut().next().unwrap().summary.kind = kind.clone();
         let stored = match case {
-            1 => vp_product_domain::experimental_credential_frame::encode(vp_product_domain::experimental_credential_frame::CredentialFrameKind::Uuid, &secret).unwrap().expose().to_vec(),
+            1 | 3 => vp_product_domain::experimental_credential_frame::encode(vp_product_domain::experimental_credential_frame::CredentialFrameKind::Uuid, &secret).unwrap().expose().to_vec(),
             2 => vp_product_domain::experimental_credential_frame::encode(vp_product_domain::experimental_credential_frame::CredentialFrameKind::ShadowsocksAes128Gcm, &secret).unwrap().expose().to_vec(),
             _ => secret.clone(),
         };
@@ -790,7 +791,7 @@ fn public_material_staging_is_plan_bound_and_typed() {
         let listener = &mut body.config.listeners[0];
         listener.bind.address = "192.168.1.5".parse().unwrap();
         if let ServerProtocol::Proxy { protocol: p, .. } = &mut listener.protocol { *p = protocol; } else { panic!("proxy fixture"); }
-        if case == 1 { listener.transport = Transport::Ws { path: "/test".into(), host: None, early_data: None }; }
+        if case == 1 || case == 3 { listener.transport = Transport::Ws { path: "/test".into(), host: None, early_data: None }; }
         if case == 2 { listener.security = ServerSecurity::None {}; }
         body.validation.config_digest = crate::ContentDigest::of("vp.product-config.v1", &body.config).unwrap();
         let digest = crate::ContentDigest::bytes(b"public-artifact-fixture");
@@ -814,7 +815,7 @@ fn public_material_staging_is_plan_bound_and_typed() {
             assert_eq!(staged_bytes.expose(), secret.as_slice());
         }
         if case != 0 {
-            let wrong_kind = if case == 1 { NodeCredentialKind::Shadowsocks { method: ShadowsocksCipher::Aes128Gcm } } else { NodeCredentialKind::Uuid {} };
+            let wrong_kind = if case == 1 || case == 3 { NodeCredentialKind::Shadowsocks { method: ShadowsocksCipher::Aes128Gcm } } else { NodeCredentialKind::Uuid {} };
             assert!(admission.experimental_server_credential_at(&reference, &wrong_kind, 4096, deadline(), &|| false).is_err());
         }
         drop(admission);
@@ -840,10 +841,10 @@ fn public_material_staging_is_plan_bound_and_typed() {
             assert!(crate::RuntimeVerificationContext::from_verifying(&l, &op, plan, &c, &cancel).is_err());
         }
         if case != 0 {
-            let malformed = if case == 1 { b"12345678-1234-1234-1234-123456789ABc".to_vec() } else { b"bad\0password".to_vec() };
+            let malformed = if case == 1 || case == 3 { b"12345678-1234-1234-1234-123456789ABc".to_vec() } else { b"bad\0password".to_vec() };
             v.lock().unwrap().data.borrow_mut().insert(reference.as_str().into(), (1, 7, malformed));
             assert!(matches!(TlsMaterialAdmission::for_public_staging(&l, &v, &m.policy, &c, l.e.state.version, &op, deadline(), &cancel, &digest), Err(ControlError::InvalidConfiguration)));
-            let wrong_frame = if case == 1 {
+            let wrong_frame = if case == 1 || case == 3 {
                 vp_product_domain::experimental_credential_frame::encode(vp_product_domain::experimental_credential_frame::CredentialFrameKind::ShadowsocksAes128Gcm, &secret).unwrap()
             } else {
                 vp_product_domain::experimental_credential_frame::encode(vp_product_domain::experimental_credential_frame::CredentialFrameKind::Uuid, b"12345678-1234-1234-1234-123456789abc").unwrap()

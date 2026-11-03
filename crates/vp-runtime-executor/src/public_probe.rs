@@ -370,7 +370,7 @@ mod tests {
         assert!(VirtualProbe::observed(&snapshot, &token).is_err());
     }
     #[test]
-    fn independent_https_status_traverses_three_real_local_protocols() {
+    fn independent_https_status_traverses_four_real_local_protocols() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let target_cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let target_root = target_cert.cert.der().to_vec();
@@ -440,7 +440,7 @@ mod tests {
 
     #[cfg(feature = "local-probe-test")]
     #[test]
-    fn virtual_sink_observes_valid_and_invalid_auth_for_three_local_protocols() {
+    fn virtual_sink_observes_valid_and_invalid_auth_for_four_local_protocols() {
         let path = std::env::var_os("VP_TEST_VIRTUAL_WORKER").map(std::path::PathBuf::from)
             .unwrap_or_else(|| std::path::PathBuf::from(std::env::var("CARGO_TARGET_DIR").unwrap()).join("debug/vp-core-server-worker-v2"));
         let hash = format!("{:x}", Sha256::digest(std::fs::read(&path).unwrap()));

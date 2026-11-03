@@ -13,7 +13,7 @@ use vp_product_storage::{BoundDirectory, DirectoryIdentity, TlsSqliteStore};
 use zeroize::{Zeroize, Zeroizing};
 
 struct Options { session_root: Option<PathBuf>, control: PathBuf, vault: PathBuf, runtime: PathBuf, output: PathBuf, worker: PathBuf,
-    worker_sha: String, bind: Ipv4Addr, ports: [u16;3], targets: Vec<SocketAddr>, probe: SingleIpProbeConfig }
+    worker_sha: String, bind: Ipv4Addr, ports: [u16;3], vmess_port: Option<u16>, targets: Vec<SocketAddr>, probe: SingleIpProbeConfig }
 fn parse(mut args: impl Iterator<Item=String>) -> Result<Options, &'static str> {
     let mut values = BTreeMap::new(); let mut targets = Vec::new(); let mut create = false; let mut cloudflare = false; let mut custom_confirm = false;
     while let Some(key) = args.next() {
@@ -22,7 +22,7 @@ fn parse(mut args: impl Iterator<Item=String>) -> Result<Options, &'static str> 
         if key == "--confirm-custom-probe" { if custom_confirm { return Err("DUPLICATE_ARGUMENT"); } custom_confirm = true; continue; }
         let value = args.next().ok_or("MISSING_ARGUMENT")?;
         if key == "--target" { targets.push(value.parse::<SocketAddr>().map_err(|_| "INVALID_TARGET")?); continue; }
-        if !["--session-root","--control-root","--vault-root","--runtime-root","--output-root","--worker","--worker-sha256","--bind-ip","--trojan-port","--vless-port","--ss-port","--probe-target","--probe-name","--probe-path","--probe-status","--probe-ca-der"].contains(&key.as_str())
+        if !["--session-root","--control-root","--vault-root","--runtime-root","--output-root","--worker","--worker-sha256","--bind-ip","--trojan-port","--vless-port","--ss-port","--vmess-port","--probe-target","--probe-name","--probe-path","--probe-status","--probe-ca-der"].contains(&key.as_str())
             || values.insert(key, value).is_some() { return Err("INVALID_ARGUMENT"); }
     }
     if !create { return Err("CONFIRMATION_REQUIRED"); }
@@ -40,6 +40,8 @@ fn parse(mut args: impl Iterator<Item=String>) -> Result<Options, &'static str> 
     let bind: Ipv4Addr = take("--bind-ip")?.parse().map_err(|_| "INVALID_BIND")?;
     let mut port = |key| -> Result<u16, &'static str> { let n: u16 = take(key)?.parse().map_err(|_| "INVALID_PORT")?; if n == 0 { return Err("INVALID_PORT"); } Ok(n) };
     let ports = [port("--trojan-port")?, port("--vless-port")?, port("--ss-port")?];
+    let vmess_port = values.remove("--vmess-port").map(|v| v.parse::<u16>().map_err(|_| "INVALID_PORT")).transpose()?;
+    if vmess_port == Some(0) { return Err("INVALID_PORT"); }
     let custom_keys = ["--probe-target","--probe-name","--probe-path","--probe-status","--probe-ca-der"];
     let custom_count = custom_keys.iter().filter(|k| values.contains_key(**k)).count();
     let probe = if custom_count == 0 {
@@ -58,11 +60,11 @@ fn parse(mut args: impl Iterator<Item=String>) -> Result<Options, &'static str> 
         SingleIpProbeConfig { target, target_trust: vp_product_core_adapter::managed::probe_client_v2::HttpsTargetTrust::PinnedDer(vec![root]), target_name, path, expected_status: status }
     };
     if !values.is_empty() || [&control,&vault,&runtime,&output,&worker].iter().any(|p| !p.is_absolute())
-        || (bind.is_loopback() && !cfg!(feature = "local-probe-test")) || bind.is_unspecified() || bind.is_multicast() || ports.iter().collect::<BTreeSet<_>>().len()!=3
+        || (bind.is_loopback() && !cfg!(feature = "local-probe-test")) || bind.is_unspecified() || bind.is_multicast() || ports.into_iter().chain(vmess_port).collect::<BTreeSet<_>>().len()!=3 + usize::from(vmess_port.is_some())
         || worker_sha.len()!=64 || !worker_sha.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) { return Err("INVALID_ARGUMENT"); }
     if !targets.contains(&probe.target) { targets.push(probe.target); }
     if targets.len()>64 || targets.iter().copied().collect::<BTreeSet<_>>().len()!=targets.len() || targets.iter().any(|t| t.ip()==IpAddr::V4(bind)) { return Err("INVALID_TARGET"); }
-    Ok(Options { session_root, control, vault, runtime, output, worker, worker_sha, bind, ports, targets, probe })
+    Ok(Options { session_root, control, vault, runtime, output, worker, worker_sha, bind, ports, vmess_port, targets, probe })
 }
 fn read_public_ca(path: &Path) -> Result<Vec<u8>, &'static str> {
     if !path.is_absolute() { return Err("INVALID_TARGET"); }
@@ -93,7 +95,9 @@ fn pem(label: &str, der: &[u8]) -> Zeroizing<Vec<u8>> {
 struct ClientExport<'a> { schema_version: u16, warning: &'static str, bind_ip: Ipv4Addr, tls_server_name: &'static str,
     ca_pem: &'a str, certificate_expires_at_unix: i64, permitted_targets: &'a [SocketAddr],
     trojan_port: u16, trojan_password: &'a str, vless_port: u16, vless_uuid: &'a str,
-    websocket_path: &'static str, websocket_alpn: &'static str, shadowsocks_port: u16, shadowsocks_method: &'static str, shadowsocks_password: &'a str }
+    websocket_path: &'static str, websocket_alpn: &'static str, shadowsocks_port: u16, shadowsocks_method: &'static str, shadowsocks_password: &'a str,
+    #[serde(skip_serializing_if="Option::is_none")] vmess_port: Option<u16>,
+    #[serde(skip_serializing_if="Option::is_none")] vmess_uuid: Option<&'a str> }
 fn start(options: Options) -> Result<(), &'static str> {
     let deadline = || Instant::now()+Duration::from_secs(20);
     let worker = VerifiedWorker::for_server_v2(&options.worker, &options.worker_sha, deadline(), &Cancellation::default()).map_err(|_| "WORKER_IDENTITY")?;
@@ -105,7 +109,7 @@ fn start(options: Options) -> Result<(), &'static str> {
     if let Some(root) = &session { root.require_empty().map_err(|_| "ROOT_NOT_EMPTY")?; }
     // Reserve requested ports before any creation. A later race fails closed.
     let mut held_ports = Vec::new();
-    for port in options.ports { held_ports.push(std::net::TcpListener::bind((options.bind, port)).map_err(|_| "BIND_UNAVAILABLE")?); }
+    for port in options.ports.into_iter().chain(options.vmess_port) { held_ports.push(std::net::TcpListener::bind((options.bind, port)).map_err(|_| "BIND_UNAVAILABLE")?); }
     if let Some(root) = &session {
         for name in ["control", "vault", "runtime", "output"] {
             drop(root.child(name, vp_product_storage::BoundOpenMode::CreateFresh).map_err(|_| "SESSION_CREATION_UNCERTAIN")?);
@@ -142,7 +146,7 @@ fn start(options: Options) -> Result<(), &'static str> {
     let receipt = vault.inspect_read_only(deadline()).map_err(|_| "VAULT_INSPECTION")?;
     let artifact = ContentDigest::of("vp.public-lab-artifacts.v1", &(&options.worker_sha, &release)).map_err(|_| "BUILD_IDENTITY")?;
     let probe_fingerprint = options.probe.fingerprint().map_err(|_| "INVALID_TARGET")?;
-    let prepare = ContentDigest::of("vp.public-lab-prepare.v1", &(&options.bind, &options.ports, &options.targets, probe_fingerprint)).map_err(|_| "INVALID_ARGUMENT")?;
+    let prepare = ContentDigest::of("vp.public-lab-prepare.v1", &(&options.bind, &options.ports, &options.vmess_port, &options.targets, probe_fingerprint)).map_err(|_| "INVALID_ARGUMENT")?;
     let binding = InstanceBinding { binding_version: 1, genesis_id, vault_id: receipt.vault_id,
         namespace_digest: ContentDigest::parse(receipt.namespace_digest).map_err(|_| "VAULT_INSPECTION")?,
         administrator_commitment: ContentDigest::bytes(b"vp-public-lab-local-admin"), preparation_digest: prepare.clone(),
@@ -159,7 +163,8 @@ fn start(options: Options) -> Result<(), &'static str> {
     let manager = Arc::new(TlsExperimentalSecretManager::new(vault.clone()));
     let control = ControlService::new(store.clone(), attached.executor(), Arc::new(NoHostChanges), Arc::new(SystemClock)).with_secret_manager(manager.clone());
     let actor = UserId::new("lab-admin").map_err(|_| "INTERNAL_ID")?;
-    let kinds = [NodeCredentialKind::Password {}, NodeCredentialKind::Uuid {}, NodeCredentialKind::Shadowsocks { method: ShadowsocksCipher::Aes128Gcm }];
+    let mut kinds = vec![NodeCredentialKind::Password {}, NodeCredentialKind::Uuid {}, NodeCredentialKind::Shadowsocks { method: ShadowsocksCipher::Aes128Gcm }];
+    if options.vmess_port.is_some() { kinds.push(NodeCredentialKind::Uuid {}); }
     let mut refs = Vec::new();
     for (index, kind) in kinds.iter().enumerate() {
         let summary = control.create_credential(&actor, Revision::ZERO, IdempotencyKey::new(format!("lab-credential-{index}")).map_err(|_| "INTERNAL_ID")?,
@@ -180,11 +185,15 @@ fn start(options: Options) -> Result<(), &'static str> {
     };
     #[cfg(not(feature = "local-probe-test"))]
     let plan_bind = options.bind;
-    let config: ProductConfig = serde_json::from_value(serde_json::json!({"schemaVersion":1,"minimumReaderVersion":1,"nodes":[],"subscriptions":[],"listeners":[
+    let mut config_value = serde_json::json!({"schemaVersion":1,"minimumReaderVersion":1,"nodes":[],"subscriptions":[],"listeners":[
         {"schemaVersion":1,"id":"lab-trojan","name":"lab-trojan","enabled":true,"bind":{"address":plan_bind,"port":options.ports[0]},"protocol":{"kind":"proxy","protocol":{"kind":"trojan"},"users":[{"id":"lab-user","credentialRef":refs[0],"enabled":true}]},"transport":{"kind":"tcp"},"security":{"kind":"tls","certificateRef":"lab-certificate","privateKeyRef":"secret:tls-key-lab-import","alpn":[]},"requirements":[]},
         {"schemaVersion":1,"id":"lab-vless","name":"lab-vless","enabled":true,"bind":{"address":plan_bind,"port":options.ports[1]},"protocol":{"kind":"proxy","protocol":{"kind":"vless","flow":null},"users":[{"id":"lab-user","credentialRef":refs[1],"enabled":true}]},"transport":{"kind":"ws","path":"/vp","host":null,"earlyData":null},"security":{"kind":"tls","certificateRef":"lab-certificate","privateKeyRef":"secret:tls-key-lab-import","alpn":["http/1.1"]},"requirements":[]},
         {"schemaVersion":1,"id":"lab-ss","name":"lab-ss","enabled":true,"bind":{"address":plan_bind,"port":options.ports[2]},"protocol":{"kind":"proxy","protocol":{"kind":"shadowsocks","method":"aes-128-gcm"},"users":[{"id":"lab-user","credentialRef":refs[2],"enabled":true}]},"transport":{"kind":"tcp"},"security":{"kind":"none"},"requirements":[]}
-    ]})).map_err(|_| "CONFIGURATION_INVALID")?;
+    ]});
+    if let Some(port) = options.vmess_port {
+        config_value["listeners"].as_array_mut().ok_or("CONFIGURATION_INVALID")?.push(serde_json::json!({"schemaVersion":1,"id":"lab-vmess","name":"lab-vmess","enabled":true,"bind":{"address":plan_bind,"port":port},"protocol":{"kind":"proxy","protocol":{"kind":"vmess","cipher":"auto","alterId":0},"users":[{"id":"lab-user","credentialRef":refs[3],"enabled":true}]},"transport":{"kind":"ws","path":"/vp","host":null,"earlyData":null},"security":{"kind":"tls","certificateRef":"lab-certificate","privateKeyRef":"secret:tls-key-lab-import","alpn":["http/1.1"]},"requirements":[]}));
+    }
+    let config: ProductConfig = serde_json::from_value(config_value).map_err(|_| "CONFIGURATION_INVALID")?;
     #[cfg(feature = "local-probe-test")]
     if std::env::var_os("VP_LAB_TEST_PLAN_IP").is_some() {
         eprintln!("VP_LAB_TEST: domain validation: {:?}", config.validate().map(|_| ()));
@@ -210,7 +219,7 @@ fn start(options: Options) -> Result<(), &'static str> {
         bind_ip: options.bind, tls_server_name: "vp-lab.invalid", ca_pem: std::str::from_utf8(&ca_pem).map_err(|_| "TLS_POLICY")?,
         certificate_expires_at_unix: (now + time::Duration::days(2)).unix_timestamp(), permitted_targets: &export_targets,
         trojan_port: options.ports[0], trojan_password: text(0)?, vless_port: options.ports[1], vless_uuid: text(1)?, websocket_path: "/vp", websocket_alpn: "http/1.1",
-        shadowsocks_port: options.ports[2], shadowsocks_method: "aes-128-gcm", shadowsocks_password: text(2)? };
+        shadowsocks_port: options.ports[2], shadowsocks_method: "aes-128-gcm", shadowsocks_password: text(2)?, vmess_port: options.vmess_port, vmess_uuid: if options.vmess_port.is_some() { Some(text(3)?) } else { None } };
     let mut encoded = Zeroizing::new(Vec::new()); serde_json::to_writer(&mut *encoded, &export).map_err(|_| "EXPORT_UNAVAILABLE")?;
     output.atomic_file("client-secrets.json", "client-secrets.pending", &encoded, 65536, false).map_err(|_| "EXPORT_WRITE_UNCERTAIN")?;
     eprintln!("VP_LAB: started; private client material is in the chosen output directory. Foreground session only; restart and upgrade are not supported.");
@@ -244,7 +253,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let first = args.next();
     if first.as_deref() == Some("--help") && args.next().is_none() {
-        println!("VP public lab: foreground, experimental, fresh instance only. No automatic restart or upgrade.\n\nBefore starting: provide an empty 0700 session directory (or four separate empty 0700 directories), a reviewed worker and SHA-256, one assigned local IPv4, three free TCP ports, and explicit approval to create test access. The selected HTTPS probe sends a request exposing the server's source IP. Credentials and the vault master key are written to 0600 files in the output directory; never include those files in a report. Existing proxy services and firewall settings are not changed.\n\n--check-host --worker ABSOLUTE_PATH --worker-sha256 SHA256 briefly starts and reaps the worker to check compatibility; no listener or state is created.\n\nStart options: (--session-root PATH | --control-root PATH --vault-root PATH --runtime-root PATH --output-root PATH) --worker PATH --worker-sha256 SHA256 --bind-ip IPV4 --trojan-port PORT --vless-port PORT --ss-port PORT [--target IPV4:PORT ...] --confirm-test-access (--confirm-cloudflare-probe | --probe-target IPV4:PORT --probe-name NAME --probe-path PATH --probe-status CODE --probe-ca-der FILE --confirm-custom-probe)");
+        println!("VP public lab: foreground, experimental, fresh instance only. No automatic restart or upgrade.\n\nBefore starting: provide an empty 0700 session directory (or four separate empty 0700 directories), a reviewed worker and SHA-256, one assigned local IPv4, three free TCP ports (and a fourth if enabling VMess), and explicit approval to create test access. The selected HTTPS probe sends a request exposing the server's source IP. Credentials and the vault master key are written to 0600 files in the output directory; never include those files in a report. Existing proxy services and firewall settings are not changed.\n\n--check-host --worker ABSOLUTE_PATH --worker-sha256 SHA256 briefly starts and reaps the worker to check compatibility; no listener or state is created.\n\nStart options: (--session-root PATH | --control-root PATH --vault-root PATH --runtime-root PATH --output-root PATH) --worker PATH --worker-sha256 SHA256 --bind-ip IPV4 --trojan-port PORT --vless-port PORT --ss-port PORT [--vmess-port PORT] [--target IPV4:PORT ...] --confirm-test-access (--confirm-cloudflare-probe | --probe-target IPV4:PORT --probe-name NAME --probe-path PATH --probe-status CODE --probe-ca-der FILE --confirm-custom-probe)");
         return;
     }
     let result = if first.as_deref() == Some("--check-host") { preflight(args) } else { parse(first.into_iter().chain(args)).and_then(start) };
@@ -266,6 +275,17 @@ mod tests {
         let mut a = args(); a.retain(|v| v != "--confirm-cloudflare-probe"); assert!(matches!(parse(a.into_iter()), Err("CONFIRMATION_REQUIRED")));
         let parsed = parse(args().into_iter()).unwrap();
         assert_eq!(parsed.targets, vec!["1.1.1.1:443".parse().unwrap()]);
+    }
+    #[test]
+    fn optional_vmess_port_is_distinct_and_nonzero() {
+        let base = args();
+        assert_eq!(parse(base.clone().into_iter()).unwrap().vmess_port, None);
+        let mut enabled = base.clone(); enabled.extend(["--vmess-port".into(), "18446".into()]);
+        assert_eq!(parse(enabled.into_iter()).unwrap().vmess_port, Some(18446));
+        let mut overlap = base.clone(); overlap.extend(["--vmess-port".into(), "18443".into()]);
+        assert!(parse(overlap.into_iter()).is_err());
+        let mut zero = base; zero.extend(["--vmess-port".into(), "0".into()]);
+        assert!(parse(zero.into_iter()).is_err());
     }
     #[test]
     fn parser_rejects_duplicate_ports_loopback_and_unexpected_flags() {
@@ -314,7 +334,7 @@ mod tests {
         let dir = cap(root.path(), true).unwrap(); let targets = ["1.1.1.1:443".parse().unwrap()];
         let export = ClientExport { schema_version: 1, warning: "synthetic", bind_ip: "192.0.2.2".parse().unwrap(), tls_server_name: "vp-lab.invalid", ca_pem: "synthetic-public-ca", certificate_expires_at_unix: 123,
             permitted_targets: &targets, trojan_port: 1, trojan_password: "synthetic-trojan", vless_port: 2, vless_uuid: "synthetic-uuid", websocket_path: "/vp", websocket_alpn: "http/1.1",
-            shadowsocks_port: 3, shadowsocks_method: "aes-128-gcm", shadowsocks_password: "synthetic-ss" };
+            shadowsocks_port: 3, shadowsocks_method: "aes-128-gcm", shadowsocks_password: "synthetic-ss", vmess_port: None, vmess_uuid: None };
         let mut bytes = Zeroizing::new(Vec::new()); serde_json::to_writer(&mut *bytes, &export).unwrap();
         dir.atomic_file("client-secrets.json", "client-secrets.pending", &bytes, 65536, false).unwrap();
         let path = root.path().join("client-secrets.json");
