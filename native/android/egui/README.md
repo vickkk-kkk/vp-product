@@ -39,4 +39,11 @@ stale observations and invalid schema. The Android process, permission flow,
 network forwarding, DNS, IPv6 and lifecycle remain untested for this bridge.
 JVM checks also confirm empty, oversized, and missing-adapter inputs fail closed;
 they do not exercise a real Android permission dialog or a loaded native core.
+
+`native/android/egui-jni` provides the Rust-side JNI calls. It loads the bridge
+class using the current Activity's class loader, borrows (never owns) the
+Activity's JNI global reference, and bounds request sizes before JNI. Its unsafe
+constructor requires the caller to keep the Activity/AndroidApp alive for the
+entire bridge lifetime. A locked offline host compile and two input/pointer
+tests pass; no JVM round-trip or Android target build has been performed.
 The Gradle module and APK manifest merge have not yet been built.

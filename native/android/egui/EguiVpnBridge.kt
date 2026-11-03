@@ -4,6 +4,8 @@ import android.content.Context
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONObject
@@ -27,20 +29,29 @@ object EguiVpnBridge {
     @JvmStatic fun requestConsent(context: Context, payload: String): Boolean {
         if (!preflight(payload) || !consentInFlight.compareAndSet(false, true)) return false
         consentResult = "pending"
-        return try {
-            val intent = Intent(context, EguiVpnConsentActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            context.startActivity(intent)
-            true
-        } catch (_: Exception) {
+        val app = context.applicationContext
+        val queued = Handler(Looper.getMainLooper()).post {
+            try {
+                val intent = Intent(app, EguiVpnConsentActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                app.startActivity(intent)
+            } catch (_: Exception) {
+                consentResult = "unavailable"
+                consentInFlight.set(false)
+            }
+        }
+        if (!queued) {
             consentResult = "unavailable"
             consentInFlight.set(false)
-            false
         }
+        return queued
     }
 
     @JvmStatic fun consentStatus(context: Context): String = try {
         if (VpnService.prepare(context) == null) "granted" else consentResult
     } catch (_: Exception) { "unavailable" }
+    @JvmStatic fun consentGranted(context: Context): Boolean = try {
+        VpnService.prepare(context) == null
+    } catch (_: Exception) { false }
 
     @Synchronized @JvmStatic fun startWithPayload(context: Context, payload: String): Boolean {
         if (VpVpnService.current != null || VpVpnService.pendingStart != null) return false
