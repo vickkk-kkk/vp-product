@@ -2,6 +2,11 @@
 use super::*;
 use vp_product_control::{TlsRawRecord, TlsTombstone, TlsVaultIo};
 
+mod credentials;
+pub use credentials::TlsPasswordSecretManager;
+#[cfg(feature = "experimental-public")]
+pub use credentials::TlsExperimentalSecretManager;
+
 pub struct TlsSecretStore {
     inner: DurableSecretStore,
 }
@@ -92,6 +97,53 @@ impl TlsSecretStore {
         deadline: Instant,
     ) -> Result<crate::VaultInspectionReceipt, VaultError> {
         self.inner.inspect_read_only(deadline)
+    }
+    /// Kind-1-only immutable credential port. Shared control owns confirmation,
+    /// CAS, intent journaling and reference reachability; this is not an apply API.
+    pub fn put_credential(
+        &self,
+        reference: &SecretRef,
+        version: u64,
+        bytes: SecretBytes,
+        deadline: Instant,
+    ) -> Result<(), VaultError> {
+        self.inner
+            .instance_binding(deadline)?
+            .validate_tls_profile()
+            .map_err(|_| VaultError::MetadataMismatch)?;
+        self.inner
+            .put(reference, SecretKind::Credential, version, bytes, deadline)
+    }
+    /// No retired fallback, implicit version choice or access to other kinds.
+    pub fn get_credential(
+        &self,
+        reference: &SecretRef,
+        deadline: Instant,
+    ) -> Result<SecretRecord, VaultError> {
+        self.inner
+            .instance_binding(deadline)?
+            .validate_tls_profile()
+            .map_err(|_| VaultError::MetadataMismatch)?;
+        let record = self.inner.get(reference, deadline)?;
+        if record.kind != SecretKind::Credential {
+            return Err(VaultError::MetadataMismatch);
+        }
+        Ok(record)
+    }
+    /// Idempotent only for this exact credential kind/version. Historical bytes
+    /// remain encrypted; control must first authorize retirement/reachability.
+    pub fn retire_credential(
+        &self,
+        reference: &SecretRef,
+        version: u64,
+        deadline: Instant,
+    ) -> Result<(), VaultError> {
+        self.inner
+            .instance_binding(deadline)?
+            .validate_tls_profile()
+            .map_err(|_| VaultError::MetadataMismatch)?;
+        self.inner
+            .retire(reference, SecretKind::Credential, version, deadline)
     }
     fn tls_kind(kind: u8) -> Result<SecretKind, VaultError> {
         match kind {
@@ -207,6 +259,10 @@ impl TlsVaultIo for TlsSecretStore {
 
 // Read-only, kind-restricted bridge. Retired/uncertain records remain errors.
 impl vp_product_control::TlsMaterialVault for TlsSecretStore {
+    #[cfg(feature = "experimental-public")]
+    fn retained_directory_identity(&self) -> Result<(u64, u64), vp_product_control::ControlError> {
+        self.inner.directory.opened_identity().map_err(|_| vp_product_control::ControlError::ResourceConflict)
+    }
     fn material_binding(
         &self,
         deadline: Instant,
@@ -459,6 +515,202 @@ mod tests {
         bytes[last] ^= 1;
         fs::write(path, bytes).unwrap();
         assert!(v.tombstone(&id, deadline()).is_err());
+    }
+    #[test]
+    fn credential_port_is_bound_kind_restricted_and_irreversible() {
+        let (d, v) = fixture();
+        let id = SecretRef::new("password-port").unwrap();
+        v.put_credential(
+            &id,
+            3,
+            SecretBytes::new(b"synthetic-password".to_vec()),
+            deadline(),
+        )
+        .unwrap();
+        assert_eq!(v.get_credential(&id, deadline()).unwrap().version, 3);
+        assert!(v
+            .put_credential(&id, 4, SecretBytes::new(vec![1]), deadline())
+            .is_err());
+        let before = snapshot(d.path());
+        assert!(v.retire_credential(&id, 2, deadline()).is_err());
+        assert_eq!(before, snapshot(d.path()));
+        v.put(record("chain-other", 6, 1), deadline()).unwrap();
+        let other = SecretRef::new("chain-other").unwrap();
+        assert!(v.get_credential(&other, deadline()).is_err());
+        assert!(v.retire_credential(&other, 1, deadline()).is_err());
+        v.retire_credential(&id, 3, deadline()).unwrap();
+        v.retire_credential(&id, 3, deadline()).unwrap();
+        assert!(matches!(
+            v.get_credential(&id, deadline()),
+            Err(VaultError::Retired)
+        ));
+        drop(v);
+        let v =
+            TlsSecretStore::open(d.path(), ns(), key(), identity(d.path()), deadline()).unwrap();
+        assert!(matches!(
+            v.get_credential(&id, deadline()),
+            Err(VaultError::Retired)
+        ));
+        assert!(v
+            .put_credential(&id, 4, SecretBytes::new(vec![1]), deadline())
+            .is_err());
+    }
+    #[test]
+    fn password_manager_validates_exact_bytes_and_never_downgrades_retired_to_absent() {
+        use vp_product_control::SecretManager;
+        use vp_product_domain::NodeCredentialKind;
+        let (d, v) = fixture();
+        let vault = std::sync::Arc::new(v);
+        let before = snapshot(d.path());
+        let manager = TlsPasswordSecretManager::new(vault.clone());
+        let kind = NodeCredentialKind::Password {};
+        assert_eq!(manager.supported_kinds(), vec![kind.clone()]);
+        let generated = manager.generate_credential(&kind, deadline()).unwrap();
+        assert_eq!(generated.bytes.expose().len(), 64);
+        assert!(generated.bytes.expose().iter().all(u8::is_ascii_hexdigit));
+        assert_eq!(before, snapshot(d.path()));
+        let id = generated.reference;
+        assert!(manager
+            .load_credential(&id, &kind, None, deadline())
+            .unwrap()
+            .is_none());
+        manager
+            .put_credential(&id, &kind, 1, generated.bytes, deadline())
+            .unwrap();
+        assert!(manager
+            .load_credential(&id, &kind, Some(2), deadline())
+            .is_err());
+        assert!(manager
+            .load_credential(&id, &NodeCredentialKind::Uuid {}, Some(1), deadline())
+            .is_err());
+        assert_eq!(
+            manager
+                .load_credential(&id, &kind, Some(1), deadline())
+                .unwrap()
+                .unwrap()
+                .expose()
+                .len(),
+            64
+        );
+        let before = snapshot(d.path());
+        for bytes in [vec![], vec![0], vec![255], vec![b'x'; 4097]] {
+            assert!(manager
+                .put_credential(
+                    &SecretRef::new("bad-password").unwrap(),
+                    &kind,
+                    1,
+                    SecretBytes::new(bytes),
+                    deadline()
+                )
+                .is_err());
+        }
+        assert!(manager
+            .put_credential(
+                &SecretRef::new("vp-instance-binding-v1").unwrap(),
+                &kind,
+                1,
+                SecretBytes::new(vec![b'x']),
+                deadline()
+            )
+            .is_err());
+        assert!(manager.generate_credential(&kind, Instant::now()).is_err());
+        assert!(manager.generate_publication_token(deadline()).is_err());
+        assert!(!manager.verify_publication_token(&ContentDigest::bytes(b"test"), b"test"));
+        assert_eq!(before, snapshot(d.path()));
+        manager.retire_credential(&id, 1, deadline()).unwrap();
+        assert!(matches!(
+            manager.load_credential(&id, &kind, None, deadline()),
+            Err(ControlError::RecoveryRequired)
+        ));
+    }
+    #[cfg(feature = "experimental-public")]
+    #[test]
+    fn experimental_manager_binds_uuid_and_ss_types_inside_vault() {
+        use vp_product_control::SecretManager;
+        use vp_product_domain::{NodeCredentialKind, ShadowsocksCipher};
+        let (_d, vault) = fixture();
+        let vault = std::sync::Arc::new(vault);
+        let manager = TlsExperimentalSecretManager::new(vault.clone());
+        let legacy = TlsPasswordSecretManager::new(vault.clone());
+        let uuid = NodeCredentialKind::Uuid {};
+        let ss = NodeCredentialKind::Shadowsocks { method: ShadowsocksCipher::Aes128Gcm };
+        for kind in [uuid.clone(), ss.clone()] {
+            let generated = manager.generate_credential(&kind, deadline()).unwrap();
+            let id = generated.reference;
+            let expected = generated.bytes.expose().to_vec();
+            manager.put_credential(&id, &kind, 1, generated.bytes, deadline()).unwrap();
+            let stored = vault.get_credential(&id, deadline()).unwrap();
+            assert_ne!(stored.bytes.expose(), expected.as_slice());
+            assert_eq!(manager.load_credential(&id, &kind, Some(1), deadline()).unwrap().unwrap().expose(), expected.as_slice());
+            let wrong = if kind == uuid { &ss } else { &uuid };
+            assert!(manager.load_credential(&id, wrong, Some(1), deadline()).is_err());
+            assert!(manager.load_credential(&id, &kind, Some(2), deadline()).is_err());
+            assert!(legacy.load_credential(&id, &NodeCredentialKind::Password {}, Some(1), deadline()).is_err());
+            manager.retire_credential(&id, 1, deadline()).unwrap();
+            assert!(manager.load_credential(&id, &kind, None, deadline()).is_err());
+        }
+        assert!(manager.generate_credential(&NodeCredentialKind::Shadowsocks { method: ShadowsocksCipher::Aes256Gcm }, deadline()).is_err());
+        assert!(manager.generate_credential(&uuid, Instant::now()).is_err());
+    }
+    #[test]
+    fn credential_port_and_manager_refuse_unclaimed_vault_before_writes() {
+        use vp_product_control::SecretManager;
+        let d = empty_root();
+        let v = std::sync::Arc::new(
+            TlsSecretStore::initialize_bound(
+                d.path(),
+                ns(),
+                key(),
+                Limits::default(),
+                identity(d.path()),
+                deadline(),
+            )
+            .unwrap(),
+        );
+        let before = snapshot(d.path());
+        let id = SecretRef::new("unclaimed-password").unwrap();
+        assert!(v
+            .put_credential(&id, 1, SecretBytes::new(vec![b'x']), deadline())
+            .is_err());
+        assert!(v.get_credential(&id, deadline()).is_err());
+        assert!(v.retire_credential(&id, 1, deadline()).is_err());
+        let manager = TlsPasswordSecretManager::new(v);
+        assert!(manager
+            .generate_credential(
+                &vp_product_domain::NodeCredentialKind::Password {},
+                deadline()
+            )
+            .is_err());
+        assert_eq!(before, snapshot(d.path()));
+    }
+    #[test]
+    fn credential_write_faults_keep_uncertainty_and_ref_reserved() {
+        for point in 1..=4 {
+            let (d, v) = fixture();
+            let id = SecretRef::new("fault-password").unwrap();
+            v.inner.inject_fault(point);
+            assert!(v
+                .put_credential(&id, 1, SecretBytes::new(vec![b'x']), deadline())
+                .is_err());
+            assert!(matches!(
+                v.get_credential(&id, deadline()),
+                Err(VaultError::RecoveryRequired)
+            ));
+            drop(v);
+            let before = snapshot(d.path());
+            let opened =
+                TlsSecretStore::open(d.path(), ns(), key(), identity(d.path()), deadline());
+            if point <= 2 {
+                assert!(opened.is_err());
+            } else {
+                let v = opened.unwrap();
+                assert_eq!(v.get_credential(&id, deadline()).unwrap().version, 1);
+                assert!(v
+                    .put_credential(&id, 1, SecretBytes::new(vec![b'x']), deadline())
+                    .is_err());
+            }
+            assert_eq!(before, snapshot(d.path()));
+        }
     }
     fn binding_for(v: &DurableSecretStore, profile: &str) -> InstanceBinding {
         let observed = v.inspect_read_only(deadline()).unwrap();

@@ -1,0 +1,67 @@
+{
+  "schemaVersion": 1,
+  "status": "passed",
+  "recordedAtUtc": "2026-10-30T08:03:49.508340+00:00",
+  "installerSources": {
+    "build_bundle.py": "2f98aeeea409713801f8474388831a48056930e67252dff343283378b21297ab",
+    "vp_api.py": "2c90adb863dd842a94b92e3c4c14dd2228590f8a88c9e0bf1d91a194fde11e58",
+    "vp_form.py": "9bc125ee473ef537e9a3fc0a3b5d55dd351154a4a6545e878a0c405c94bc52a3",
+    "vp_install.py": "c956d230f554486021cf2f63df57c8b0b645176a5a441374cf333952f01eaee2",
+    "vpctl.py": "f69839699c9e8d10ed6d5d400842ff4152cf904ae605df1c4c2579043d613971"
+  },
+  "harnessSha256": "94e7bd83e24682aacc983a300102a11ef682aabeb1f71214ccc3a91a281ffa8b",
+  "scope": "temporary-filesystem + real installed loopback daemon/worker + CLI",
+  "daemonSha256": "e302257e8e276561ca3271bcf339392395cafd1ba69b446bc3212706f738b4e2",
+  "workerSha256": "5dae2017718147c6b2a5f939a398021367457790b391eec058807f4bcc163c91",
+  "bundleSha256": "5a6743f402c30b3837a1212e5e3d4995506059617207c23154b0afd22b0b28df",
+  "coreLockSha256": "0cb955829bcf1365288c9739d20f627aa8ce55e02cd8a6af1b7fcccc005d54c7",
+  "webIndexSha256": "a97534f75a2ac4246bccbace860fdd0ca34fe7ddfafc50c7c6f403b9c93ddab6",
+  "sharedConfigFixtureSha256": "066498d991a11eaac79136e7c8316da21caf99714b1af9387a4ec1b4883ba786",
+  "observedBuildIdentity": {
+    "releaseId": "development-source-only",
+    "productVersion": "0.1.0-dev.1",
+    "adapterVersion": "0.1.0-dev.1",
+    "coreCommit": "a1abce2b515b199fe1120061b54654c60f4dd59c",
+    "patchsetHash": "4cc124b5aa049df777eebfcb91d4fd746c8dcbe117cfb17d5fba57466ab9059d",
+    "buildTarget": "x86_64-linux",
+    "toolchain": "unrecorded",
+    "schemaRead": {
+      "minimum": 1,
+      "maximum": 1
+    },
+    "schemaWrite": {
+      "minimum": 1,
+      "maximum": 1
+    },
+    "abi": {
+      "major": 1,
+      "minor": 1
+    },
+    "api": {
+      "major": 1,
+      "minor": 0
+    },
+    "evidenceManifestHash": null
+  },
+  "checks": [
+    "real-local-artifacts-packaged",
+    "readonly-install-plan",
+    "confirmed-files-only-install",
+    "installed-binary-launch",
+    "observed-build-core-and-patch-match-bundle",
+    "all-21-presets-preserved",
+    "shared-api-draft-validate-plan",
+    "dryrun-does-not-apply",
+    "confirmed-api-apply",
+    "observed-loopback-forwarding-probe",
+    "unimplemented-export-rejected-without-output",
+    "daemon-and-owned-worker-processes-exited",
+    "post-stop-connect-refused-and-exclusive-rebind-listen",
+    "retaining-uninstall",
+    "no-plaintext-test-credentials-in-retained-state-or-output"
+  ],
+  "systemd": "not_run",
+  "independentProtocolCertification": false,
+  "publicDeployment": false,
+  "browserMobileSubscriptionJourney": "not_run"
+}

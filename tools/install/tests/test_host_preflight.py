@@ -170,3 +170,21 @@ class UnsupportedHostCleanupTests(Fixture):
 
 if __name__ == '__main__':
     unittest.main()
+
+class GlibcRequirementTests(unittest.TestCase):
+    def test_compares_numeric_versions_and_never_executes_binary(self):
+        good = host.check_glibc_requirement('2.9', confstr=lambda _: 'glibc 2.10', system=lambda: 'Linux')
+        self.assertTrue(good['compatible'])
+        self.assertEqual(good['status'], 'compatible_not_execution_certified')
+        old = host.check_glibc_requirement('2.39', confstr=lambda _: 'glibc 2.35', system=lambda: 'Linux')
+        self.assertFalse(old['compatible'])
+        self.assertEqual(old['reason'], 'glibc_too_old')
+    def test_unknown_non_glibc_invalid_and_other_os_fail_closed(self):
+        for value in (None, 'musl 1.2', 'glibc 2.39 extra', 'glibc 2.x'):
+            self.assertFalse(host.check_glibc_requirement('2.39', confstr=lambda _, v=value: v, system=lambda: 'Linux')['compatible'])
+        self.assertFalse(host.check_glibc_requirement('2.39', confstr=lambda _: 'glibc 2.40', system=lambda: 'Darwin')['compatible'])
+        self.assertFalse(host.check_glibc_requirement('2.39.1', confstr=lambda _: 'glibc 2.39', system=lambda: 'Linux')['compatible'])
+        self.assertTrue(host.check_glibc_requirement('2.2.5', confstr=lambda _: 'glibc 2.39', system=lambda: 'Linux')['compatible'])
+        self.assertFalse(host.check_glibc_requirement('2.39.1.1', confstr=lambda _: 'glibc 2.40', system=lambda: 'Linux')['compatible'])
+        def unavailable(_): raise OSError('unavailable')
+        self.assertFalse(host.check_glibc_requirement('2.39', confstr=unavailable, system=lambda: 'Linux')['compatible'])

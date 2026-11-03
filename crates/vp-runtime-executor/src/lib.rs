@@ -2,6 +2,16 @@
 //! This is an explicitly uncertified loopback-development executor, not a vault,
 //! production interoperability harness, route controller or release certificate.
 #![forbid(unsafe_code)]
+#[cfg(feature = "server-v2-journal")]
+pub mod server_v2_journal;
+#[cfg(all(target_os = "linux", feature = "experimental-public"))]
+mod public_stage;
+#[cfg(all(target_os = "linux", feature = "experimental-public"))]
+mod public_oracle;
+#[cfg(all(target_os = "linux", feature = "experimental-public"))]
+mod public_probe;
+#[cfg(all(target_os = "linux", feature = "experimental-public"))]
+pub mod experimental_public;
 mod durable;
 mod ports;
 use durable::*;

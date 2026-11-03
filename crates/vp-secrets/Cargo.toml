@@ -6,6 +6,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [features]
+experimental-public = ["private-tls", "vp-product-control/experimental-public"]
 default = []
 private-tls = ["vp-product-control/private-tls"]
 
@@ -41,3 +42,13 @@ workspace = true
 name = "tls_import"
 harness = false
 required-features = ["private-tls"]
+
+[[test]]
+name = "tls_credentials"
+harness = false
+required-features = ["private-tls"]
+
+[[test]]
+name = "fresh_public_reservation"
+harness = false
+required-features = ["experimental-public", "vp-product-runtime-executor/experimental-public"]

@@ -1,0 +1,258 @@
+--- a/crates/vp-protocol/src/tuic.rs
++++ b/crates/vp-protocol/src/tuic.rs
+@@ -713,6 +713,49 @@
+ // 入站（服务端）
+ // ---------------------------------------------------------------------------
+ 
++/// Explicit server congestion selection. The factory is used by Quinn, not just
++/// retained as metadata in a product configuration.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum TuicCongestionControl {
++    Cubic,
++    NewReno,
++    Bbr,
++}
++impl TuicCongestionControl {
++    fn factory(self) -> Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> {
++        match self {
++            Self::Cubic => Arc::new(quinn::congestion::CubicConfig::default()),
++            Self::NewReno => Arc::new(quinn::congestion::NewRenoConfig::default()),
++            Self::Bbr => Arc::new(quinn::congestion::BbrConfig::default()),
++        }
++    }
++}
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum TuicUdpRelayMode {
++    Native,
++    Quic,
++}
++impl TuicUdpRelayMode {
++    fn allows(self, native: bool) -> bool {
++        native == matches!(self, Self::Native)
++    }
++}
++#[derive(Clone, Debug)]
++pub struct TuicServerOptions {
++    pub congestion_control: TuicCongestionControl,
++    pub udp_relay_mode: TuicUdpRelayMode,
++    pub alpn: Vec<Vec<u8>>,
++}
++impl TuicServerOptions {
++    fn validate(&self) -> Result<()> {
++        // The supported server profile is exact h3, not arbitrary ignored ALPN.
++        if self.alpn != [b"h3".to_vec()] {
++            return Err(Error::Config("tuic: server ALPN must be exactly h3".into()));
++        }
++        Ok(())
++    }
++}
++
+ pub struct TuicInbound {
+     bind: String,
+     port: u16,
+@@ -722,6 +765,8 @@
+     /// 证书（PEM）
+     cert_pem: Vec<u8>,
+     key_pem: Vec<u8>,
++    // None preserves the old constructor's both-mode/Cubic behavior only.
++    options: Option<TuicServerOptions>,
+ }
+ 
+ impl TuicInbound {
+@@ -740,7 +785,61 @@
+             users,
+             cert_pem,
+             key_pem,
+-        }
++            options: None,
++        }
++    }
++
++    pub fn new_with_options(
++        bind: &str,
++        port: u16,
++        tag: &str,
++        users: Vec<(String, String)>,
++        cert_pem: Vec<u8>,
++        key_pem: Vec<u8>,
++        options: TuicServerOptions,
++    ) -> Result<Self> {
++        options.validate()?;
++        if users.is_empty() || users.len() > 1024 {
++            return Err(Error::Config("tuic: 1..1024 users required".into()));
++        }
++        let mut ids = std::collections::HashSet::new();
++        for (uuid, password) in &users {
++            let canonical = uuid.len() == 36
++                && uuid.bytes().enumerate().all(|(index, b)| {
++                    if [8, 13, 18, 23].contains(&index) {
++                        b == b'-'
++                    } else {
++                        b.is_ascii_hexdigit() && !b.is_ascii_uppercase()
++                    }
++                });
++            if !canonical
++                || password.is_empty()
++                || password.len() > 1024
++                || !ids.insert(parse_uuid16(uuid)?)
++            {
++                return Err(Error::Config(
++                    "tuic: invalid or duplicate credential".into(),
++                ));
++            }
++        }
++        if cert_pem.is_empty()
++            || cert_pem.len() > 1024 * 1024
++            || key_pem.is_empty()
++            || key_pem.len() > 65536
++        {
++            return Err(Error::Config(
++                "tuic: missing or oversized TLS identity".into(),
++            ));
++        }
++        let mut inbound = Self::new(bind, port, tag, users, cert_pem, key_pem);
++        inbound.options = Some(options);
++        Ok(inbound)
++    }
++
++    fn permits_udp_source(&self, native: bool) -> bool {
++        self.options
++            .as_ref()
++            .is_none_or(|options| options.udp_relay_mode.allows(native))
+     }
+ }
+ 
+@@ -772,12 +871,20 @@
+             .with_no_client_auth()
+             .with_single_cert(certs, key)
+             .map_err(|e| Error::Config(format!("tuic tls: {e}")))?;
+-        crypto.alpn_protocols = vec![b"h3".to_vec()];
++        crypto.alpn_protocols = self
++            .options
++            .as_ref()
++            .map_or_else(|| vec![b"h3".to_vec()], |o| o.alpn.clone());
+         let mut scfg = quinn::ServerConfig::with_crypto(Arc::new(
+             quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
+                 .map_err(|e| Error::Config(format!("tuic server cfg: {e}")))?,
+         ));
+         let mut t = quinn::TransportConfig::default();
++        let congestion = self
++            .options
++            .as_ref()
++            .map_or(TuicCongestionControl::Cubic, |o| o.congestion_control);
++        t.congestion_controller_factory(congestion.factory());
+         t.datagram_receive_buffer_size(Some(1 << 20));
+         t.max_concurrent_bidi_streams((MAX_STREAMS as u32).into());
+         t.max_concurrent_uni_streams((MAX_STREAMS as u32).into());
+@@ -1033,6 +1140,11 @@
+                         });
+                     }
+                     Command::Packet(fragment, native) => {
++                        // Reject before fragment allocation, route lookup or opening a UDP relay.
++                        if !self.permits_udp_source(native) {
++                            conn.close(0u32.into(), b"UDP relay mode rejected");
++                            return Err(Error::Proto("tuic: UDP relay mode rejected"));
++                        }
+                         let Some(pkt) = fragments.push(fragment) else {
+                             continue;
+                         };
+@@ -1383,3 +1495,99 @@
+         assert_eq!(report.remaining_tasks, 0);
+     }
+ }
++
++#[cfg(test)]
++mod explicit_server_options_tests {
++    use super::*;
++
++    #[test]
++    fn exact_congestion_selection_builds_the_requested_quinn_controller() {
++        use quinn::congestion::{Bbr, Cubic, NewReno};
++        let now = std::time::Instant::now();
++        assert!(
++            TuicCongestionControl::Cubic
++                .factory()
++                .build(now, 1200)
++                .into_any()
++                .is::<Cubic>()
++        );
++        assert!(
++            TuicCongestionControl::NewReno
++                .factory()
++                .build(now, 1200)
++                .into_any()
++                .is::<NewReno>()
++        );
++        assert!(
++            TuicCongestionControl::Bbr
++                .factory()
++                .build(now, 1200)
++                .into_any()
++                .is::<Bbr>()
++        );
++    }
++    #[test]
++    fn mode_gate_rejects_cross_carrier_packets() {
++        assert!(TuicUdpRelayMode::Native.allows(true));
++        assert!(!TuicUdpRelayMode::Native.allows(false));
++        assert!(TuicUdpRelayMode::Quic.allows(false));
++        assert!(!TuicUdpRelayMode::Quic.allows(true));
++    }
++    #[test]
++    fn alpn_is_not_silently_replaced() {
++        for alpn in [
++            vec![],
++            vec![b"h2".to_vec()],
++            vec![b"h3".to_vec(), b"h2".to_vec()],
++        ] {
++            assert!(
++                TuicServerOptions {
++                    congestion_control: TuicCongestionControl::Bbr,
++                    udp_relay_mode: TuicUdpRelayMode::Native,
++                    alpn
++                }
++                .validate()
++                .is_err()
++            );
++        }
++        assert!(
++            TuicServerOptions {
++                congestion_control: TuicCongestionControl::NewReno,
++                udp_relay_mode: TuicUdpRelayMode::Quic,
++                alpn: vec![b"h3".to_vec()]
++            }
++            .validate()
++            .is_ok()
++        );
++    }
++    #[test]
++    fn invalid_users_are_rejected_before_tls_or_udp_bind() {
++        let options = TuicServerOptions {
++            congestion_control: TuicCongestionControl::Cubic,
++            udp_relay_mode: TuicUdpRelayMode::Native,
++            alpn: vec![b"h3".to_vec()],
++        };
++        for users in [
++            vec![],
++            vec![("not-uuid".into(), "fixture".into())],
++            vec![("12345678-1234-1234-1234-123456789abc".into(), String::new())],
++            vec![(
++                "12345678-1234-1234-1234-123456789ABC".into(),
++                "fixture".into(),
++            )],
++        ] {
++            assert!(
++                TuicInbound::new_with_options(
++                    "127.0.0.1",
++                    0,
++                    "fixture",
++                    users,
++                    vec![1],
++                    vec![1],
++                    options.clone()
++                )
++                .is_err()
++            );
++        }
++    }
++}

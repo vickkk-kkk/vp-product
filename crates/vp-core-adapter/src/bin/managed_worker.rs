@@ -34,6 +34,7 @@ fn snapshot(app: &ManagedApp, generation: u64) -> WorkerSnapshot {
         active_tasks: tasks.task_count(),
         task_panics: tasks.panics,
         forwarding_verified: false,
+        probe_ledger: None,
     }
 }
 async fn run(

@@ -647,4 +647,6 @@ fn control_error(error: VaultError) -> ControlError {
 #[cfg(feature = "private-tls")]
 mod tls;
 #[cfg(feature = "private-tls")]
-pub use tls::TlsSecretStore;
+pub use tls::{TlsPasswordSecretManager, TlsSecretStore};
+#[cfg(feature = "experimental-public")]
+pub use tls::TlsExperimentalSecretManager;

@@ -53,6 +53,14 @@ impl ProcessIdentity {
             boot_id,
         })
     }
+    /// Translate a live /proc observation into the V2 journal representation.
+    /// A PID observation alone is never authority to adopt or signal a process.
+    #[cfg(feature = "server-v2-journal")]
+    pub(crate) fn as_server_v2(&self) -> crate::server_v2_journal::ProcessIdentity {
+        crate::server_v2_journal::ProcessIdentity {
+            pid: self.pid, start_ticks: self.start_ticks.clone(), boot_id: self.boot_id.clone(),
+        }
+    }
     pub fn is_present(&self) -> Result<bool, ControlError> {
         match fs::metadata(format!("/proc/{}", self.pid)) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),

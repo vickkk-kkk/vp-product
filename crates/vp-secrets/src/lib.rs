@@ -29,4 +29,6 @@ pub use types::{Limits, MasterKey, Namespace, SecretKind, SecretRecord, VaultErr
 mod tests;
 
 #[cfg(all(target_os = "linux", feature = "private-tls"))]
-pub use server::TlsSecretStore;
+pub use server::{TlsPasswordSecretManager, TlsSecretStore};
+#[cfg(feature = "experimental-public")]
+pub use server::TlsExperimentalSecretManager;

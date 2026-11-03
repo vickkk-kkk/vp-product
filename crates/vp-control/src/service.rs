@@ -67,9 +67,10 @@ impl ControlService {
             return Err(ControlError::RecoveryRequired);
         }
         check_revision(request.expected_revision, lease.state().active_revision)?;
-        let validation =
-            self.runtime
-                .validate(&request.config, &request.release, lease.state().active())?;
+        #[cfg(feature = "experimental-public")]
+        let validation = self.runtime.validate_with_context(RuntimePlanContext::new(&*lease, &request, &*self.clock))?;
+        #[cfg(not(feature = "experimental-public"))]
+        let validation = self.runtime.validate(&request.config, &request.release, lease.state().active())?;
         if validation.config_digest != ContentDigest::of("vp.product-config.v1", &request.config)?
             || validation.release_digest
                 != ContentDigest::of("vp.release-identity.v1", &request.release)?
@@ -254,8 +255,15 @@ impl ControlService {
                 Some(ControlError::Canceled),
             );
         }
+        #[cfg(feature = "experimental-public")]
+        if let Err(error) = RuntimePreStageContext::from_queued(&*lease, id, &plan)
+            .and_then(|context| self.runtime.reconcile_before_stage(context)) {
+            return self.finish(&mut *lease, id, OperationState::RecoveryRequired, Some(error));
+        }
         self.transition(&mut *lease, id, OperationState::Staging, None)?;
-        if let Err(error) = self.runtime.stage(id, &plan, cancel) {
+        let staged = RuntimeStageContext::from_staging(&*lease, id, &plan, &*self.clock, cancel)
+            .and_then(|context| self.runtime.stage_with_context(context));
+        if let Err(error) = staged {
             return self.cleanup_staging(&mut *lease, id, error);
         }
         if cancel.is_canceled() {
@@ -301,20 +309,26 @@ impl ControlService {
             return self.rollback(&mut *lease, id, &plan, previous.as_ref(), error);
         }
         self.transition(&mut *lease, id, OperationState::Activating, None)?;
-        let activation = match self
-            .runtime
-            .activate(id, &plan, previous.as_ref())
-            .and_then(|activation| {
-                if activation.operation_id != *id
-                    || activation.revision != plan.body().target_revision
-                    || activation.generation == 0
-                    || activation.config_digest != plan.body().validation.config_digest
-                    || activation.release_digest != plan.body().validation.release_digest
-                {
-                    return Err(ControlError::HealthFailed);
-                }
-                Ok(activation)
-            }) {
+        let activation = match RuntimeActivationContext::from_activating(
+            &*lease,
+            id,
+            &plan,
+            previous.as_ref(),
+            &*self.clock,
+            cancel,
+        )
+        .and_then(|context| self.runtime.activate_with_context(context))
+        .and_then(|activation| {
+            if activation.operation_id != *id
+                || activation.revision != plan.body().target_revision
+                || activation.generation == 0
+                || activation.config_digest != plan.body().validation.config_digest
+                || activation.release_digest != plan.body().validation.release_digest
+            {
+                return Err(ControlError::HealthFailed);
+            }
+            Ok(activation)
+        }) {
             Ok(activation) => activation,
             Err(error) => return self.rollback(&mut *lease, id, &plan, previous.as_ref(), error),
         };
@@ -331,7 +345,12 @@ impl ControlService {
             Some(OperationState::Activating),
         )?;
         self.transition(&mut *lease, id, OperationState::Verifying, None)?;
-        let health = match self.runtime.verify(id, &plan).and_then(|health| {
+        #[cfg(feature = "experimental-public")]
+        let observed_health = RuntimeVerificationContext::from_verifying(&*lease, id, &plan, &*self.clock, cancel)
+            .and_then(|context| self.runtime.verify_with_context(context));
+        #[cfg(not(feature = "experimental-public"))]
+        let observed_health = self.runtime.verify(id, &plan);
+        let health = match observed_health.and_then(|health| {
             verify_health(&plan, id, &activation, &health, self.clock.now_ms()?)?;
             check_observations(
                 &plan.body().resources,
@@ -593,7 +612,12 @@ impl ControlService {
         error: ControlError,
     ) -> Result<Operation, ControlError> {
         self.transition(lease, id, OperationState::Canceling, Some(error.clone()))?;
-        if self.runtime.discard_stage(id).is_err() {
+        #[cfg(feature = "experimental-public")]
+        let discarded = RuntimeCleanupContext::from_canceling(&*lease, id)
+            .and_then(|context| self.runtime.discard_with_context(context));
+        #[cfg(not(feature = "experimental-public"))]
+        let discarded = self.runtime.discard_stage(id);
+        if discarded.is_err() {
             return self.finish(
                 lease,
                 id,
@@ -626,6 +650,12 @@ impl ControlService {
             let snapshot = snapshot.ok_or(ControlError::CorruptState)?;
             // Stop the new runtime before reversing host resources. If external
             // drift occurred, stop here; do not restore unrelated machine state.
+            #[cfg(feature = "experimental-public")]
+            {
+                let context = RuntimeRestoreContext::from_rolling_back(&*lease, id, plan, previous, &*self.clock)?;
+                self.runtime.stop_candidate_with_context(context)?;
+            }
+            #[cfg(not(feature = "experimental-public"))]
             self.runtime.stop_candidate(id, plan)?;
             check_observations(
                 &plan.body().resources,
@@ -638,7 +668,14 @@ impl ControlService {
                 &self.system.inspect(&plan.body().resources)?,
                 ObservationMode::Before,
             )?;
-            self.runtime.restore_previous(id, previous)?;
+            let context = RuntimeRestoreContext::from_rolling_back(
+                &*lease,
+                id,
+                plan,
+                previous,
+                &*self.clock,
+            )?;
+            self.runtime.restore_previous_with_context(context)?;
             self.runtime.verify_previous(id, previous)?;
             self.runtime.discard_stage(id)?;
             Ok::<(), ControlError>(())

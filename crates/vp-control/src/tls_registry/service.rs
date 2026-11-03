@@ -6,6 +6,12 @@ use std::time::Instant;
 use subtle::ConstantTimeEq;
 use vp_product_domain::{SecretBytes, SecretRef};
 
+// Borrowed durable action identity for private completion only.
+struct PendingAction<'a> {
+    actor: &'a str,
+    action: &'a str,
+}
+
 pub trait TlsAssetWriterLease {
     fn aggregate(&self) -> &TlsControlEnvelope;
     fn persist_asset(&mut self, mutation: TlsAssetMutation) -> Result<(), ControlError>;
@@ -51,9 +57,16 @@ pub struct TlsBackendPolicy {
     pub(super) actor: String,
     pub(super) anchors: Vec<rustls::pki_types::CertificateDer<'static>>,
     pub(super) name: rustls::pki_types::ServerName<'static>,
+    #[cfg(feature = "experimental-public")]
+    name_text: String,
     pub(super) fingerprint: String,
 }
 impl TlsBackendPolicy {
+    /// Public trust material only; never exposes keys or credentials.
+    #[cfg(feature = "experimental-public")]
+    pub fn probe_trust(&self) -> (Vec<Vec<u8>>, String) {
+        (self.anchors.iter().map(|v| v.as_ref().to_vec()).collect(), self.name_text.clone())
+    }
     pub fn new(actor: String, anchors: Vec<Vec<u8>>, name: String) -> Result<Self, ControlError> {
         if !token(&actor)
             || anchors.is_empty()
@@ -75,6 +88,8 @@ impl TlsBackendPolicy {
             actor,
             anchors: anchors.into_iter().map(Into::into).collect(),
             name: parsed_name,
+            #[cfg(feature = "experimental-public")]
+            name_text: name,
             fingerprint,
         })
     }
@@ -203,8 +218,10 @@ impl<'a> TlsImportService<'a> {
         self.complete_pending(
             lease,
             vault,
-            &request.actor,
-            &request.action,
+            PendingAction {
+                actor: &request.actor,
+                action: &request.action,
+            },
             deadline,
             cancel,
             Some((&request.chain, &request.key)),
@@ -238,12 +255,12 @@ impl<'a> TlsImportService<'a> {
         &self,
         lease: &mut dyn TlsAssetWriterLease,
         vault: &dyn TlsVaultIo,
-        actor: &str,
-        action: &str,
+        identity: PendingAction<'_>,
         deadline: Instant,
         cancel: &CancellationToken,
         uploaded: Option<(&SecretBytes, &SecretBytes)>,
     ) -> Result<(), ControlError> {
+        let PendingAction { actor, action } = identity;
         let (asset, created) = self.pending(lease, actor, action)?;
         let chain = exact_read(vault, &asset.chain_ref, 6, asset.chain_version, deadline)?
             .ok_or(ControlError::RecoveryRequired)?;
@@ -295,8 +312,10 @@ impl<'a> TlsImportService<'a> {
         self.complete_pending(
             lease,
             vault,
-            &request.actor,
-            &request.action,
+            PendingAction {
+                actor: &request.actor,
+                action: &request.action,
+            },
             deadline,
             cancel,
             None,
@@ -304,6 +323,11 @@ impl<'a> TlsImportService<'a> {
     }
     /// Reupload only never-reserved missing records of the SAME durable action.
     /// Present records must match intent and uploaded exact public identity first.
+    ///
+    /// The explicit public arguments preserve this backend API: writer and vault
+    /// identify the two stores; request carries durable action intent; chain/key
+    /// are separately owned sensitive inputs; deadline/cancellation bound IO.
+    /// Keep them explicit rather than change callers for a parameter-count lint.
     pub fn reupload_missing(
         &self,
         lease: &mut dyn TlsAssetWriterLease,
@@ -368,8 +392,10 @@ impl<'a> TlsImportService<'a> {
         self.complete_pending(
             lease,
             vault,
-            &request.actor,
-            &request.action,
+            PendingAction {
+                actor: &request.actor,
+                action: &request.action,
+            },
             deadline,
             cancel,
             None,

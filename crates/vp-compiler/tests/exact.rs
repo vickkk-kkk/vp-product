@@ -18,7 +18,10 @@ fn release() -> ReleaseIdentity {
             minimum: 1,
             maximum: 1,
         },
-        abi: VersionPair { major: 1, minor: 0 },
+        abi: VersionPair {
+            major: ABI_MAJOR,
+            minor: ABI_MINOR,
+        },
         api: VersionPair { major: 1, minor: 0 },
         evidence_manifest_hash: None,
     }

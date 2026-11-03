@@ -10,7 +10,9 @@ pub use migration::PayloadMigrationReceipt;
 mod bound;
 mod sqlite;
 #[cfg(target_os = "linux")]
-pub use bound::{AnchoredControlRoot, BoundDirectory, BoundOpenMode, DirectoryIdentity};
+pub use bound::{
+    AnchoredControlRoot, BoundDirectory, BoundOpenMode, DirectoryIdentity, ReadOnlyBoundFile,
+};
 #[cfg(target_os = "linux")]
 mod fresh;
 pub use artifacts::*;
@@ -45,4 +47,7 @@ fn private_test_directory() -> tempfile::TempDir {
 #[cfg(target_os = "linux")]
 mod tls;
 #[cfg(target_os = "linux")]
-pub use tls::{TlsSqliteStore, TlsWriter};
+pub use tls::{
+    inspect_tls_control_read_only, TlsControlInspection, TlsControlSnapshot, TlsSqliteStore,
+    TlsWriter,
+};

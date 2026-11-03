@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "evidence": [
+    {
+      "file": "boringtun-0.6.0-BSD-3-Clause.txt",
+      "license": "BSD-3-Clause",
+      "source": "https://github.com/cloudflare/boringtun/blob/18eaf59c9c9718850c63e1c82ba933e09224d3dd/LICENSE.md",
+      "source_commit": "18eaf59c9c9718850c63e1c82ba933e09224d3dd",
+      "source_blob": "dfd871a44e50b8fe0177073111a0a1f2596eba98",
+      "file_sha256": "6dbef24708bad8c727bd80cca58ba8aa1637cdcb2cc6e9a31ea49235717e9391",
+      "scope": "complete source license file"
+    },
+    {
+      "file": "etherparse-0.17.0-MIT.txt",
+      "license": "MIT",
+      "source": "https://github.com/JulianSchmid/etherparse/blob/2cbbf41ff225cf9a97f59de21f2a9e649c47df32/LICENSE-MIT",
+      "source_commit": "2cbbf41ff225cf9a97f59de21f2a9e649c47df32",
+      "source_blob": "5f9b3332ed7952b2306944ab9b0d3af7431c0fa0",
+      "file_sha256": "4be7e6a9b3e7293807bbebfd081941c2d87fa445733e1ad0a9fc6efbc4f3029a",
+      "scope": "complete source license file"
+    },
+    {
+      "file": "etherparse-0.20.3-MIT.txt",
+      "license": "MIT",
+      "source": "https://github.com/JulianSchmid/etherparse/blob/752f96aaa73a878b3842008d8c501650884ba482/LICENSE-MIT",
+      "source_commit": "752f96aaa73a878b3842008d8c501650884ba482",
+      "source_blob": "5f9b3332ed7952b2306944ab9b0d3af7431c0fa0",
+      "file_sha256": "4be7e6a9b3e7293807bbebfd081941c2d87fa445733e1ad0a9fc6efbc4f3029a",
+      "scope": "complete source license file"
+    },
+    {
+      "file": "yasna-0.5.2-MIT.txt",
+      "license": "MIT",
+      "source": "https://github.com/qnighy/yasna.rs/blob/b7e65f9a4c317494cce2d18ea02b3d6eaaea7985/LICENSE-MIT",
+      "source_commit": "b7e65f9a4c317494cce2d18ea02b3d6eaaea7985",
+      "source_blob": "eaa67b3cb827ab4ece77b37e2de875657fc3cdee",
+      "file_sha256": "2a7df90e60fd5512b8bca35d3ce90e068f21c52d962855053fd1d9e2e7ca0f16",
+      "scope": "complete source license file"
+    },
+    {
+      "file": "json5-0.4.1-ISC.txt",
+      "license": "ISC",
+      "source": "https://github.com/callum-oakley/json5-rs/blob/5066f2e0a2726ceaeeb0a7786804787b3dc801f1/LICENCE",
+      "source_commit": "5066f2e0a2726ceaeeb0a7786804787b3dc801f1",
+      "source_blob": "98b4977e5d8673c5a5467858cec4b9de3445d5c2",
+      "file_sha256": "61f16940693f0ff048d7090dbf514f50f7d867f912f3315d599e8c2f685dd0d2",
+      "scope": "complete source license file"
+    },
+    {
+      "file": "tun-0.8.5-WTFPL-embedded.txt",
+      "license": "WTFPL",
+      "source": "https://github.com/meh/rust-tun/blob/75a19785bde45400a0a738940b19f6e7c3312441/src/lib.rs",
+      "source_commit": "75a19785bde45400a0a738940b19f6e7c3312441",
+      "source_blob": "65910c214afe692019dab64666b5538c8f639a78",
+      "file_sha256": "f9d857970963648b4e089bd25c11183e7c960fe901c25b41b1e805ce9bd59415",
+      "scope": "source lines 1-13"
+    }
+  ],
+  "note": "Exact source-commit notices; inclusion is not legal review or artifact-exact SBOM."
+}

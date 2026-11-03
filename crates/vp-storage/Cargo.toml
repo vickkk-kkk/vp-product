@@ -10,6 +10,7 @@ default = []
 private-tls = ["vp-product-control/private-tls"]
 
 [dependencies]
+vp-product-domain.workspace = true
 vp-product-control = { path = "../vp-control" }
 serde.workspace = true
 serde_json.workspace = true
@@ -20,7 +21,6 @@ sha2 = "=0.10.8"
 tempfile = "=3.19.1"
 
 [dev-dependencies]
-vp-product-domain.workspace = true
 tempfile = "=3.19.1"
 
 [lints]
@@ -29,4 +29,9 @@ workspace = true
 [[test]]
 name = "tls_profile"
 path = "tests/tls_profile.rs"
+harness = false
+
+[[test]]
+name = "tls_inspection"
+path = "tests/tls_inspection.rs"
 harness = false

@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "scope": "frozen e965 local bundle + installed loopback daemon/worker + CLI; no host services or network changes",
+  "daemonSha256": "e302257e8e276561ca3271bcf339392395cafd1ba69b446bc3212706f738b4e2",
+  "workerSha256": "5dae2017718147c6b2a5f939a398021367457790b391eec058807f4bcc163c91",
+  "attempts": [
+    {
+      "attempt": 1,
+      "startedAtUtc": "2026-10-30T07:42:12Z",
+      "endedAtUtc": "2026-10-30T07:42:16Z",
+      "status": "failed",
+      "log": "live-cli-attempt-1.log",
+      "failure": "CLI derived idempotency keys contained dots; shared IdempotencyKey rejects these before draft creation (HTTP 400 CONFIG_INVALID).",
+      "resolution": "Changed suffix separator to hyphen, tightened key validation, added regression against shared JSON Schema.",
+      "cleanup": "harness finally observed daemon exit 0; private TemporaryDirectory removed; no independent worker identity gate in this attempt"
+    },
+    {
+      "attempt": 2,
+      "startedAtUtc": "2026-10-30T07:44:12Z",
+      "endedAtUtc": "2026-10-30T07:44:18Z",
+      "status": "failed",
+      "log": "live-cli-attempt-2.log",
+      "failure": "Full API apply/observed probe/export rejection passed; immediate default-socket rebind after clean daemon stop returned EADDRINUSE. Uninstall gate not reached.",
+      "resolution": "Require connect refused plus SO_REUSEADDR bind AND listen (never SO_REUSEPORT), which still rejects a live listener while permitting ordinary TCP TIME_WAIT.",
+      "cleanup": "harness finally observed daemon exit 0; private TemporaryDirectory removed; no independent worker identity gate in this attempt"
+    },
+    {
+      "attempt": 3,
+      "startedAtUtc": "2026-10-30T07:49:01Z",
+      "endedAtUtc": "2026-10-30T07:49:08Z",
+      "status": "failed",
+      "log": "live-cli-attempt-3.log",
+      "failure": "New worker-exit observation assumed /proc/task/*/children; environment lacks that optional interface (including for self), so active worker identity could not be obtained.",
+      "resolution": "API owner confirmed frozen v1 private runtime.journal.json active.process pid/startTicks/bootId; use only owned temp journal and exact PID stat, never enumerate/guess/kill processes. Validated by attempt 4.",
+      "cleanup": "harness finally observed daemon exit 0; private TemporaryDirectory removed; worker identity assertion not established"
+    },
+    {
+      "attempt": 4,
+      "startedAtUtc": "2026-10-30T08:03:41Z",
+      "endedAtUtc": "2026-10-30T08:03:49Z",
+      "status": "passed",
+      "log": "live-cli.log",
+      "evidence": "live-cli-results.json",
+      "checks": "Verified local bundle and installed binary identity; real shared API apply and active forwarding probe; truthful export503/no file; graceful daemon exit and exact journal worker PID/startTicks/boot identity absence; durable runtime active/launching null; connect refused; SO_REUSEADDR bind+listen without SO_REUSEPORT; retaining uninstall; no test plaintext secrets in retained state/output.",
+      "cleanup": "All harness-owned CLI/packager subprocesses terminal; daemon exit 0; original worker process identity absent; TemporaryDirectory fully removed."
+    }
+  ],
+  "finalGate": "passed for frozen e965 file-only + loopback VLESS profile; not systemd, independent protocol certification or public release"
+}

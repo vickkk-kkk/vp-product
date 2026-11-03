@@ -67,3 +67,38 @@ def check_sealed_runtime_host():
         if fd is not None:
             os.close(fd)
     return result
+
+
+def check_glibc_requirement(required, *, confstr=None, system=None):
+    """Read-only compatibility check for a package-declared glibc minimum.
+
+    It does not execute the package or prove any other ABI/exec requirement. An
+    unknown or non-glibc host is never treated as compatible.
+    """
+    result = {"status": "unknown", "compatible": False, "required": required,
+              "observed": None, "reason": "glibc_version_unavailable"}
+    if not isinstance(required, str) or not re.fullmatch(r"[0-9]{1,3}\.[0-9]{1,3}(?:\.[0-9]{1,3})?", required):
+        result["reason"] = "invalid_package_glibc_requirement"
+        return result
+    system = system or platform.system
+    confstr = confstr or getattr(os, "confstr", None)
+    if system() != "Linux":
+        result["reason"] = "unsupported_operating_system"
+        return result
+    if confstr is None:
+        return result
+    try:
+        text = confstr("CS_GNU_LIBC_VERSION")
+    except (OSError, ValueError, AttributeError):
+        return result
+    match = re.fullmatch(r"glibc ([0-9]{1,3}\.[0-9]{1,3}(?:\.[0-9]{1,3})?)", text or "")
+    if match is None:
+        return result
+    observed = match.group(1)
+    installed = tuple((list(map(int, observed.split("."))) + [0, 0])[:3])
+    minimum = tuple((list(map(int, required.split("."))) + [0, 0])[:3])
+    compatible = installed >= minimum
+    result.update(status="compatible_not_execution_certified" if compatible else "incompatible",
+                  compatible=compatible, observed=observed,
+                  reason="glibc_meets_minimum" if compatible else "glibc_too_old")
+    return result

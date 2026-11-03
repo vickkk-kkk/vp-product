@@ -5,6 +5,7 @@
 pub mod capability;
 pub mod envelope;
 pub mod error;
+pub mod experimental_credential_frame;
 pub mod ids;
 pub mod management_secrets;
 pub mod node;

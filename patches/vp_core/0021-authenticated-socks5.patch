@@ -1,0 +1,472 @@
+--- a/crates/vp-protocol/src/inbound/socks5_in.rs
++++ b/crates/vp-protocol/src/inbound/socks5_in.rs
+@@ -16,10 +16,124 @@
+ use super::dispatch::{ClientReply, dispatch_stream};
+ use super::udp_nat::UdpNat;
+ 
++struct CredentialVerifier {
++    username: [u8; 32],
++    password: [u8; 32],
++}
++enum Socks5Authentication {
++    Anonymous,
++    UsernamePassword(Vec<CredentialVerifier>),
++}
++impl Socks5Authentication {
++    fn from_users(users: &[(String, String)]) -> Result<Self> {
++        use sha2::{Digest, Sha256};
++        if users.is_empty() || users.len() > 128 {
++            return Err(Error::Config("socks5 requires 1..128 users".into()));
++        }
++        let mut names = std::collections::HashSet::new();
++        let mut values = Vec::new();
++        for (username, password) in users {
++            if !(1..=255).contains(&username.len())
++                || !(1..=255).contains(&password.len())
++                || !names.insert(username)
++            {
++                return Err(Error::Config(
++                    "invalid or duplicate SOCKS5 credential".into(),
++                ));
++            }
++            values.push(CredentialVerifier {
++                username: Sha256::digest(username.as_bytes()).into(),
++                password: Sha256::digest(password.as_bytes()).into(),
++            });
++        }
++        Ok(Self::UsernamePassword(values))
++    }
++}
++async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
++    stream: &mut S,
++    policy: &Socks5Authentication,
++) -> Result<Option<usize>> {
++    use sha2::{Digest, Sha256};
++    let mut head = [0; 2];
++    stream.read_exact(&mut head).await?;
++    if head[0] != 5 || head[1] == 0 {
++        return Err(Error::Proto("invalid SOCKS5 greeting"));
++    }
++    let mut methods = [0; 255];
++    stream.read_exact(&mut methods[..head[1] as usize]).await?;
++    let method = match policy {
++        Socks5Authentication::Anonymous => 0,
++        Socks5Authentication::UsernamePassword(_) => 2,
++    };
++    if !methods[..head[1] as usize].contains(&method) {
++        stream.write_all(&[5, 255]).await?;
++        return Err(Error::Proto("SOCKS5 authentication method not offered"));
++    }
++    stream.write_all(&[5, method]).await?;
++    let Socks5Authentication::UsernamePassword(users) = policy else {
++        return Ok(None);
++    };
++    stream.read_exact(&mut head).await?;
++    if head[0] != 1 || head[1] == 0 {
++        stream.write_all(&[1, 1]).await?;
++        return Err(Error::Proto("invalid SOCKS5 authentication frame"));
++    }
++    let mut username = [0; 255];
++    stream.read_exact(&mut username[..head[1] as usize]).await?;
++    let username_hash: [u8; 32] = Sha256::digest(&username[..head[1] as usize]).into();
++    let length = stream.read_u8().await?;
++    if length == 0 {
++        stream.write_all(&[1, 1]).await?;
++        return Err(Error::Proto("invalid SOCKS5 authentication frame"));
++    }
++    let mut password = [0; 255];
++    stream.read_exact(&mut password[..length as usize]).await?;
++    let password_hash: [u8; 32] = Sha256::digest(&password[..length as usize]).into();
++    // Reuse the core's ring-HMAC equality oracle; raw secrets/verifiers are never
++    // placed in diagnostics. Best-effort stack scrub is not a process-compromise guarantee.
++    username.fill(0);
++    password.fill(0);
++    let mut selected = None;
++    for (index, user) in users.iter().enumerate() {
++        let name_matches = crate::tuic::credentials_equal(&user.username, &username_hash);
++        let password_matches = crate::tuic::credentials_equal(&user.password, &password_hash);
++        if name_matches & password_matches {
++            selected = Some(index);
++        }
++    }
++    stream
++        .write_all(&[1, if selected.is_some() { 0 } else { 1 }])
++        .await?;
++    selected
++        .map(Some)
++        .ok_or(Error::Proto("SOCKS5 authentication rejected"))
++}
++
++async fn authenticate_bounded<S: AsyncRead + AsyncWrite + Unpin>(
++    stream: &mut S,
++    policy: &Socks5Authentication,
++) -> Result<Option<usize>> {
++    tokio::time::timeout(Duration::from_secs(10), authenticate(stream, policy))
++        .await
++        .map_err(|_| Error::Proto("socks5 authentication timed out"))?
++}
++fn udp_client_endpoint(
++    dst: &DstAddr,
++    src: std::net::SocketAddr,
++) -> Result<Option<std::net::SocketAddr>> {
++    match &dst.host {
++        vp_common::Host::Ip(ip) if ip.is_unspecified() || *ip == src.ip() => {
++            Ok((dst.port != 0).then_some(std::net::SocketAddr::new(src.ip(), dst.port)))
++        }
++        _ => Err(Error::Proto("socks5 UDP client endpoint mismatch")),
++    }
++}
++
+ pub struct Socks5Inbound {
+     bind: String,
+     port: u16,
+     tag: Arc<str>,
++    authentication: Arc<Socks5Authentication>,
+ }
+ 
+ impl Socks5Inbound {
+@@ -28,7 +142,22 @@
+             bind,
+             port,
+             tag: tag.into(),
+-        }
++            authentication: Arc::new(Socks5Authentication::Anonymous),
++        }
++    }
++    /// Explicit RFC1929 policy; never falls back to the anonymous method.
++    pub fn new_authenticated(
++        bind: String,
++        port: u16,
++        tag: &str,
++        users: &[(String, String)],
++    ) -> Result<Self> {
++        Ok(Self {
++            bind,
++            port,
++            tag: tag.into(),
++            authentication: Arc::new(Socks5Authentication::from_users(users)?),
++        })
+     }
+ }
+ 
+@@ -42,6 +171,7 @@
+         let listener = TcpListener::bind((self.bind.as_str(), self.port)).await?;
+         let bound = listener.local_addr()?.port();
+         let tag = self.tag.clone();
++        let authentication = self.authentication.clone();
+         vp_core::task_scope::spawn_listener(self.tag().to_string(), async move {
+             loop {
+                 match listener.accept().await {
+@@ -49,10 +179,11 @@
+                         vp_transport::tune(&stream);
+                         let ctx = ctx.clone();
+                         let tag = tag.clone();
++                        let authentication = authentication.clone();
+                         vp_core::task_scope::spawn(async move {
+                             if let Err(e) = crate::server_route::on_port(
+                                 bound,
+-                                serve_socks5(stream, src, tag, &ctx),
++                                serve_socks5_authenticated(stream, src, tag, &ctx, &authentication),
+                             )
+                             .await
+                             {
+@@ -73,7 +204,7 @@
+ 
+ /// SOCKS5 服务端协议处理（泛型流，mixed 入站复用）
+ pub async fn serve_socks5<S>(
+-    mut stream: S,
++    stream: S,
+     src: std::net::SocketAddr,
+     tag: Arc<str>,
+     ctx: &InboundCtx,
+@@ -81,34 +212,42 @@
+ where
+     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+ {
+-    // 方法协商
+-    let mut head = [0u8; 2];
+-    stream.read_exact(&mut head).await?;
+-    if head[0] != 0x05 {
+-        return Err(Error::Proto("socks5 入站: 版本错误"));
+-    }
+-    let n = head[1] as usize;
+-    if n == 0 || n > 8 {
+-        return Err(Error::Proto("socks5 入站: 方法数非法"));
+-    }
+-    let mut methods = vec![0u8; n];
+-    stream.read_exact(&mut methods).await?;
+-    stream.write_all(&[0x05, 0x00]).await?; // 无认证
+-
+-    // 请求头：[ver][cmd][rsv]（atyp 起由 read_socks_addr 解析）
+-    let mut req = [0u8; 3];
+-    stream.read_exact(&mut req).await?;
+-    if req[0] != 0x05 {
+-        return Err(Error::Proto("socks5 入站: 请求版本错误"));
+-    }
+-    let dst = read_socks_addr(&mut stream).await?;
++    serve_socks5_authenticated(stream, src, tag, ctx, &Socks5Authentication::Anonymous).await
++}
++
++/// Authentication completes before destination parsing, routing, DNS or UDP bind.
++async fn serve_socks5_authenticated<S>(
++    mut stream: S,
++    src: std::net::SocketAddr,
++    tag: Arc<str>,
++    ctx: &InboundCtx,
++    authentication: &Socks5Authentication,
++) -> Result<()>
++where
++    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
++{
++    let user = authenticate_bounded(&mut stream, authentication).await?;
++    let (req, dst) = tokio::time::timeout(Duration::from_secs(10), async {
++        let mut req = [0u8; 3];
++        stream.read_exact(&mut req).await?;
++        if req[0] != 5 || req[2] != 0 {
++            return Err(Error::Proto("socks5 invalid request header"));
++        }
++        let dst = read_socks_addr(&mut stream).await?;
++        Ok::<_, Error>((req, dst))
++    })
++    .await
++    .map_err(|_| Error::Proto("socks5 request timed out"))??;
+     match req[1] {
+         0x01 => {
+-            let sess = crate::server_route::session(tag, src, dst, vp_core::Network::Tcp, 0, None);
++            let sess = crate::server_route::session(tag, src, dst, vp_core::Network::Tcp, 0, user);
+             dispatch_stream(ctx, sess, Box::new(stream), ClientReply::Socks5(0x00)).await;
+             Ok(())
+         }
+         0x03 => {
++            // RFC1928's requested client UDP endpoint is constrained to the
++            // authenticated TCP peer. Wildcard port is pinned on first packet.
++            let mut udp_peer = udp_client_endpoint(&dst, src)?;
+             // UDP ASSOCIATE：申请中继 socket，回复绑定地址，转入 UDP 泵
+             let bind_ip: std::net::IpAddr = if vp_core::task_scope::destination_policy()
+                 == vp_core::task_scope::DestinationPolicy::LoopbackIpOnly
+@@ -118,6 +257,8 @@
+                 } else {
+                     std::net::Ipv4Addr::LOCALHOST.into()
+                 }
++            } else if src.is_ipv6() {
++                std::net::Ipv6Addr::UNSPECIFIED.into()
+             } else {
+                 std::net::Ipv4Addr::UNSPECIFIED.into()
+             };
+@@ -133,7 +274,13 @@
+             let bound = relay.local_addr()?;
+             // 回复对客户端可达的地址：默认回环（本机客户端场景）；
+             // 远程客户端需内核开启 allow-lan 时由其自行访问绑定端口
+-            let local_ip = std::net::IpAddr::V4([127, 0, 0, 1].into());
++            let local_ip = if bind_ip.is_unspecified() {
++                // A wildcard UDP address is legal; the client substitutes the
++                // actual authenticated control peer address, not 127.0.0.1.
++                bind_ip
++            } else {
++                bound.ip()
++            };
+             let reply_addr = std::net::SocketAddr::new(local_ip, bound.port());
+             let mut rep = Vec::with_capacity(18);
+             rep.extend_from_slice(&[0x05, 0x00, 0x00]);
+@@ -141,7 +288,7 @@
+             stream.write_all(&rep).await?;
+             debug!("socks5 UDP ASSOCIATE {src} -> {reply_addr}");
+             let relay = Arc::new(relay);
+-            let nat = UdpNat::new(ctx.clone(), tag.clone(), relay.clone());
++            let nat = UdpNat::new_with_user(ctx.clone(), tag.clone(), relay.clone(), user);
+             nat.set_reply_formatter(Arc::new(|from_srv: std::net::SocketAddr, data: &[u8]| {
+                 // [rsv rsv frag][socks addr of server][payload]
+                 let mut pkt = vec![0x00, 0x00, 0x00];
+@@ -163,9 +310,9 @@
+                     r = relay.recv_from(&mut buf) => {
+                         let Ok((n, from)) = r else { break };
+                         tracing::debug!("udp relay 收到 {n}B from {from} (src={src})");
+-                        // RFC1928 允许客户端使用不同于控制连接的 UDP 端口，
+-                        // 仅校验同 IP（防外部注入）；严格校验随 M3 配置项提供
+-                        if from.ip() != src.ip() {
++                        // Only the authenticated control peer and pinned UDP
++                        // endpoint may submit data to this association.
++                        if from.ip() != src.ip() || udp_peer.is_some_and(|peer| peer != from) {
+                             tracing::debug!("udp 来源 IP 不匹配 {from} != {src}");
+                             continue;
+                         }
+@@ -173,13 +320,14 @@
+                             continue;
+                         }
+                         // socks udp: [rsv2][frag1][socks addr][payload]
+-                        if buf[2] != 0x00 {
++                        if buf[0] != 0 || buf[1] != 0 || buf[2] != 0x00 {
+                             continue; // 分片不支持
+                         }
+                         let (dst_addr, used) = match vp_common::addr::decode_socks_addr(&buf[3..n]) {
+                             Ok(x) => x,
+                             Err(_) => continue,
+                         };
++                        udp_peer.get_or_insert(from);
+                         let pkt = UdpPacket {
+                             src: from,
+                             dst: std::net::SocketAddr::new(
+@@ -234,3 +382,126 @@
+         }
+     }
+ }
++
++#[cfg(test)]
++mod authenticated_tests {
++    use super::*;
++
++    // Ephemeral synthetic fixtures: these are not stored product credentials.
++    fn policy() -> Socks5Authentication {
++        Socks5Authentication::from_users(&[("fixture-user".into(), "fixture-password".into())])
++            .unwrap()
++    }
++    async fn exchange(
++        bytes: &[u8],
++        policy: Socks5Authentication,
++    ) -> (Result<Option<usize>>, Vec<u8>) {
++        let (mut server, mut client) = tokio::io::duplex(1024);
++        client.write_all(bytes).await.unwrap();
++        client.shutdown().await.unwrap();
++        let result = authenticate(&mut server, &policy).await;
++        drop(server);
++        let mut reply = Vec::new();
++        client.read_to_end(&mut reply).await.unwrap();
++        (result, reply)
++    }
++    fn frame(username: &[u8], password: &[u8]) -> Vec<u8> {
++        let mut out = vec![5, 2, 0, 2, 1, username.len() as u8];
++        out.extend(username);
++        out.push(password.len() as u8);
++        out.extend(password);
++        out
++    }
++    #[tokio::test]
++    async fn authenticated_policy_never_downgrades_to_anonymous() {
++        let (result, reply) = exchange(&[5, 1, 0], policy()).await;
++        assert!(result.is_err());
++        assert_eq!(reply, [5, 255]);
++        let (result, reply) = exchange(&[5, 1, 2], Socks5Authentication::Anonymous).await;
++        assert!(result.is_err());
++        assert_eq!(reply, [5, 255]);
++    }
++    #[tokio::test]
++    async fn exact_username_and_password_select_user_before_request_is_read() {
++        let (mut server, mut client) = tokio::io::duplex(1024);
++        let mut bytes = frame(b"fixture-user", b"fixture-password");
++        bytes.push(42); // sentinel stands for a request not consumed by authentication
++        client.write_all(&bytes).await.unwrap();
++        assert_eq!(authenticate(&mut server, &policy()).await.unwrap(), Some(0));
++        assert_eq!(server.read_u8().await.unwrap(), 42);
++        let mut reply = [0; 4];
++        client.read_exact(&mut reply).await.unwrap();
++        assert_eq!(reply, [5, 2, 1, 0]);
++    }
++    #[tokio::test]
++    async fn wrong_and_retired_credentials_fail_closed() {
++        for (username, password) in [
++            (b"wrong".as_slice(), b"fixture-password".as_slice()),
++            (b"fixture-user", b"retired-password"),
++        ] {
++            let (result, reply) = exchange(&frame(username, password), policy()).await;
++            assert!(result.is_err());
++            assert_eq!(reply, [5, 2, 1, 1]);
++        }
++    }
++    #[tokio::test]
++    async fn malformed_empty_and_truncated_frames_cannot_authenticate() {
++        for bytes in [
++            vec![4, 1, 2],
++            vec![5, 0],
++            vec![5, 1, 2, 2, 1],
++            vec![5, 1, 2, 1, 0],
++            vec![5, 1, 2, 1, 1, b'u', 0],
++            vec![5, 1, 2, 1, 4, b'u'],
++        ] {
++            let (result, _) = exchange(&bytes, policy()).await;
++            assert!(result.is_err());
++        }
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn authentication_deadline_is_bounded_for_a_silent_client() {
++        let (_client, mut server) = tokio::io::duplex(1024);
++        assert!(matches!(
++            authenticate_bounded(&mut server, &policy()).await,
++            Err(Error::Proto("socks5 authentication timed out"))
++        ));
++    }
++    #[test]
++    fn udp_endpoint_validation_precedes_socket_allocation() {
++        let peer = "127.0.0.1:35000".parse().unwrap();
++        assert_eq!(
++            udp_client_endpoint(&DstAddr::ip([0, 0, 0, 0].into(), 0), peer).unwrap(),
++            None
++        );
++        assert_eq!(
++            udp_client_endpoint(&DstAddr::ip([127, 0, 0, 1].into(), 35001), peer).unwrap(),
++            Some("127.0.0.1:35001".parse().unwrap())
++        );
++        assert!(udp_client_endpoint(&DstAddr::ip([127, 0, 0, 2].into(), 35001), peer).is_err());
++        assert!(
++            udp_client_endpoint(
++                &DstAddr {
++                    host: vp_common::Host::Domain("localhost".into()),
++                    port: 35001
++                },
++                peer
++            )
++            .is_err()
++        );
++    }
++    #[test]
++    fn invalid_configuration_fails_before_any_bind() {
++        for users in [
++            vec![],
++            vec![(String::new(), "p".into())],
++            vec![("u".into(), String::new())],
++            vec![("u".repeat(256), "p".into())],
++            vec![("u".into(), "a".into()), ("u".into(), "b".into())],
++        ] {
++            assert!(
++                Socks5Inbound::new_authenticated("127.0.0.1".into(), 0, "fixture", &users).is_err()
++            );
++        }
++    }
++}
+--- a/crates/vp-protocol/src/inbound/udp_nat.rs
++++ b/crates/vp-protocol/src/inbound/udp_nat.rs
+@@ -20,15 +20,25 @@
+ pub struct UdpNat {
+     ctx: InboundCtx,
+     tag: Arc<str>,
++    user: Option<usize>,
+     relay: Arc<UdpSocket>,
+     association: Mutex<Option<Association>>,
+     reply_formatter: Arc<StdMutex<Option<ReplyFormatter>>>,
+ }
+ impl UdpNat {
+     pub fn new(ctx: InboundCtx, tag: Arc<str>, relay: Arc<UdpSocket>) -> Arc<Self> {
++        Self::new_with_user(ctx, tag, relay, None)
++    }
++    pub fn new_with_user(
++        ctx: InboundCtx,
++        tag: Arc<str>,
++        relay: Arc<UdpSocket>,
++        user: Option<usize>,
++    ) -> Arc<Self> {
+         Arc::new(Self {
+             ctx,
+             tag,
++            user,
+             relay,
+             association: Mutex::new(None),
+             reply_formatter: Arc::new(StdMutex::new(None)),
+@@ -56,7 +66,7 @@
+                 destination.clone(),
+                 vp_core::Network::Udp,
+                 0,
+-                None,
++                self.user,
+             );
+             let (sender, mut receiver) =
+                 crate::server_route::datagrams(self.ctx.router.clone(), template);

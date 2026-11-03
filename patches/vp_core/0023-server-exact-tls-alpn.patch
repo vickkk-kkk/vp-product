@@ -1,0 +1,239 @@
+--- a/crates/vp-transport/src/server.rs
++++ b/crates/vp-transport/src/server.rs
+@@ -240,12 +240,40 @@
+         })?;
+         Ok(Self { config })
+     }
++
++    /// Preserve the caller's exact ordered ALPN list. This does not infer a
++    /// carrier or silently replace an unsupported application protocol.
++    pub fn from_pem_with_alpn(cert_pem: &[u8], key_pem: &[u8], alpn: Vec<Vec<u8>>) -> Result<Self> {
++        validate_alpn(&alpn)?;
++        let mut identity = Self::from_pem(cert_pem, key_pem)?;
++        identity.config.alpn_protocols = alpn;
++        Ok(identity)
++    }
++}
++
++fn validate_alpn(alpn: &[Vec<u8>]) -> Result<()> {
++    let mut seen = std::collections::HashSet::new();
++    if alpn.len() > 16
++        || alpn.iter().any(|value| {
++            value.is_empty()
++                || value.len() > 255
++                || value.iter().any(|b| !b.is_ascii_graphic())
++                || !seen.insert(value)
++        })
++    {
++        return Err(Error::Config(
++            "invalid, duplicate or oversized TLS ALPN list".into(),
++        ));
++    }
++    Ok(())
+ }
+ 
+ #[derive(Clone)]
+ pub struct ServerTransport {
+     network: ServerNetwork,
+     tls: Option<tokio_rustls::TlsAcceptor>,
++    // Present only for explicit nonempty ALPN. Legacy new remains compatible.
++    required_alpn: Option<Vec<Vec<u8>>>,
+     limits: ServerLimits,
+ }
+ impl ServerTransport {
+@@ -274,6 +302,52 @@
+         Ok(Self {
+             network,
+             tls,
++            required_alpn: None,
++            limits,
++        })
++    }
++
++    /// Exact-policy constructor: never replaces identity ALPN. An explicit
++    /// nonempty list also requires the client to negotiate one of those values.
++    pub fn new_exact_alpn(
++        network: ServerNetwork,
++        tls: Option<ServerTlsIdentity>,
++        limits: ServerLimits,
++    ) -> Result<Self> {
++        limits.validate()?;
++        if matches!(&network, ServerNetwork::WebSocket(r) | ServerNetwork::HttpUpgrade(r) if r.method.is_some())
++        {
++            return Err(Error::Config(
++                "upgrade method must be GET (do not set a method override)".into(),
++            ));
++        }
++        let mut required_alpn = None;
++        let tls = if let Some(identity) = tls {
++            let alpn = &identity.config.alpn_protocols;
++            validate_alpn(alpn)?;
++            let compatible = match &network {
++                ServerNetwork::Tcp => true,
++                ServerNetwork::Http2(_) => alpn == &[b"h2".to_vec()],
++                ServerNetwork::WebSocket(_) | ServerNetwork::HttpUpgrade(_) => {
++                    alpn.is_empty() || alpn == &[b"http/1.1".to_vec()]
++                }
++            };
++            if !compatible {
++                return Err(Error::Config(
++                    "TLS ALPN incompatible with server transport".into(),
++                ));
++            }
++            if !alpn.is_empty() {
++                required_alpn = Some(alpn.clone());
++            }
++            Some(tokio_rustls::TlsAcceptor::from(Arc::new(identity.config)))
++        } else {
++            None
++        };
++        Ok(Self {
++            network,
++            tls,
++            required_alpn,
+             limits,
+         })
+     }
+@@ -290,6 +364,9 @@
+             let mut io = if let Some(tls) = &self.tls {
+                 let stream = tls.accept(io).await?;
+                 let alpn = stream.get_ref().1.alpn_protocol();
++                if self.required_alpn.as_ref().is_some_and(|allowed| !alpn.is_some_and(|selected| allowed.iter().any(|p| p.as_slice() == selected))) {
++                    return Err(Error::Proto("TLS required ALPN was not negotiated"));
++                }
+                 if matches!(self.network, ServerNetwork::Http2(_)) && alpn != Some(b"h2".as_slice()) {
+                     return Err(Error::Proto("HTTP/2 requires negotiated h2 ALPN"));
+                 }
+@@ -406,3 +483,132 @@
+ 
+ #[cfg(test)]
+ mod tests;
++
++#[cfg(test)]
++mod exact_alpn_tests {
++    use super::*;
++    use std::sync::atomic::{AtomicUsize, Ordering};
++    fn certificate() -> rcgen::CertifiedKey {
++        // Test-only ephemeral key, never written to disk or logs.
++        rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap()
++    }
++    fn identity(cert: &rcgen::CertifiedKey, alpn: &[&str]) -> ServerTlsIdentity {
++        ServerTlsIdentity::from_pem_with_alpn(
++            cert.cert.pem().as_bytes(),
++            cert.key_pair.serialize_pem().as_bytes(),
++            alpn.iter().map(|s| s.as_bytes().to_vec()).collect(),
++        )
++        .unwrap()
++    }
++    fn connector(cert: &rcgen::CertifiedKey, alpn: &[&str]) -> tokio_rustls::TlsConnector {
++        let mut roots = rustls::RootCertStore::empty();
++        roots.add(cert.cert.der().clone()).unwrap();
++        let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
++            rustls::crypto::ring::default_provider(),
++        ))
++        .with_safe_default_protocol_versions()
++        .unwrap()
++        .with_root_certificates(roots)
++        .with_no_client_auth();
++        cfg.alpn_protocols = alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
++        tokio_rustls::TlsConnector::from(Arc::new(cfg))
++    }
++    #[test]
++    fn explicit_order_survives_and_incompatible_carriers_fail() {
++        let cert = certificate();
++        let id = identity(&cert, &["protocol-b", "protocol-a"]);
++        assert_eq!(
++            id.config.alpn_protocols,
++            [b"protocol-b".to_vec(), b"protocol-a".to_vec()]
++        );
++        let transport =
++            ServerTransport::new_exact_alpn(ServerNetwork::Tcp, Some(id), ServerLimits::default())
++                .unwrap();
++        assert_eq!(
++            transport.required_alpn.unwrap(),
++            [b"protocol-b".to_vec(), b"protocol-a".to_vec()]
++        );
++        for network in [
++            ServerNetwork::Http2(HttpRoute::new("/", vec![]).unwrap()),
++            ServerNetwork::WebSocket(HttpRoute::new("/", vec![]).unwrap()),
++            ServerNetwork::HttpUpgrade(HttpRoute::new("/", vec![]).unwrap()),
++        ] {
++            assert!(
++                ServerTransport::new_exact_alpn(
++                    network,
++                    Some(identity(&cert, &["not-http"])),
++                    ServerLimits::default()
++                )
++                .is_err()
++            );
++        }
++    }
++    #[test]
++    fn malformed_alpn_and_mismatched_private_key_are_rejected() {
++        for alpn in [
++            vec![vec![]],
++            vec![b"h2".to_vec(), b"h2".to_vec()],
++            vec![b"bad\n".to_vec()],
++            vec![vec![b'x'; 256]],
++            vec![b"a".to_vec(); 17],
++        ] {
++            assert!(validate_alpn(&alpn).is_err());
++        }
++        let first = certificate();
++        let second = certificate();
++        assert!(
++            ServerTlsIdentity::from_pem_with_alpn(
++                first.cert.pem().as_bytes(),
++                second.key_pair.serialize_pem().as_bytes(),
++                vec![]
++            )
++            .is_err()
++        );
++        assert!(
++            ServerTlsIdentity::from_pem_with_alpn(first.cert.pem().as_bytes(), b"", vec![])
++                .is_err()
++        );
++    }
++    #[tokio::test]
++    async fn real_tls_preserves_negotiated_alpn_and_rejects_missing_or_wrong_offer() {
++        for offered in [vec!["protocol-a"], vec!["wrong"], vec![]] {
++            let cert = certificate();
++            let server = ServerTransport::new_exact_alpn(
++                ServerNetwork::Tcp,
++                Some(identity(&cert, &["protocol-b", "protocol-a"])),
++                ServerLimits::default(),
++            )
++            .unwrap();
++            let (server_io, client_io) = tokio::io::duplex(16384);
++            let called = Arc::new(AtomicUsize::new(0));
++            let observed = called.clone();
++            let client = connector(&cert, &offered);
++            let (served, connected) =
++                tokio::time::timeout(std::time::Duration::from_secs(2), async {
++                    tokio::join!(
++                        server.serve(Box::new(server_io), move |_| {
++                            observed.fetch_add(1, Ordering::SeqCst);
++                            async { Ok(()) }
++                        }),
++                        client.connect(
++                            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
++                            client_io
++                        )
++                    )
++                })
++                .await
++                .unwrap();
++            if offered == ["protocol-a"] {
++                assert!(served.is_ok());
++                assert_eq!(
++                    connected.unwrap().get_ref().1.alpn_protocol(),
++                    Some(b"protocol-a".as_slice())
++                );
++                assert_eq!(called.load(Ordering::SeqCst), 1);
++            } else {
++                assert!(served.is_err());
++                assert_eq!(called.load(Ordering::SeqCst), 0);
++            }
++        }
++    }
++}

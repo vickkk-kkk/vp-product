@@ -240,3 +240,75 @@ source_tests = ["vp-app::tests::uot_ss_e2e", "vp-app::tests::rule_provider_onlin
 execution_status = "Final private routing6/UoT6 passed with exact source/binary before-after; full generated pin rerun pending"
 remove_when = "Upstream has authenticated bounded SS UoT with equivalent per-target policy/metadata, reserved-name handling and positive real encapsulation tests"
 limitations = ["UoT v1 only; v2 rejected", "Only SS raw ingress gains this bridge; other raw ingress still rejects reserved control names", "ASCII case normalization follows existing SOCKS decoder; trailing-root variants are reserved but not accepted as v1", "Same-engine UoT regression is not independent UoT certification", "Server target-domain DNS after selection remains local, not proxy-side DNS privacy"]
+
+[[patch]]
+id = "P02-private-authenticated-socks5"
+path = "patches/vp_core/0021-authenticated-socks5.patch"
+origin = "Private server-v2 source candidate on e965; independently validated next"
+reason = "Exact typed server constructor semantics, no silent downgrade"
+work_packages = ["WP02", "WP07"]
+acceptance_ids = ["ACC-SEC-001"]
+source_tests = ["named focused tests recorded in server-v2 evidence"]
+execution_status = "not-run-before-this-lane"
+remove_when = "Upstream supplies matching semantics with full independent evidence"
+limitations = ["No public release certification", "v2 IPC and certificate resolver pending"]
+
+[[patch]]
+id = "P02-private-tuic-exact-server-options"
+path = "patches/vp_core/0022-tuic-exact-server-options.patch"
+origin = "Private server-v2 source candidate on e965; independently validated next"
+reason = "Exact typed server constructor semantics, no silent downgrade"
+work_packages = ["WP02", "WP07"]
+acceptance_ids = ["ACC-SEC-001"]
+source_tests = ["named focused tests recorded in server-v2 evidence"]
+execution_status = "not-run-before-this-lane"
+remove_when = "Upstream supplies matching semantics with full independent evidence"
+limitations = ["No public release certification", "v2 IPC and certificate resolver pending"]
+
+[[patch]]
+id = "P02-private-server-exact-tls-alpn"
+path = "patches/vp_core/0023-server-exact-tls-alpn.patch"
+origin = "Private server-v2 source candidate on e965; independently validated next"
+reason = "Exact typed server constructor semantics, no silent downgrade"
+work_packages = ["WP02", "WP07"]
+acceptance_ids = ["ACC-SEC-001"]
+source_tests = ["named focused tests recorded in server-v2 evidence"]
+execution_status = "not-run-before-this-lane"
+remove_when = "Upstream supplies matching semantics with full independent evidence"
+limitations = ["No public release certification", "v2 IPC and certificate resolver pending"]
+
+[[patch]]
+id = "P11-protected-bootstrap-dual-stack"
+path = "patches/vp_core/0024-proxy-dns-dualstack.patch"
+origin = "Preserved e965 bootstrap dual-stack source candidate fad4cc3570ba9ddbc6d3152f54e6d00bb0e36b19"
+reason = "Bounded protected A/AAAA bootstrap queries retaining completed answers without direct fallback"
+work_packages = ["WP02", "P11"]
+acceptance_ids = ["ACC-SEC-001"]
+source_tests = ["vp-dns::bootstrap_dual_stack_tests", "vp-tun::proxy_dns"]
+execution_status = "not-run-before-this-isolated-lane"
+remove_when = "Upstream provides matching protected bounded dual-stack endpoint bootstrap and native evidence"
+limitations = ["Not Happy Eyeballs or full IPv6-only platform acceptance", "No public release certification"]
+
+[[patch]]
+id = "P09-experimental-public-safety"
+path = "patches/vp_core/0025-experimental-public-safety.patch"
+origin = "Independent experimental working copy"
+reason = "Explicit exact destination authorization, process-level floor and TCP-only experimental SS"
+work_packages = ["WP02", "WP07", "WP09"]
+acceptance_ids = ["ACC-SEC-001"]
+source_tests = ["vp-core destination and host-network unit tests", "vp-protocol SS TCP-only unit test"]
+execution_status = "Partial; focused offline tests pass, external interoperability not run"
+remove_when = "Upstream supplies equivalent reviewed and independently verified semantics"
+limitations = ["Experimental, default off", "IPv4 exact targets only; domains and UDP denied", "No external interoperability or release certification", "Network bypass and lifecycle audits incomplete"]
+
+[[patch]]
+id = "P09-process-local-probe"
+path = "patches/vp_core/0026-process-local-probe.patch"
+origin = "Independent experimental working copy"
+reason = "Bounded process-local authentication challenge with no network socket"
+work_packages = ["WP02", "WP07", "WP09"]
+acceptance_ids = ["ACC-SEC-001"]
+source_tests = ["vp-core::experimental_virtual_probe", "vp-core::task_scope::destination_tests"]
+execution_status = "Partial; focused local checks pass, full protocol and public integration pending"
+remove_when = "Upstream supplies equivalent reviewed process-local observation and egress safeguards"
+limitations = ["Experimental, default off", "No external interoperability or release certification", "Public worker and network bypass audits incomplete"]

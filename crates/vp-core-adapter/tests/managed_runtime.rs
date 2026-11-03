@@ -316,52 +316,213 @@ fn journal_generation_seed_is_consumed_exactly_once() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn parent_process_crash_closes_worker_via_pipe_eof() {
+    use rustix::process::{pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
+    use std::{
+        io::BufRead,
+        process::{Child, Stdio},
+        time::Instant,
+    };
     const DRIVER: &str = "VP_MANAGED_CRASH_DRIVER";
+    // Capture start time and parent identity while the retained driver is alive.
+    // A later numeric PID reuse is never a signal target.
+    fn identity(pid: u32) -> Option<(u64, u32, char)> {
+        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => panic!("cannot inspect owned process: {e}"),
+        };
+        let fields: Vec<_> = stat
+            .rsplit_once(") ")
+            .unwrap()
+            .1
+            .split_whitespace()
+            .collect();
+        Some((
+            fields[19].parse().unwrap(),
+            fields[1].parse().unwrap(),
+            fields[0].chars().next().unwrap(),
+        ))
+    }
     if std::env::var(DRIVER).as_deref() == Ok("yes") {
         let mut runtime = ManagedRuntime::new(worker());
         let observed = start(&mut runtime, config(0));
-        println!("VP_CHILD={}:{}", observed.pid, observed.listeners[0].port);
+        let (ticks, parent, _) = identity(observed.pid).unwrap();
+        assert_eq!(parent, std::process::id());
+        println!(
+            "VP_CHILD={}:{}:{ticks}",
+            observed.pid, observed.listeners[0].port
+        );
         std::io::stdout().flush().unwrap();
-        // Deliberately bypass ALL Rust Drop guards, like a daemon crash.
+        // Parent first retains a verified pidfd, then authorizes this synthetic
+        // driver crash. No existing process or external PID is admitted.
+        let mut go = [0];
+        if std::io::stdin().read_exact(&mut go).is_err() || go != [1] {
+            // Pre-pidfd parent failure closes stdin. Abort cooperatively while
+            // this driver still owns the actual ManagedRuntime/Child handles.
+            let stopped = runtime.stop(observed.generation, Duration::ZERO).unwrap();
+            assert!(stopped.process_exited && stopped.remaining_tasks == 0);
+            eprintln!("VP_ABORT_REAPED={}:{ticks}", observed.pid);
+            std::process::exit(24);
+        }
         std::process::exit(23);
     }
+    struct Driver(Child);
+    impl Drop for Driver {
+        fn drop(&mut self) {
+            // EOF requests explicit runtime stop/reap before authorization.
+            // This also covers marker parsing/timeout and pidfd acquisition errors.
+            drop(self.0.stdin.take());
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                if matches!(self.0.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            eprintln!("VP_DRIVER_COOPERATIVE_ABORT_TIMEOUT: forcing retained driver cleanup");
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    struct OwnedWorker {
+        fd: rustix::fd::OwnedFd,
+        armed: bool,
+    }
+    impl Drop for OwnedWorker {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = pidfd_send_signal(&self.fd, Signal::KILL);
+            }
+        }
+    }
+    let mut driver = Driver(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "parent_process_crash_closes_worker_via_pipe_eof",
+                "--nocapture",
+            ])
+            .env(DRIVER, "yes")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = driver.0.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let reader = std::thread::spawn(move || {
+        let lines = std::io::BufReader::new(stdout.take(4096)).lines();
+        for line in lines {
+            let line = line.unwrap();
+            if let Some(marker) = line.strip_prefix("VP_CHILD=") {
+                let _ = sender.send(marker.to_owned());
+                return;
+            }
+        }
+    });
+    let marker = receiver.recv_timeout(Duration::from_secs(20)).unwrap();
+    reader.join().unwrap();
+    let fields: Vec<_> = marker.split(':').collect();
+    assert_eq!(fields.len(), 3);
+    let pid: u32 = fields[0].parse().unwrap();
+    let port: u16 = fields[1].parse().unwrap();
+    let ticks: u64 = fields[2].parse().unwrap();
+    assert!(pid > 1 && pid != std::process::id());
+    if std::env::var("VP_MANAGED_ABORT_BEFORE_PIDFD").as_deref() == Ok("yes") {
+        // Separate negative fixture: no worker pidfd is acquired and no crash
+        // authorization is sent. Closing stdin must make the owner stop/reap.
+        drop(driver.0.stdin.take());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(status) = driver.0.try_wait().unwrap() {
+                assert_eq!(status.code(), Some(24));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cooperative driver abort did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut acknowledgment = String::new();
+        driver
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .take(4096)
+            .read_to_string(&mut acknowledgment)
+            .unwrap();
+        assert!(acknowledgment
+            .lines()
+            .any(|line| line == format!("VP_ABORT_REAPED={pid}:{ticks}")));
+        assert!(identity(pid).is_none_or(|(current, _, state)| current != ticks || state == 'Z'));
+        assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok());
+        return;
+    }
+    let expected_parent = driver.0.id();
+    let before = identity(pid).expect("owned worker exited before pidfd acquisition");
+    assert_eq!((before.0, before.1), (ticks, expected_parent));
+    let fd = pidfd_open(
+        Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
+        PidfdFlags::empty(),
+    )
+    .unwrap();
+    let after = identity(pid).expect("owned worker exited during pidfd acquisition");
+    assert_eq!((after.0, after.1), (ticks, expected_parent));
+    // Arm cleanup only after identity was verified on both sides of pidfd_open.
+    let mut owned = OwnedWorker { fd, armed: true };
+    driver.0.stdin.take().unwrap().write_all(&[1]).unwrap();
+    let driver_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = driver.0.try_wait().unwrap() {
+            assert_eq!(status.code(), Some(23));
+            break;
+        }
+        assert!(
+            Instant::now() < driver_deadline,
+            "owned driver did not exit"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let ended = identity(pid)
+            .is_none_or(|(current_ticks, _, state)| current_ticks != ticks || state == 'Z');
+        if ended && TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+            owned.armed = false;
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker survived parent crash or retained listener"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn parent_process_abort_before_pidfd_cooperatively_reaps_worker() {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
             "parent_process_crash_closes_worker_via_pipe_eof",
             "--nocapture",
         ])
-        .env(DRIVER, "yes")
+        .env("VP_MANAGED_ABORT_BEFORE_PIDFD", "yes")
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(23));
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let marker = stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("VP_CHILD="))
-        .unwrap();
-    let (pid, port) = marker.split_once(':').unwrap();
-    let pid: u32 = pid.parse().unwrap();
-    let port: u16 = port.parse().unwrap();
-    assert!(pid > 1 && pid != std::process::id());
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    loop {
-        let ended = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
-            stat.split_once(") ")
-                .is_some_and(|(_, tail)| tail.starts_with("Z "))
-        });
-        if ended && TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = std::process::Command::new("/bin/kill")
-                .args(["-KILL", &pid.to_string()])
-                .status();
-            panic!("worker survived parent crash or retained listener");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    assert!(
+        output.status.success(),
+        "cooperative pre-pidfd abort fixture failed"
+    );
 }
 
 #[test]

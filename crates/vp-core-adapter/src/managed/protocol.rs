@@ -181,6 +181,10 @@ pub struct BoundListener {
     pub port: u16,
     pub accept_loop_live: bool,
 }
+/// Bounded one-way observations of process-local test challenges, not user credentials.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProbeLedgerObservation { pub version: u8, pub token_hashes: Vec<String>, pub saturated: bool }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkerSnapshot {
@@ -192,6 +196,8 @@ pub struct WorkerSnapshot {
     pub task_panics: u64,
     /// Explicitly false: bound + live accept loops are not forwarding evidence.
     pub forwarding_verified: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_ledger: Option<ProbeLedgerObservation>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

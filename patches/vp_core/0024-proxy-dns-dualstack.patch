@@ -1,0 +1,835 @@
+diff --git a/crates/vp-dns/BOOTSTRAP_DUAL_STACK.md b/crates/vp-dns/BOOTSTRAP_DUAL_STACK.md
+new file mode 100644
+index 0000000..db18643
+--- /dev/null
++++ b/crates/vp-dns/BOOTSTRAP_DUAL_STACK.md
+@@ -0,0 +1,114 @@
++# Protected bootstrap hostname dual stack — source-only candidate
++
++Base: `e96584fb8c7a38aa2c24beb89dcf969e70c24c93` (20-patch pinned core).
++This is a required follow-on to the previous A-only bootstrap implementation,
++not evidence of completed IPv6-network or native-platform acceptance.
++
++## Scope and behavior
++
++Only `vp-dns` protected `lookup_host` endpoint resolution changes. No live
++integration source, core-lock, mobile/ABI contract, guest APK, upstream research
++checkout source, or frozen fa3/af79 upgrade candidate is modified.
++
++`Resolver::resolve_bootstrap_dual_stack(&str) -> Result<Vec<IpAddr>>` requires an
++explicit bootstrap resolver and validates the exact endpoint name before any
++query. All numeric configured resolver destinations are checked against the
++TaskScope destination policy before starting any query. Existing `Bootstrap`
++purpose and host protection callbacks remain on every socket before connect/send.
++
++- A and AAAA are issued concurrently to the existing 1..4 numeric bootstrap
++  servers: **at most 8 tracked query tasks per lookup**.
++- All families, servers and CNAME work share a **single 3-second wall deadline**.
++  This is not a sequential 3-second-per-family/per-CNAME timeout.
++- Results are collected individually before the deadline. A valid completed
++  result is retained when another family or another configured resolver errors,
++  returns an invalid/unassociated reply, produces no address, or times out.
++- With no usable completed result, return an explicit A-and-AAAA bootstrap error.
++  There is no system, direct user-DNS, unconfigured resolver or public-provider
++  fallback. Numeric proxy endpoints still bypass DNS; that is not the hostname
++  dual-stack implementation or its test substitute.
++- Within each family, preserve configured server order and wire answer order,
++  remove duplicate IPs, and interleave **IPv4-first / IPv6 / IPv4 / IPv6 ...**.
++  Arrival timing does not choose the output order. Exhausting one family retains
++  every unique address in the other, subject to existing bounded wire parsing.
++- The existing 4096-byte/128-record response and 8-followed-CNAME limits remain.
++  Completed address lists are bounded by these limits and the 8 queries; no new
++  unbounded query fanout or detached tasks are introduced. These are per-lookup
++  limits, not a new process-wide connection/task limit.
++- JoinSet and TaskScope own all child queries. Deadline or cancellation aborts
++  unfinished work and releases sockets; this behavior still requires execution.
++- An endpoint-derived CNAME may be followed within this lookup and its budget;
++  directly requesting the alias or any other application/relay domain does not
++  acquire bootstrap authority.
++
++Implementation deliberately collects each server/family result, rather than
++wrapping the old whole-family collector in a timeout: doing the latter can lose
++an already successful result when another server in the same family is silent.
++
++The prior A-only unit fixture is replaced with the eight focused tests below.
++The authenticated proxy/TUN fixture now returns AAAA NODATA for its IPv4-only
++proxy listener instead of inventing an IPv6 listener. Its application AAAA
++answers remain unchanged. Expected bootstrap query counts change; old artifact
++counts are historical, not applicable to this candidate.
++
++## Existing connect behavior and mandatory subsequent gate
++
++Source review found:
++
++- `vp-transport::dial_tcp_multi` passes all resolved addresses to
++  `dial_addrs_multi`, which races protected TCP attempts with a 150ms stagger.
++  The deterministic interleaving makes the first IPv6 address eligible after
++  the first IPv4 address without rewriting that transport layer.
++- TUIC `dial`, Hysteria2 `connect_quic`, SOCKS UDP relay-domain handling and
++  Shadowsocks UDP `SsUdpConn::bind` currently take only the first address.
++  AAAA-only hostnames can now produce IPv6 addresses, but a mixed result with a
++  broken first address still lacks alternate-address failover in those clients.
++
++**Required follow-on, not accepted limitation:** those connection paths need
++bounded, cancelable alternate-address handling with a total deadline and a
++protected socket for every attempt. Retry only eligible pre-auth transport
++failures; do not treat authentication, certificate/trust or protection rejection
++as permission to downgrade, use Direct, or otherwise bypass the selected route.
++No QUIC/UDP connect rewrite is included in this uncompiled DNS slice. It does
++not claim complete Happy Eyeballs, every protocol's IPv6-only-network readiness,
++or a successful native guest hostname connection.
++
++## Authored tests — NOT RUN
++
++Module `bootstrap_dual_stack_tests` contains exactly **8** `#[tokio::test]` tests:
++
++1. `bootstrap_aaaa_only_hostname_via_ipv6_resolver_and_ipv4_only_hostname`
++2. `bootstrap_dual_stack_deduplicates_and_interleaves_in_configured_server_order`
++3. `bootstrap_one_family_servfail_or_unassociated_response_preserves_other_family`
++4. `bootstrap_family_timeout_and_silent_second_server_preserve_completed_answers`
++5. `bootstrap_all_failed_and_protect_denial_are_explicit_without_fallback`
++6. `bootstrap_endpoint_and_numeric_destination_authority_precede_any_query`
++7. `bootstrap_cname_is_bounded_endpoint_work_not_new_lookup_authority`
++8. `bootstrap_cancellation_drops_all_eight_tracked_queries_and_never_retries`
++
++These use IPv4/IPv6 loopback DNS fixtures, `.invalid` synthetic names, purpose and
++socket hooks, positive/negative packet counts, response-ID validation and tracked
++cancellation. The documentation-address denial case must reject before any
++socket creation or send. It must never contact that non-loopback address.
++
++The source was formatted and statically inspected only. **No Cargo, Rust tests,
++Clippy, peer executable, emulator operation or heavy build was run.**
++
++## Required verification after root allocates the lane
++
++1. Guard disk/RAM; retain jobs=1, incremental=0, dev/test debug=0, and shared
++   `product-core-target`. Preserve the live guest pin and APK until coordinated.
++2. Defeat cross-worktree false freshness: touch the private candidate's source
++   and manifests immediately before the build (content hashes unchanged). Verify
++   log compilation paths point to this worktree, not merely exit status 0.
++3. Compile/list the test executable and capture its SHA-256 **before execution**.
++   Assert all eight expected test names exist, then run the filter and require
++   **8 executed**, not zero/filtered. Capture post-run executable/source hashes.
++4. Run full `vp-dns` library tests (public-live tests remain explicitly not run),
++   affected host-network/TUIC denial tests, DNS/TUN regressions and the already
++   authorized official authenticated VMess proxy-DNS loopback test.
++5. Run changed-target formatting and warnings-denied Clippy; retain any actual
++   failure and distinguish pre-existing unrelated lints. Re-run after fixes.
++6. Only then hand a tested patch to the core pipeline. Rebuild/verify the promoted
++   source, adapter and subsequent native guest artifact; source-only replay or
++   an unchanged e965 APK is not dual-stack acceptance evidence.
+diff --git a/crates/vp-dns/src/bootstrap_dual_stack_tests.rs b/crates/vp-dns/src/bootstrap_dual_stack_tests.rs
+new file mode 100644
+index 0000000..19b8240
+--- /dev/null
++++ b/crates/vp-dns/src/bootstrap_dual_stack_tests.rs
+@@ -0,0 +1,455 @@
++//! Source-authored loopback coverage for protected endpoint hostname bootstrap.
++//! No public DNS, OS route changes, or production domains. Run only in an
++//! explicitly allocated Cargo lane; source presence is not execution evidence.
++use super::*;
++use std::sync::atomic::{AtomicBool, Ordering};
++use vp_core::host_network::{HostNetwork, Protocol, Purpose};
++use vp_core::task_scope::{DestinationPolicy, TaskScope};
++
++const ENDPOINT: &str = "proxy.bootstrap.fixture.invalid";
++const ALIAS: &str = "canonical.bootstrap.fixture.invalid";
++#[derive(Clone)]
++enum Reply {
++    Addresses(Vec<IpAddr>),
++    Empty,
++    ServFail,
++    WrongId,
++    Cname(String),
++    Silent,
++}
++fn reply(query: &[u8], response: Reply) -> Option<Vec<u8>> {
++    if matches!(&response, Reply::Silent) {
++        return None;
++    }
++    let mut out = wire::build_empty_response(query);
++    match response {
++        Reply::Addresses(ips) => {
++            out[6..8].copy_from_slice(&(ips.len() as u16).to_be_bytes());
++            for ip in ips {
++                out.extend_from_slice(&[0xc0, 0x0c]);
++                let (kind, bytes) = match ip {
++                    IpAddr::V4(v4) => (wire::TYPE_A, v4.octets().to_vec()),
++                    IpAddr::V6(v6) => (wire::TYPE_AAAA, v6.octets().to_vec()),
++                };
++                out.extend_from_slice(&kind.to_be_bytes());
++                out.extend_from_slice(&[0, 1, 0, 0, 0, 1]);
++                out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
++                out.extend_from_slice(&bytes);
++            }
++        }
++        Reply::Cname(name) => {
++            out[6..8].copy_from_slice(&1u16.to_be_bytes());
++            out.extend_from_slice(&[0xc0, 0x0c, 0, 5, 0, 1, 0, 0, 0, 1]);
++            let mut labels = Vec::new();
++            for label in name.split('.') {
++                labels.push(label.len() as u8);
++                labels.extend_from_slice(label.as_bytes());
++            }
++            labels.push(0);
++            out.extend_from_slice(&(labels.len() as u16).to_be_bytes());
++            out.extend_from_slice(&labels);
++        }
++        Reply::ServFail => out[3] = 0x82,
++        Reply::WrongId => out[0] ^= 1,
++        Reply::Empty => {}
++        Reply::Silent => unreachable!(),
++    }
++    Some(out)
++}
++struct Peer {
++    address: SocketAddr,
++    seen: Arc<Mutex<Vec<(String, u16)>>>,
++    task: tokio::task::JoinHandle<()>,
++}
++impl Drop for Peer {
++    fn drop(&mut self) {
++        self.task.abort();
++    }
++}
++async fn peer<F>(ipv6: bool, response: F) -> Peer
++where
++    F: Fn(&str, u16) -> (Reply, Duration) + Send + Sync + 'static,
++{
++    let socket = Arc::new(
++        UdpSocket::bind(if ipv6 { "[::1]:0" } else { "127.0.0.1:0" })
++            .await
++            .unwrap(),
++    );
++    let address = socket.local_addr().unwrap();
++    let seen = Arc::new(Mutex::new(Vec::new()));
++    let observations = seen.clone();
++    let task = tokio::spawn(async move {
++        let mut responses = tokio::task::JoinSet::new();
++        let mut buf = [0; 4096];
++        loop {
++            tokio::select! {
++                received = socket.recv_from(&mut buf) => {
++                    let (len, source) = received.unwrap();
++                    assert!(source.ip().is_loopback());
++                    let (_, name, kind) = wire::parse_query(&buf[..len]).unwrap();
++                    observations.lock().unwrap().push((name.clone(),kind));
++                    assert!(observations.lock().unwrap().len() <= 128, "unexpected unbounded query chain");
++                    let (answer, delay) = response(&name, kind);
++                    let output = reply(&buf[..len], answer);
++                    let socket = socket.clone();
++                    responses.spawn(async move {
++                        if let Some(output) = output {
++                            tokio::time::sleep(delay).await;
++                            socket.send_to(&output, source).await.unwrap();
++                        }
++                    });
++                }
++                completed = responses.join_next(), if !responses.is_empty() => {completed.unwrap().unwrap();}
++            }
++        }
++    });
++    Peer {
++        address,
++        seen,
++        task,
++    }
++}
++struct Host {
++    servers: Vec<SocketAddr>,
++    calls: Mutex<Vec<SocketAddr>>,
++    deny: AtomicBool,
++}
++impl HostNetwork for Host {
++    fn before_connect(
++        &self,
++        _: u64,
++        protocol: Protocol,
++        destination: SocketAddr,
++        purpose: Purpose,
++    ) -> std::io::Result<()> {
++        assert_eq!(protocol, Protocol::Udp);
++        assert_eq!(purpose, Purpose::Bootstrap);
++        assert!(self.servers.contains(&destination));
++        self.calls.lock().unwrap().push(destination);
++        if self.deny.load(Ordering::SeqCst) {
++            Err(std::io::Error::new(
++                std::io::ErrorKind::PermissionDenied,
++                "test protect denial",
++            ))
++        } else {
++            Ok(())
++        }
++    }
++    fn dns_servers(&self) -> Vec<SocketAddr> {
++        self.servers.clone()
++    }
++    fn bootstrap_host(&self) -> Option<String> {
++        Some(ENDPOINT.into())
++    }
++}
++fn new_scope(servers: Vec<SocketAddr>) -> (Arc<TaskScope>, Arc<Host>) {
++    let host = Arc::new(Host {
++        servers,
++        calls: Mutex::new(vec![]),
++        deny: AtomicBool::new(false),
++    });
++    (
++        TaskScope::with_host_network(DestinationPolicy::LoopbackIpOnly, Some(host.clone())),
++        host,
++    )
++}
++async fn stop(scope: &Arc<TaskScope>) {
++    let report = scope.shutdown(Duration::ZERO, Duration::from_secs(1)).await;
++    assert_eq!(report.remaining_tasks, 0);
++    assert_eq!(report.panics, 0);
++}
++async fn addresses(scope: &Arc<TaskScope>) -> Vec<IpAddr> {
++    timeout(
++        Duration::from_secs(6),
++        scope.run(lookup_host(ENDPOINT, 443)),
++    )
++    .await
++    .unwrap()
++    .unwrap()
++    .map(|address| {
++        assert_eq!(address.port(), 443);
++        address.ip()
++    })
++    .collect()
++}
++fn ips(values: &[&str]) -> Vec<IpAddr> {
++    values.iter().map(|value| value.parse().unwrap()).collect()
++}
++
++#[tokio::test]
++async fn bootstrap_aaaa_only_hostname_via_ipv6_resolver_and_ipv4_only_hostname() {
++    for v6_only in [true, false] {
++        let dns = peer(true, move |name, kind| {
++            assert_eq!(name, ENDPOINT);
++            (
++                if kind
++                    == if v6_only {
++                        wire::TYPE_AAAA
++                    } else {
++                        wire::TYPE_A
++                    }
++                {
++                    Reply::Addresses(ips(&[if v6_only { "::1" } else { "127.0.0.1" }]))
++                } else {
++                    Reply::Empty
++                },
++                Duration::ZERO,
++            )
++        })
++        .await;
++        let (scope, host) = new_scope(vec![dns.address]);
++        assert_eq!(
++            addresses(&scope).await,
++            ips(&[if v6_only { "::1" } else { "127.0.0.1" }])
++        );
++        let mut types = dns
++            .seen
++            .lock()
++            .unwrap()
++            .iter()
++            .map(|(_, kind)| *kind)
++            .collect::<Vec<_>>();
++        types.sort();
++        assert_eq!(types, vec![wire::TYPE_A, wire::TYPE_AAAA]);
++        assert_eq!(host.calls.lock().unwrap().len(), 2);
++        stop(&scope).await;
++    }
++}
++#[tokio::test]
++async fn bootstrap_dual_stack_deduplicates_and_interleaves_in_configured_server_order() {
++    let first = peer(false, |_, kind| {
++        if kind == wire::TYPE_A {
++            (
++                Reply::Addresses(ips(&["127.0.0.2", "127.0.0.1", "127.0.0.2"])),
++                Duration::from_millis(40),
++            )
++        } else {
++            (
++                Reply::Addresses(ips(&["::2", "::1", "::2"])),
++                Duration::from_millis(20),
++            )
++        }
++    })
++    .await;
++    let second = peer(true, |_, kind| {
++        (
++            Reply::Addresses(if kind == wire::TYPE_A {
++                ips(&["127.0.0.3", "127.0.0.1"])
++            } else {
++                ips(&["::3", "::1"])
++            }),
++            Duration::ZERO,
++        )
++    })
++    .await;
++    let (scope, host) = new_scope(vec![first.address, second.address]);
++    assert_eq!(
++        addresses(&scope).await,
++        ips(&["127.0.0.2", "::2", "127.0.0.1", "::1", "127.0.0.3", "::3"])
++    );
++    assert_eq!(host.calls.lock().unwrap().len(), 4);
++    stop(&scope).await;
++}
++#[tokio::test]
++async fn bootstrap_one_family_servfail_or_unassociated_response_preserves_other_family() {
++    for bad_v4 in [true, false] {
++        for wrong_id in [true, false] {
++            let dns = peer(false, move |_, kind| {
++                (
++                    if (kind == wire::TYPE_A) == bad_v4 {
++                        if wrong_id {
++                            Reply::WrongId
++                        } else {
++                            Reply::ServFail
++                        }
++                    } else {
++                        Reply::Addresses(ips(&[if bad_v4 { "::1" } else { "127.0.0.1" }]))
++                    },
++                    Duration::ZERO,
++                )
++            })
++            .await;
++            let (scope, _) = new_scope(vec![dns.address]);
++            assert_eq!(
++                addresses(&scope).await,
++                ips(&[if bad_v4 { "::1" } else { "127.0.0.1" }])
++            );
++            stop(&scope).await;
++        }
++    }
++}
++#[tokio::test]
++async fn bootstrap_family_timeout_and_silent_second_server_preserve_completed_answers() {
++    for silent_v4 in [true, false] {
++        let responsive = peer(true, move |_, kind| {
++            (
++                if (kind == wire::TYPE_A) == silent_v4 {
++                    Reply::Silent
++                } else {
++                    Reply::Addresses(ips(&[if silent_v4 { "::1" } else { "127.0.0.1" }]))
++                },
++                Duration::ZERO,
++            )
++        })
++        .await;
++        let silent = peer(false, |_, _| (Reply::Silent, Duration::ZERO)).await;
++        let (scope, host) = new_scope(vec![responsive.address, silent.address]);
++        let began = tokio::time::Instant::now();
++        assert_eq!(
++            addresses(&scope).await,
++            ips(&[if silent_v4 { "::1" } else { "127.0.0.1" }])
++        );
++        assert!(began.elapsed() >= BOOTSTRAP_TIMEOUT);
++        assert_eq!(host.calls.lock().unwrap().len(), 4);
++        stop(&scope).await;
++    }
++}
++#[tokio::test]
++async fn bootstrap_all_failed_and_protect_denial_are_explicit_without_fallback() {
++    let dns = peer(false, |_, kind| {
++        (
++            if kind == wire::TYPE_A {
++                Reply::ServFail
++            } else {
++                Reply::WrongId
++            },
++            Duration::ZERO,
++        )
++    })
++    .await;
++    let (scope, host) = new_scope(vec![dns.address]);
++    let error = scope.run(lookup_host(ENDPOINT, 443)).await.unwrap_err();
++    assert!(error.to_string().contains("A and AAAA"));
++    assert_eq!(dns.seen.lock().unwrap().len(), 2);
++    host.deny.store(true, Ordering::SeqCst);
++    assert!(scope.run(lookup_host(ENDPOINT, 443)).await.is_err());
++    assert_eq!(
++        dns.seen.lock().unwrap().len(),
++        2,
++        "denied lookup sent no datagrams"
++    );
++    assert_eq!(host.calls.lock().unwrap().len(), 4);
++    stop(&scope).await;
++    let silent = peer(true, |_, _| (Reply::Silent, Duration::ZERO)).await;
++    let (scope, host) = new_scope(vec![silent.address]);
++    let error = timeout(
++        Duration::from_secs(6),
++        scope.run(lookup_host(ENDPOINT, 443)),
++    )
++    .await
++    .unwrap()
++    .unwrap_err();
++    assert!(error.to_string().contains("A and AAAA"));
++    assert_eq!(host.calls.lock().unwrap().len(), 2);
++    stop(&scope).await;
++}
++#[tokio::test]
++async fn bootstrap_endpoint_and_numeric_destination_authority_precede_any_query() {
++    let dns = peer(true, |_, _| {
++        panic!("unauthorized name must never reach resolver")
++    })
++    .await;
++    let (scope, host) = new_scope(vec![dns.address]);
++    for name in [ALIAS, "user.fixture.invalid", "relay.fixture.invalid"] {
++        assert!(scope.run(lookup_host(name, 443)).await.is_err());
++    }
++    assert_eq!(
++        scope
++            .run(lookup_host("::1", 443))
++            .await
++            .unwrap()
++            .next()
++            .unwrap(),
++        "[::1]:443".parse().unwrap()
++    );
++    assert!(host.calls.lock().unwrap().is_empty());
++    assert!(dns.seen.lock().unwrap().is_empty());
++    stop(&scope).await;
++    // Documentation-only IP: policy must reject before creating/sending a socket.
++    let (scope, host) = new_scope(vec!["192.0.2.53:53".parse().unwrap()]);
++    assert!(scope.run(lookup_host(ENDPOINT, 443)).await.is_err());
++    assert!(host.calls.lock().unwrap().is_empty());
++    stop(&scope).await;
++}
++#[tokio::test]
++async fn bootstrap_cname_is_bounded_endpoint_work_not_new_lookup_authority() {
++    let dns = peer(true, |name, kind| {
++        (
++            if name == ENDPOINT {
++                Reply::Cname(ALIAS.into())
++            } else {
++                assert_eq!(name, ALIAS);
++                Reply::Addresses(ips(&[if kind == wire::TYPE_A {
++                    "127.0.0.1"
++                } else {
++                    "::1"
++                }]))
++            },
++            Duration::ZERO,
++        )
++    })
++    .await;
++    let (scope, host) = new_scope(vec![dns.address]);
++    assert_eq!(addresses(&scope).await, ips(&["127.0.0.1", "::1"]));
++    assert!(scope.run(lookup_host(ALIAS, 443)).await.is_err());
++    assert_eq!(host.calls.lock().unwrap().len(), 4);
++    stop(&scope).await;
++    let looping = peer(false, |_, _| (Reply::Cname(ALIAS.into()), Duration::ZERO)).await;
++    let (scope, host) = new_scope(vec![looping.address]);
++    assert!(
++        timeout(
++            Duration::from_secs(6),
++            scope.run(lookup_host(ENDPOINT, 443))
++        )
++        .await
++        .unwrap()
++        .is_err()
++    );
++    assert!(
++        host.calls.lock().unwrap().len() <= 18,
++        "existing eight-hop CNAME cap per family"
++    );
++    stop(&scope).await;
++}
++#[tokio::test]
++async fn bootstrap_cancellation_drops_all_eight_tracked_queries_and_never_retries() {
++    let mut peers = Vec::new();
++    for ipv6 in [false, true, false, true] {
++        peers.push(peer(ipv6, |_, _| (Reply::Silent, Duration::ZERO)).await);
++    }
++    let (scope, host) = new_scope(peers.iter().map(|peer| peer.address).collect());
++    // Return a tuple so the scoped future is not itself an awaitable result;
++    // the caller keeps the tracked operation handle and can cancel/join it.
++    let (operation,) = scope
++        .run(async { (vp_core::task_scope::spawn(lookup_host(ENDPOINT, 443)),) })
++        .await;
++    timeout(Duration::from_secs(1), async {
++        loop {
++            if peers
++                .iter()
++                .map(|peer| peer.seen.lock().unwrap().len())
++                .sum::<usize>()
++                == 8
++            {
++                break;
++            }
++            tokio::task::yield_now().await;
++        }
++    })
++    .await
++    .unwrap();
++    assert_eq!(host.calls.lock().unwrap().len(), 8);
++    assert!(
++        scope.snapshot().work <= 9,
++        "one caller plus at most eight DNS tasks"
++    );
++    operation.abort();
++    assert!(operation.await.unwrap_err().is_cancelled());
++    stop(&scope).await;
++    tokio::time::sleep(Duration::from_millis(20)).await;
++    assert_eq!(
++        host.calls.lock().unwrap().len(),
++        8,
++        "no retry after cancellation"
++    );
++}
+diff --git a/crates/vp-dns/src/lib.rs b/crates/vp-dns/src/lib.rs
+index e2f085b..ecc0d76 100644
+--- a/crates/vp-dns/src/lib.rs
++++ b/crates/vp-dns/src/lib.rs
+@@ -20,6 +20,9 @@ use vp_common::{Error, Host, Result};
+ pub use wire::QType;
+ 
+ const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
++/// One wall-clock budget for both bootstrap families, all configured servers,
++/// and every followed CNAME. No per-family sequential timeout multiplication.
++const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(3);
+ const CACHE_CAP: usize = 4096;
+ const MIN_TTL: u32 = 30;
+ 
+@@ -136,6 +139,85 @@ impl Resolver {
+             .collect();
+         Ok(resolver)
+     }
++    /// Resolve only the configured proxy endpoint, querying A and AAAA together.
++    /// At most eight tracked queries (two families x four numeric servers) are
++    /// outstanding. Completed valid answers survive another family's/server's
++    /// error or deadline. No system lookup, fallback resolver, or user DNS path.
++    ///
++    /// Results interleave IPv4 first, then IPv6, preserving configured resolver
++    /// order and wire-answer order within each family and removing duplicates.
++    pub async fn resolve_bootstrap_dual_stack(&self, domain: &str) -> Result<Vec<IpAddr>> {
++        if self.bootstrap_host.is_none() || self.servers.is_empty() || self.servers.len() > 4 {
++            return Err(Error::Config(
++                "dual-stack bootstrap requires explicit endpoint authority".into(),
++            ));
++        }
++        self.check_bootstrap_name(domain)?;
++        // Validate every destination before starting any query. A restricted
++        // generation must not bypass destination policy merely because a DNS
++        // server is explicit. Each actual socket still uses Purpose::Bootstrap
++        // and the existing protected-host hook before connect/send.
++        for server in &self.servers {
++            let address = server
++                .addr
++                .ok_or_else(|| Error::Config("bootstrap DNS server must be numeric".into()))?;
++            if server.proto != Proto::Udp
++                || server.purpose != vp_core::host_network::Purpose::Bootstrap
++            {
++                return Err(Error::Config("invalid bootstrap resolver transport".into()));
++            }
++            vp_core::task_scope::check_destination(&vp_common::DstAddr::ip(
++                address.ip(),
++                address.port(),
++            ))?;
++        }
++        let deadline = tokio::time::Instant::now() + BOOTSTRAP_TIMEOUT;
++        let mut queries = tokio::task::JoinSet::new();
++        for (server_index, server) in self.servers.iter().enumerate() {
++            for qtype in [QType::A, QType::Aaaa] {
++                let server = server.clone();
++                let domain = domain.to_owned();
++                vp_core::task_scope::spawn_in(&mut queries, async move {
++                    (
++                        server_index,
++                        qtype,
++                        query_server(&server, &domain, qtype).await,
++                    )
++                });
++            }
++        }
++        let mut ipv4 = Vec::new();
++        let mut ipv6 = Vec::new();
++        while !queries.is_empty() {
++            // Prefer completed results when the deadline and a completion are
++            // ready together; no valid completed answer is discarded just
++            // because another query remains silent at the common deadline.
++            tokio::select! {
++                biased;
++                completed = queries.join_next() => {
++                    if let Some(Ok((index, kind, Ok(ips)))) = completed {
++                        match kind {
++                            QType::A => ipv4.push((index, ips)),
++                            QType::Aaaa => ipv6.push((index, ips)),
++                            QType::Https => unreachable!("bootstrap only queries A/AAAA"),
++                        }
++                    }
++                }
++                _ = tokio::time::sleep_until(deadline) => break,
++            }
++        }
++        // JoinSet ownership also aborts these tracked queries if this future is
++        // dropped/cancelled. No detached resolver tasks survive cancellation.
++        queries.abort_all();
++        let ips = merge_bootstrap_answers(ipv4, ipv6);
++        if ips.is_empty() {
++            return Err(Error::Dns(
++                "bootstrap A and AAAA queries produced no usable answers".into(),
++            ));
++        }
++        Ok(ips)
++    }
++
+     fn check_bootstrap_name(&self, domain: &str) -> Result<()> {
+         if self
+             .bootstrap_host
+@@ -459,6 +541,38 @@ impl Resolver {
+     }
+ }
+ 
++/// Stable across response arrival order. Each family keeps server and answer
++/// order; interleaving avoids placing every IPv6 address behind a long A list.
++fn merge_bootstrap_answers(
++    mut ipv4: Vec<(usize, Vec<IpAddr>)>,
++    mut ipv6: Vec<(usize, Vec<IpAddr>)>,
++) -> Vec<IpAddr> {
++    use std::collections::HashSet;
++    ipv4.sort_by_key(|(index, _)| *index);
++    ipv6.sort_by_key(|(index, _)| *index);
++    let unique = |entries: Vec<(usize, Vec<IpAddr>)>, v4: bool| {
++        let mut seen = HashSet::new();
++        entries
++            .into_iter()
++            .flat_map(|(_, ips)| ips)
++            .filter(|ip| ip.is_ipv4() == v4 && seen.insert(*ip))
++            .collect::<Vec<_>>()
++    };
++    let mut v4 = unique(ipv4, true).into_iter();
++    let mut v6 = unique(ipv6, false).into_iter();
++    let mut out = Vec::with_capacity(v4.len() + v6.len());
++    loop {
++        match (v4.next(), v6.next()) {
++            (None, None) => break,
++            (a, aaaa) => {
++                out.extend(a);
++                out.extend(aaaa);
++            }
++        }
++    }
++    out
++}
++
+ fn parse_server(s: &str) -> Option<ServerAddr> {
+     // #insecure 片段：跳过证书校验
+     let (s, skip_verify) = match s.strip_suffix("#insecure") {
+@@ -1414,9 +1528,9 @@ pub async fn lookup_host(host: &str, port: u16) -> std::io::Result<std::vec::Int
+         })?;
+         let resolver = Resolver::bootstrap(servers, &endpoint).map_err(std::io::Error::from)?;
+         let ips = resolver
+-            .resolve_domain(host, false)
++            .resolve_bootstrap_dual_stack(host)
+             .await
+-            .map_err(|_| std::io::Error::other("protected DNS failed"))?;
++            .map_err(std::io::Error::from)?;
+         return Ok(ips
+             .iter()
+             .map(|ip| SocketAddr::new(*ip, port))
+@@ -1430,84 +1544,4 @@ pub async fn lookup_host(host: &str, port: u16) -> std::io::Result<std::vec::Int
+ }
+ 
+ #[cfg(test)]
+-mod bootstrap_policy_tests {
+-    use super::*;
+-    use vp_core::host_network::{HostNetwork, Protocol, Purpose};
+-    use vp_core::task_scope::{DestinationPolicy, TaskScope};
+-    struct Host {
+-        dns: SocketAddr,
+-        calls: Mutex<Vec<Purpose>>,
+-    }
+-    impl HostNetwork for Host {
+-        fn before_connect(
+-            &self,
+-            _: u64,
+-            protocol: Protocol,
+-            destination: SocketAddr,
+-            purpose: Purpose,
+-        ) -> std::io::Result<()> {
+-            assert_eq!(protocol, Protocol::Udp);
+-            assert_eq!(destination, self.dns);
+-            assert_eq!(purpose, Purpose::Bootstrap);
+-            self.calls.lock().unwrap().push(purpose);
+-            Ok(())
+-        }
+-        fn dns_servers(&self) -> Vec<SocketAddr> {
+-            vec![self.dns]
+-        }
+-        fn bootstrap_host(&self) -> Option<String> {
+-            Some("proxy.fixture.invalid".into())
+-        }
+-    }
+-    #[tokio::test]
+-    async fn bootstrap_endpoint_only_numeric_ipv6_and_response_association() {
+-        let socket = UdpSocket::bind("[::1]:0").await.unwrap();
+-        let host = Arc::new(Host {
+-            dns: socket.local_addr().unwrap(),
+-            calls: Mutex::new(vec![]),
+-        });
+-        let peer = tokio::spawn(async move {
+-            for wrong in [false, true] {
+-                let mut buf = [0; 4096];
+-                let (n, addr) = socket.recv_from(&mut buf).await.unwrap();
+-                assert_eq!(
+-                    wire::parse_query(&buf[..n]).unwrap().1,
+-                    "proxy.fixture.invalid"
+-                );
+-                let mut response = wire::build_a_response(&buf[..n], [127, 0, 0, 1].into());
+-                if wrong {
+-                    response[0] ^= 1;
+-                }
+-                socket.send_to(&response, addr).await.unwrap();
+-            }
+-        });
+-        let scope =
+-            TaskScope::with_host_network(DestinationPolicy::Unrestricted, Some(host.clone()));
+-        scope
+-            .run(async {
+-                assert_eq!(
+-                    lookup_host("proxy.fixture.invalid", 443)
+-                        .await
+-                        .unwrap()
+-                        .next()
+-                        .unwrap()
+-                        .ip(),
+-                    "127.0.0.1".parse::<IpAddr>().unwrap()
+-                );
+-                assert!(lookup_host("user.fixture.invalid", 443).await.is_err());
+-                assert!(lookup_host("relay.fixture.invalid", 443).await.is_err());
+-                assert!(lookup_host("proxy.fixture.invalid", 443).await.is_err());
+-                assert!(lookup_host("::1", 443).await.is_ok());
+-            })
+-            .await;
+-        peer.await.unwrap();
+-        assert_eq!(host.calls.lock().unwrap().len(), 2);
+-        assert_eq!(
+-            scope
+-                .shutdown(Duration::ZERO, Duration::from_secs(1))
+-                .await
+-                .remaining_tasks,
+-            0
+-        );
+-    }
+-}
++mod bootstrap_dual_stack_tests;
+diff --git a/crates/vp-tun/tests/proxy_dns.rs b/crates/vp-tun/tests/proxy_dns.rs
+index 7c36c7a..5cc8ad2 100644
+--- a/crates/vp-tun/tests/proxy_dns.rs
++++ b/crates/vp-tun/tests/proxy_dns.rs
+@@ -95,6 +95,12 @@ impl HostNetwork for Host {
+ }
+ fn answer(query: &[u8]) -> Vec<u8> {
+     let (_, name, kind) = vp_dns::wire::parse_query(query).unwrap();
++    // This official-proxy fixture listens only on IPv4. The new bootstrap path
++    // also asks AAAA; return authoritative NODATA rather than inventing a
++    // reachable IPv6 proxy listener. User AAAA DNS answers remain unchanged.
++    if name == "proxy.fixture.invalid" && kind == vp_dns::wire::TYPE_AAAA {
++        return vp_dns::wire::build_empty_response(query);
++    }
+     let mut out = query.to_vec();
+     out[2] = 0x81;
+     out[3] = 0x80;

@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-10-30T07:01:00Z",
+  "scope": "Current e96584f source/replay/standalone/root adapter gates passed; native C/Android relink and complete release acceptance still pending",
+  "identity": {
+    "upstream": {
+      "repository_url": "https://github.com/mateo-ki/vp_core.git",
+      "commit": "a1abce2b515b199fe1120061b54654c60f4dd59c",
+      "tree": "8cf7f0a98cd2f86e76cef3aa62f3b106a90f7c06"
+    },
+    "integration": {
+      "path": "integration/vp_core",
+      "patched_tree": "eb339f2c485e10a6a9e32a8c1e39d8337b2b35fe",
+      "commit": "e96584fb8c7a38aa2c24beb89dcf969e70c24c93"
+    },
+    "patchset_sha256": "4cc124b5aa049df777eebfcb91d4fd746c8dcbe117cfb17d5fba57466ab9059d"
+  },
+  "results": {
+    "deterministic_replay": {
+      "status": "passed",
+      "log": "tools/core/evidence/uot-fix/twenty-patch-replay.json"
+    },
+    "generated_and_original_clean": {
+      "status": "passed",
+      "log": "tools/core/evidence/uot-fix/twenty-patch-check.json"
+    },
+    "isolated_uuid": {
+      "status": "passed",
+      "count": 2,
+      "receipt": "tools/core/evidence/next-candidate/uuid/result.json"
+    },
+    "author_router": {
+      "status": "passed-author-only",
+      "count": 236,
+      "excluded_external_probes": 2,
+      "report": "integration/server-routing-evidence/FINAL-REPORT.md"
+    },
+    "author_dns": {
+      "status": "passed-author-only; executable hashes captured after runs",
+      "report": "integration/proxy-dns-evidence/manifest.json",
+      "freshness_review": "integration/proxy-dns-evidence/freshness-review.json"
+    },
+    "root_adapter": {
+      "status": "passed",
+      "mobile_tests": 23,
+      "fail_closed_contract_tests": 9,
+      "actual_managed_worker_tests": 13,
+      "strict_clippy": "passed --all-targets --no-deps -D warnings",
+      "receipt": "tools/core/evidence/activation-dns2/root-twenty/result.json",
+      "clippy_log": "tools/core/evidence/activation-dns2/root-twenty/clippy.log",
+      "worker_receipt": "tools/core/evidence/activation-dns2/root-twenty/immutable-worker.json"
+    },
+    "android": {
+      "status": "source gates reported passed by Android owner; exact current-pin native C/Android relink and guest acceptance pending"
+    },
+    "data": {
+      "status": "DNS2 activation source applied; analyzer50 tests reported passed by Android owner; guest/native journey pending"
+    },
+    "previous_pin": {
+      "record": "tools/core/evidence/verification-sixteen-patch-2026-10-30.json",
+      "note": "b739 native/worker/APK evidence remains historical"
+    },
+    "public_capabilities": {
+      "status": "blocked-no-promotion"
+    },
+    "previous_f398_app_failure": {
+      "status": "blocked",
+      "failed_suites": [
+        "vp_app"
+      ],
+      "passed_app_tests": 24,
+      "failed_app_tests": 2,
+      "receipt": "tools/core/evidence/activation-dns2/integrated/result.json"
+    },
+    "current_twenty_patch": {
+      "status": "passed",
+      "replay": "passed",
+      "source_clean": "passed",
+      "private_uot_tests": 12,
+      "passed": 313,
+      "ignored": 6,
+      "receipt": "tools/core/evidence/activation-dns2/integrated-twenty/result.json"
+    },
+    "pipeline_toy_git": {
+      "status": "passed",
+      "count": 20,
+      "log": "tools/core/evidence/activation-dns2/python-toy-git-tests.txt"
+    },
+    "upgrade_fa3e743_current_series": {
+      "status": "blocked-source-only-at-patch1",
+      "patch_count": 20,
+      "candidate_executed": false,
+      "receipt": "tools/core/evidence/upgrade-fa3e743/twenty-patch-check.json"
+    }
+  },
+  "release_eligible": false,
+  "notes": [
+    "Current engine remains vp_core; official protocol libraries are test-only independent peers",
+    "fa3e743 upstream remains source-only audit and is excluded from execution",
+    "Fresh local package invalidation, expected named counts and pre/post source/binary identities required",
+    "Raw server domain destination DNS remains local after Router selection; no proxy-side destination privacy claim",
+    "DNS layer bounded; upstream ipstack ingress queues still unbounded",
+    "Full21 preset/platform acceptance still required"
+  ]
+}

@@ -6,7 +6,7 @@
     "tree": "8cf7f0a98cd2f86e76cef3aa62f3b106a90f7c06"
   },
   "patchset": {
-    "sha256": "4cc124b5aa049df777eebfcb91d4fd746c8dcbe117cfb17d5fba57466ab9059d",
+    "sha256": "94a146875fc61559f0683c7e4b95583ba9cbb7760d2f69bdc5387806bfc1d078",
     "patches": [
       {
         "id": "P01-fail-closed-listener-startup",
@@ -107,13 +107,43 @@
         "id": "P09-authenticated-shadowsocks-uot-routing",
         "path": "patches/vp_core/0020-authenticated-shadowsocks-uot-routing.patch",
         "sha256": "87a853e6b661d3fac6d6ab1df996fcb2f23c06a2c3d1490f2abbee118877846b"
+      },
+      {
+        "id": "P02-private-authenticated-socks5",
+        "path": "patches/vp_core/0021-authenticated-socks5.patch",
+        "sha256": "0f233320ec81669717d5008d24effc41608f9717649ff07c47579b8caaeef4c4"
+      },
+      {
+        "id": "P02-private-tuic-exact-server-options",
+        "path": "patches/vp_core/0022-tuic-exact-server-options.patch",
+        "sha256": "d74ab376372113662a709d82f2a1540d5be3efce13103abaa3d4d10cb3a01f86"
+      },
+      {
+        "id": "P02-private-server-exact-tls-alpn",
+        "path": "patches/vp_core/0023-server-exact-tls-alpn.patch",
+        "sha256": "679986cb7f8c5400362a4d6a9fafea29038b27e6484bd83b615563e273700390"
+      },
+      {
+        "id": "P11-protected-bootstrap-dual-stack",
+        "path": "patches/vp_core/0024-proxy-dns-dualstack.patch",
+        "sha256": "9792c05683b1be4df4ef5db171cc6f2cca6a51cf8712732e4c0b11dec70270f8"
+      },
+      {
+        "id": "P09-experimental-public-safety",
+        "path": "patches/vp_core/0025-experimental-public-safety.patch",
+        "sha256": "39213c471efe8a90632ffa453030fe8acd5eb55f15923f20830832c5f731a027"
+      },
+      {
+        "id": "P09-process-local-probe",
+        "path": "patches/vp_core/0026-process-local-probe.patch",
+        "sha256": "c06c35f890a549a718a6c5ed7c8350fa57456d6aa3d4ac9f8f47a64e532a74f8"
       }
     ]
   },
   "integration": {
     "path": "integration/vp_core",
-    "patched_tree": "eb339f2c485e10a6a9e32a8c1e39d8337b2b35fe",
-    "commit": "e96584fb8c7a38aa2c24beb89dcf969e70c24c93"
+    "patched_tree": "9869d0e5b9372380dd70c161f29f430c8891fd3f",
+    "commit": "8fcc05a93378bcf114986f1ea4f095744af9acbf"
   },
   "adapter": {
     "package": "vp-product-core-adapter",

@@ -17,7 +17,21 @@ path = "src/bin/fresh.rs"
 name = "vp-product-fresh-runtime"
 path = "src/bin/fresh_runtime.rs"
 
+[features]
+default = []
+# Explicit local fixture only; adapter rejects release-profile builds.
+local-probe-test = ["experimental-public", "vp-product-core-adapter/local-probe-test", "vp-product-runtime-executor/local-probe-test"]
+experimental-public = ["vp-product-control/experimental-public", "vp-product-storage/private-tls", "vp-product-secrets/experimental-public", "vp-product-runtime-executor/experimental-public", "vp-product-core-adapter/experimental-public", "dep:rcgen", "dep:base64", "dep:time"]
+
+[[bin]]
+name = "vp-public-lab"
+path = "src/bin/public_lab.rs"
+required-features = ["experimental-public"]
+
 [dependencies]
+time = { version = "=0.3.41", optional = true }
+rcgen = { version = "=0.13.2", default-features = false, features = ["crypto", "ring"], optional = true }
+base64 = { version = "=0.22.1", optional = true }
 sha2 = "=0.10.8"
 vp-product-api = { path = "../vp-api" }
 vp-product-domain = { path = "../vp-domain" }

@@ -13,6 +13,9 @@ use vp_product_control::{
     ContentDigest, ControlError, ControlStore, GenesisPhase, InstanceBinding, JournalEvent,
     StoredState, TlsAssetEvent, TlsAssetMutation, TlsControlEnvelope, WriterLease,
 };
+mod inspection;
+pub use inspection::{inspect_tls_control_read_only, TlsControlInspection, TlsControlSnapshot};
+
 const MAX_PAYLOAD: usize = 32 * 1024 * 1024;
 const DB: &str = "control.db";
 const LOCK: &str = "control.writer.lock";
@@ -26,6 +29,16 @@ pub struct TlsSqliteStore {
     binding: InstanceBinding,
 }
 impl TlsSqliteStore {
+    /// Identity of the retained control root.
+    pub fn directory_identity(&self) -> Result<crate::DirectoryIdentity, ControlError> {
+        self.root.check_cwd()?;
+        self.root.0.identity()
+    }
+    /// Check separation against the retained control capability, not a pathname.
+    pub fn disjoint_from(&self, other: &crate::BoundDirectory) -> Result<(), ControlError> {
+        self.root.check_cwd()?;
+        self.root.0.disjoint(other)
+    }
     pub fn create(
         root: AnchoredControlRoot,
         binding: InstanceBinding,
@@ -147,6 +160,21 @@ impl TlsSqliteStore {
         }
         Ok(e)
     }
+    /// Borrow only the exact persisted preparing envelope while retaining the
+    /// current writer. This does not initialize, claim a vault, or authorize a
+    /// runtime by itself; a trusted coordinator must prove all pairings. The
+    /// callback must not re-enter this store while its writer is held.
+    pub fn with_preparing<T>(&self, f: impl FnOnce(&TlsControlEnvelope) -> Result<T, ControlError>) -> Result<T, ControlError> {
+        let _guard = self.writer.lock().map_err(|_| ControlError::StorageUnavailable)?;
+        let envelope = self.envelope(false)?;
+        if envelope.binding() != &self.binding || envelope.phase() != GenesisPhase::Preparing
+            || envelope.state().version != 0 || envelope.state().active_revision != vp_product_domain::Revision::ZERO
+            || !envelope.state().plans.is_empty() || !envelope.state().operations.is_empty()
+            || !envelope.state().revisions.is_empty() {
+            return Err(ControlError::RecoveryRequired);
+        }
+        f(&envelope)
+    }
     /// The vault claim and bound runtime reservation must already be durable.
     /// This transition is one-shot and is not proof of HTTP/process liveness.
     pub fn mark_initialized(&self) -> Result<(), ControlError> {
@@ -260,6 +288,10 @@ impl TlsWriter<'_> {
     }
 }
 impl WriterLease for TlsWriter<'_> {
+    #[cfg(feature = "private-tls")]
+    fn tls_aggregate(&self) -> Option<&TlsControlEnvelope> {
+        Some(&self.aggregate)
+    }
     fn state(&self) -> &StoredState {
         self.aggregate.state()
     }
@@ -354,21 +386,28 @@ fn validate_layout(c: &Connection) -> Result<(), ControlError> {
     let mode: String = c
         .pragma_query_value(None, "journal_mode", |r| r.get(0))
         .map_err(unavailable)?;
+    if v != 1 || mode != "delete" {
+        return Err(ControlError::CorruptState);
+    }
+    validate_table_layout(c)
+}
+
+// Shared strict object inventory. The read-only inspector checks format fields
+// from the retained file header rather than executing connection pragmas.
+fn validate_table_layout(c: &Connection) -> Result<(), ControlError> {
     let mut q = c
-        .prepare("SELECT type,name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name")
+        .prepare("SELECT type,name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name LIMIT 3")
         .map_err(unavailable)?;
     let names = q
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
         .map_err(unavailable)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(unavailable)?;
-    if v != 1
-        || mode != "delete"
-        || names
-            != vec![
-                ("table".into(), "control_state".into()),
-                ("table".into(), "operation_journal".into()),
-            ]
+    if names
+        != vec![
+            ("table".into(), "control_state".into()),
+            ("table".into(), "operation_journal".into()),
+        ]
     {
         return Err(ControlError::CorruptState);
     }
@@ -411,6 +450,16 @@ fn validate_journal(c: &Connection, version: u64) -> Result<(), ControlError> {
         return Err(ControlError::CorruptState);
     }
     Ok(())
+}
+
+#[cfg(feature = "private-tls")]
+impl vp_product_control::TlsAssetWriterLease for TlsWriter<'_> {
+    fn aggregate(&self) -> &TlsControlEnvelope {
+        TlsWriter::aggregate(self)
+    }
+    fn persist_asset(&mut self, mutation: TlsAssetMutation) -> Result<(), ControlError> {
+        TlsWriter::persist_asset(self, mutation)
+    }
 }
 
 #[cfg(test)]
@@ -608,9 +657,8 @@ mod tests {
                 1 => v["future"] = true.into(),
                 _ => v["certificateAssets"]["cert"]["keyRef"] = "secret:chain".into(),
             };
-            match serde_json::from_value::<TlsControlEnvelope>(v) {
-                Ok(e) => assert!(e.validate().is_err()),
-                Err(_) => {}
+            if let Ok(e) = serde_json::from_value::<TlsControlEnvelope>(v) {
+                assert!(e.validate().is_err());
             }
         }
     }
@@ -660,15 +708,5 @@ mod tests {
             e.digest().unwrap()
         );
         validate_journal(&c, 0).unwrap();
-    }
-}
-
-#[cfg(feature = "private-tls")]
-impl vp_product_control::TlsAssetWriterLease for TlsWriter<'_> {
-    fn aggregate(&self) -> &TlsControlEnvelope {
-        TlsWriter::aggregate(self)
-    }
-    fn persist_asset(&mut self, mutation: TlsAssetMutation) -> Result<(), ControlError> {
-        TlsWriter::persist_asset(self, mutation)
     }
 }

@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/vp-x509-validity",
+    "crates/vp-server-protocol3",
+    "crates/vp-server-materials",
     "crates/vp-domain",
     "crates/vp-core-adapter",
     "crates/vp-control",

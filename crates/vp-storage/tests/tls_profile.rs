@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_used)]
 use std::os::unix::fs::MetadataExt;
 use std::{fs::File, path::Path, process::Command};
-use vp_product_control::{ContentDigest, ControlStore, InstanceBinding, JournalEvent};
+use vp_product_control::{ContentDigest, ControlStore, GenesisPhase, InstanceBinding, JournalEvent};
 use vp_product_storage::{BoundDirectory, DirectoryIdentity, FreshSqliteStore, TlsSqliteStore};
 #[path = "support/tls_lifecycle.rs"]
 mod lifecycle;
@@ -73,7 +73,9 @@ fn child(root: &Path, mode: &str) {
         "create" => {
             let store = TlsSqliteStore::create(root, binding()).unwrap();
             assert!(store.read().is_err());
+            store.with_preparing(|e| { assert!(e.phase() == GenesisPhase::Preparing); assert!(e.binding() == &binding()); Ok(()) }).unwrap();
             store.mark_initialized().unwrap();
+            assert!(store.with_preparing(|_| Ok(())).is_err());
             assert!(store.mark_initialized().is_err());
             let mut writer = store.writer().unwrap();
             let mut state = writer.state().clone();

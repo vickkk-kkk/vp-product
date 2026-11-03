@@ -1,0 +1,42 @@
+[package]
+name = "vp-product-server-materials"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+[features]
+experimental-public = ["vp-product-control/experimental-public", "vp-product-core-adapter/experimental-public", "vp-product-secrets/experimental-public"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+vp-product-control = { workspace = true, features = ["private-tls"] }
+vp-product-core-adapter = { workspace = true, features = ["managed-server-v2"] }
+vp-product-compiler.workspace = true
+vp-product-domain.workspace = true
+[dev-dependencies]
+vp-product-secrets = { workspace = true, features = ["private-tls"] }
+vp-product-storage = { workspace = true, features = ["private-tls"] }
+rcgen = { version = "=0.13.2", default-features = false, features = ["crypto", "ring"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+tempfile = "=3.19.1"
+serde_json.workspace = true
+sha2 = "=0.10.8"
+time = "=0.3.41"
+rustix = { version = "=1.1.6", features = ["process"] }
+[lints]
+workspace = true
+
+[[test]]
+name = "registry_trojan_tls"
+harness = false
+
+[[test]]
+name = "public_material_registry"
+harness = false
+required-features = ["experimental-public"]
+
+[[bin]]
+name = "vp-public-plan"
+path = "src/bin/public_plan.rs"
+required-features = ["experimental-public"]

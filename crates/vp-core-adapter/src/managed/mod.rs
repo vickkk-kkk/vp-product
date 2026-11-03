@@ -2,10 +2,12 @@
 //! Start/stop/replace are blocking bounded host operations: invoke off UI threads.
 //! A verified child process isolates global core state and non-cancelable library
 //! tasks. This is vp_core itself, not an alternate proxy engine.
+#[cfg(feature = "experimental-public")]
+pub mod probe_client_v2;
 pub mod protocol;
 mod sealed_executable;
 pub use protocol::{
-    BoundListener, Failure, ListenerKind, ListenerSpec, StopReport, WorkerConfig, WorkerSnapshot,
+    BoundListener, Failure, ListenerKind, ListenerSpec, ProbeLedgerObservation, StopReport, WorkerConfig, WorkerSnapshot,
 };
 use protocol::{Request, Response, MAX_FRAME, PROTOCOL_VERSION};
 use std::io::{BufReader, Write};
@@ -485,3 +487,21 @@ impl ManagedRuntime {
         }
     }
 }
+
+#[cfg(feature = "managed-server-v2")]
+pub mod server_v2;
+
+#[cfg(feature = "managed-server-v2")]
+pub mod host_v2;
+#[cfg(feature = "managed-server-v2")]
+pub mod material_port_v2;
+#[cfg(feature = "managed-server-v2")]
+pub mod protocol_v2;
+#[cfg(feature = "managed-server-v2")]
+pub mod server_worker_v2;
+
+#[cfg(all(test, feature = "managed-server-v2"))]
+mod v2_test_support;
+
+#[cfg(feature = "managed-server-v2")]
+mod sealed_executable_v2;

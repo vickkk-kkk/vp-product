@@ -1052,3 +1052,9 @@ fn fresh_observation_requires_exact_identity_generation_time_and_all_checks() {
 
 #[path = "managed_secret_tests.rs"]
 mod managed_secret_tests;
+
+#[path = "stage_context_tests.rs"]
+mod stage_context_tests;
+
+#[path = "runtime_context_tests.rs"]
+mod runtime_context_tests;

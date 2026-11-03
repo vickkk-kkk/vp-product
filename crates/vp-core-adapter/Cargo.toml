@@ -22,6 +22,11 @@ expect_used = "warn"
 crate-type = ["rlib", "cdylib"]
 
 [features]
+# Opt-in only; no production certification.
+experimental-public = ["managed-server-v2", "dep:rustls", "dep:tokio-rustls", "dep:vp-dns", "dep:webpki-roots"]
+# Explicit local-only fixture; release builds must reject this feature.
+local-probe-test = ["experimental-public"]
+managed-server-v2 = ["managed-runtime", "dep:vp-product-compiler", "dep:vp-protocol", "dep:vp-transport"]
 mobile-ffi = ["dep:vp-core", "dep:vp-config", "dep:vp-common", "dep:vp-dns", "dep:vp-protocol", "dep:vp-tun", "dep:tokio", "dep:sha2", "dep:libc", "dep:async-trait"]
 default = []
 managed-runtime = ["dep:rustix", "dep:vp-app", "dep:vp-core", "dep:vp-config", "dep:vp-common", "dep:tokio", "dep:sha2"]
@@ -54,6 +59,21 @@ optional = true
 [dependencies.zeroize]
 workspace = true
 
+[dependencies.rustls]
+version = "=0.23.46"
+default-features = false
+features = ["ring", "std", "tls12"]
+optional = true
+[dependencies.webpki-roots]
+version = "=0.26.11"
+optional = true
+
+[dependencies.tokio-rustls]
+version = "=0.26.6"
+default-features = false
+features = ["ring", "tls12"]
+optional = true
+
 [[bin]]
 name = "vp-core-managed-worker"
 path = "src/bin/managed_worker.rs"
@@ -79,3 +99,18 @@ optional = true
 version = "=1.1.6"
 features = ["fs"]
 optional = true
+
+[dependencies.vp-product-compiler]
+workspace = true
+optional = true
+[dependencies.vp-transport]
+path = "../../integration/vp_core/crates/vp-transport"
+optional = true
+[dev-dependencies]
+rustix = { version = "=1.1.6", features = ["process"] }
+rcgen = { version = "=0.13.2", default-features = false, features = ["crypto", "ring"] }
+time = "=0.3.41"
+[[bin]]
+name = "vp-core-server-worker-v2"
+path = "src/bin/server_worker_v2.rs"
+required-features = ["managed-server-v2"]

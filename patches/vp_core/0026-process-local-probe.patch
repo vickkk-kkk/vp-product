@@ -1,0 +1,200 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index e9f9ba7..2729323 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2682,6 +2682,7 @@ dependencies = [
+  "async-trait",
+  "bytes",
+  "serde",
++ "sha2",
+  "tokio",
+  "tracing",
+  "vp-common",
+diff --git a/crates/vp-core/Cargo.toml b/crates/vp-core/Cargo.toml
+index 025923a..6ae4b11 100644
+--- a/crates/vp-core/Cargo.toml
++++ b/crates/vp-core/Cargo.toml
+@@ -13,3 +13,4 @@ bytes.workspace = true
+ async-trait.workspace = true
+ tracing.workspace = true
+ serde = { workspace = true, features = ["rc"] }
++sha2.workspace = true
+diff --git a/crates/vp-core/src/experimental_virtual_probe.rs b/crates/vp-core/src/experimental_virtual_probe.rs
+new file mode 100644
+index 0000000..c878f6c
+--- /dev/null
++++ b/crates/vp-core/src/experimental_virtual_probe.rs
+@@ -0,0 +1,106 @@
++//! Process-local experimental challenge sink. It never opens a network socket.
++//! An opt-in public worker may route one reserved numeric address here while
++//! the actual network floor continues to deny that address on real sockets.
++use sha2::{Digest, Sha256};
++use std::{collections::BTreeMap, io, net::{IpAddr, Ipv4Addr, SocketAddr}, pin::Pin,
++    sync::{Mutex, OnceLock}, task::{Context, Poll, Waker}, time::{Duration, Instant}};
++use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
++
++pub const TARGET: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)), 9);
++const CAPACITY: usize = 64;
++const RETENTION: Duration = Duration::from_secs(60);
++const ACK: &[u8] = b"VP-ORACLE-OK";
++#[derive(Default)]
++struct Ledger { hashes: BTreeMap<[u8; 32], Instant>, saturated_since: Option<Instant> }
++impl Ledger {
++    fn prune(&mut self, now: Instant) {
++        self.hashes.retain(|_, at| now.checked_duration_since(*at).is_none_or(|age| age < RETENTION));
++        if self.saturated_since.is_some_and(|at| now.checked_duration_since(at).is_some_and(|age| age >= RETENTION)) { self.saturated_since = None; }
++    }
++    fn record(&mut self, token: &[u8;32], now: Instant) -> bool {
++        self.prune(now);
++        let digest: [u8;32] = Sha256::digest(token).into();
++        if self.saturated_since.is_some() || self.hashes.contains_key(&digest) { return false; }
++        if self.hashes.len() >= CAPACITY { self.saturated_since = Some(now); return false; }
++        self.hashes.insert(digest, now); true
++    }
++}
++fn ledger() -> &'static Mutex<Ledger> { static LEDGER: OnceLock<Mutex<Ledger>> = OnceLock::new(); LEDGER.get_or_init(|| Mutex::new(Ledger::default())) }
++fn register(token: &[u8; 32]) -> bool { ledger().lock().is_ok_and(|mut value| value.record(token, Instant::now())) }
++/// One-way hashes only, never tokens. A capacity overflow is reported for at
++/// least 60 seconds, longer than a bounded individual probe observation.
++pub fn snapshot() -> (Vec<[u8;32]>, bool) {
++    match ledger().lock() {
++        Ok(mut value) => { value.prune(Instant::now()); (value.hashes.keys().copied().collect(), value.saturated_since.is_some()) }
++        Err(_) => (vec![], true),
++    }
++}
++/// Allowed only inside an explicitly installed immutable public process floor.
++pub fn is_target(address: SocketAddr) -> bool { address == TARGET && crate::task_scope::experimental_process_floor().is_some() }
++
++pub struct VirtualProbeStream { token: [u8;32], used: usize, complete: bool, accepted: bool, sent: usize, reader: Option<Waker> }
++impl VirtualProbeStream { pub fn new() -> Self { Self { token: [0;32], used: 0, complete: false, accepted: false, sent: 0, reader: None } } }
++impl Default for VirtualProbeStream { fn default() -> Self { Self::new() } }
++impl Drop for VirtualProbeStream { fn drop(&mut self) { self.token.fill(0); } }
++impl AsyncWrite for VirtualProbeStream {
++    fn poll_write(mut self: Pin<&mut Self>, _: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
++        if self.complete { return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "challenge complete"))); }
++        if data.is_empty() { return Poll::Ready(Ok(0)); }
++        let take = data.len().min(32 - self.used); let start = self.used;
++        self.token[start..start+take].copy_from_slice(&data[..take]); self.used += take;
++        if self.used == 32 {
++            self.accepted = register(&self.token); self.token.fill(0); self.complete = true;
++            if let Some(waker) = self.reader.take() { waker.wake(); }
++        }
++        Poll::Ready(Ok(take))
++    }
++    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> { Poll::Ready(Ok(())) }
++    fn poll_shutdown(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
++        if !self.complete { self.complete = true; self.token.fill(0); if let Some(waker) = self.reader.take() { waker.wake(); } }
++        Poll::Ready(Ok(()))
++    }
++}
++impl AsyncRead for VirtualProbeStream {
++    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, out: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
++        if out.remaining() == 0 { return Poll::Ready(Ok(())); }
++        if !self.complete { self.reader = Some(cx.waker().clone()); return Poll::Pending; }
++        if self.accepted && self.sent < ACK.len() {
++            let take = out.remaining().min(ACK.len()-self.sent); out.put_slice(&ACK[self.sent..self.sent+take]); self.sent += take;
++        }
++        Poll::Ready(Ok(()))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use tokio::io::{AsyncReadExt, AsyncWriteExt};
++    #[test]
++    fn capacity_and_saturation_expire_only_after_retention_window() {
++        let mut ledger = Ledger::default(); let t = Instant::now();
++        for n in 0..64u8 { assert!(ledger.record(&[n;32], t)); }
++        assert!(!ledger.record(&[65;32], t));
++        ledger.prune(t + Duration::from_secs(59)); assert!(ledger.saturated_since.is_some()); assert_eq!(ledger.hashes.len(), 64);
++        ledger.prune(t + Duration::from_secs(60)); assert!(ledger.saturated_since.is_none()); assert!(ledger.hashes.is_empty());
++        assert!(ledger.record(&[65;32], t + Duration::from_secs(60)));
++    }
++    #[tokio::test]
++    async fn one_use_hash_ledger_saturates_without_eviction_or_network() {
++        let token = [1u8;32];
++        let mut stream = VirtualProbeStream::new();
++        stream.write_all(&token[..7]).await.unwrap(); stream.write_all(&token[7..]).await.unwrap();
++        let mut ack = [0;12]; stream.read_exact(&mut ack).await.unwrap(); assert_eq!(&ack, ACK);
++        let expected: [u8;32] = Sha256::digest(token).into();
++        assert!(snapshot().0.contains(&expected));
++        let mut replay = VirtualProbeStream::new(); replay.write_all(&token).await.unwrap();
++        let mut byte = [0;1]; assert_eq!(replay.read(&mut byte).await.unwrap(), 0);
++        for n in 2..=64u8 {
++            let mut stream = VirtualProbeStream::new(); stream.write_all(&[n;32]).await.unwrap();
++            let mut ack = [0;12]; stream.read_exact(&mut ack).await.unwrap(); assert_eq!(&ack, ACK);
++        }
++        assert_eq!(snapshot().0.len(), CAPACITY); assert!(!snapshot().1);
++        let mut overflow = VirtualProbeStream::new(); overflow.write_all(&[65;32]).await.unwrap();
++        assert_eq!(overflow.read(&mut byte).await.unwrap(), 0);
++        let (hashes, saturated) = snapshot(); assert!(saturated); assert_eq!(hashes.len(), CAPACITY); assert!(hashes.contains(&expected));
++    }
++}
+diff --git a/crates/vp-core/src/lib.rs b/crates/vp-core/src/lib.rs
+index 15fe11e..61212f8 100644
+--- a/crates/vp-core/src/lib.rs
++++ b/crates/vp-core/src/lib.rs
+@@ -8,6 +8,7 @@ pub mod inbound;
+ pub mod host_network;
+ // Exact-target policy used by the opt-in experimental public profile.
+ pub mod experimental_exact_targets;
++pub mod experimental_virtual_probe;
+ pub mod outbound;
+ pub mod router;
+ pub mod session;
+diff --git a/crates/vp-core/src/task_scope.rs b/crates/vp-core/src/task_scope.rs
+index b86ed41..b35feec 100644
+--- a/crates/vp-core/src/task_scope.rs
++++ b/crates/vp-core/src/task_scope.rs
+@@ -96,7 +96,8 @@ pub fn destination_policy() -> DestinationPolicy {
+ pub fn check_destination(dst: &vp_common::DstAddr) -> vp_common::Result<()> {
+     if let Some(targets) = experimental_process_floor() {
+         let permitted = match &dst.host {
+-            vp_common::Host::Ip(ip) => targets.validate(&[std::net::SocketAddr::new(*ip, dst.port)]).is_some(),
++            vp_common::Host::Ip(ip) => targets.validate(&[std::net::SocketAddr::new(*ip, dst.port)]).is_some()
++                || crate::experimental_virtual_probe::is_target(std::net::SocketAddr::new(*ip, dst.port)),
+             vp_common::Host::Domain(_) => false,
+         };
+         if !permitted { return Err(vp_common::Error::Unsupported("experimental process floor denied destination".into())); }
+@@ -113,7 +114,8 @@ pub fn check_destination(dst: &vp_common::DstAddr) -> vp_common::Result<()> {
+         // Domains remain disabled until every bypass path is audited.
+         DestinationPolicy::ExactPublic(targets) => {
+             let permitted = match &dst.host {
+-                vp_common::Host::Ip(ip) => targets.validate(&[std::net::SocketAddr::new(*ip, dst.port)]).is_some(),
++                vp_common::Host::Ip(ip) => targets.validate(&[std::net::SocketAddr::new(*ip, dst.port)]).is_some()
++                || crate::experimental_virtual_probe::is_target(std::net::SocketAddr::new(*ip, dst.port)),
+                 vp_common::Host::Domain(_) => false,
+             };
+             if permitted { Ok(()) } else { Err(vp_common::Error::Unsupported("destination not authorized".into())) }
+@@ -587,6 +589,11 @@ mod destination_tests {
+             scope.run(async {
+                 assert!(check_destination(&denied()).is_err());
+                 assert!(check_udp_destination(&DstAddr { host: Host::Ip("8.8.8.8".parse().unwrap()), port: 443 }).is_err());
++                let virtual_target = crate::experimental_virtual_probe::TARGET;
++                let probe = DstAddr { host: Host::Ip(virtual_target.ip()), port: virtual_target.port() };
++                assert!(check_destination(&probe).is_ok());
++                assert!(check_udp_destination(&probe).is_err());
++                assert_eq!(crate::host_network::connect_tcp(virtual_target, crate::host_network::Purpose::Proxy).await.unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+                 assert_eq!(crate::host_network::connect_tcp("127.0.0.1:443".parse().unwrap(), crate::host_network::Purpose::Proxy).await.unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+             }).await;
+         });
+diff --git a/crates/vp-protocol/src/direct.rs b/crates/vp-protocol/src/direct.rs
+index d567404..331a195 100644
+--- a/crates/vp-protocol/src/direct.rs
++++ b/crates/vp-protocol/src/direct.rs
+@@ -59,6 +59,14 @@ impl Outbound for DirectOutbound {
+                 }
+             }
+         }
++        // The reserved probe destination is intercepted in-process, never
++        // dialed. HostNetwork's real-socket floor still rejects the address.
++        if let Host::Ip(ip) = dst.host {
++            if vp_core::experimental_virtual_probe::is_target(std::net::SocketAddr::new(ip, dst.port)) {
++                vp_core::task_scope::check_destination(dst)?;
++                return Ok(Box::new(vp_core::experimental_virtual_probe::VirtualProbeStream::new()));
++            }
++        }
+         let addrs = self.resolve(dst).await?;
+         if addrs.is_empty() {
+             return Err(Error::Addr(format!("无法解析 {dst}")));

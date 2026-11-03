@@ -2885,6 +2885,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "serde",
+ "sha2",
  "tokio",
  "tracing",
  "vp-common",
@@ -3008,6 +3009,7 @@ dependencies = [
  "time",
  "vp-product-domain",
  "vp-product-import",
+ "vp-product-x509-validity",
  "yasna",
  "zeroize",
 ]
@@ -3018,19 +3020,26 @@ version = "0.1.0-dev.1"
 dependencies = [
  "async-trait",
  "libc",
+ "rcgen",
  "rustix",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
+ "time",
  "tokio",
+ "tokio-rustls",
  "vp-app",
  "vp-common",
  "vp-config",
  "vp-core",
  "vp-dns",
+ "vp-product-compiler",
  "vp-product-domain",
  "vp-protocol",
+ "vp-transport",
  "vp-tun",
+ "webpki-roots 0.26.11",
  "zeroize",
 ]
 
@@ -3060,13 +3069,16 @@ name = "vp-product-managementd"
 version = "0.1.0-dev.1"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "getrandom 0.3.4",
+ "rcgen",
  "rustix",
  "serde",
  "serde_json",
  "sha2",
  "subtle",
  "tempfile",
+ "time",
  "tokio",
  "vp-product-api",
  "vp-product-compiler",
@@ -3085,17 +3097,22 @@ version = "0.1.0-dev.1"
 dependencies = [
  "axum",
  "fs2",
+ "getrandom 0.3.4",
+ "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tower",
  "vp-product-api",
  "vp-product-compiler",
  "vp-product-control",
  "vp-product-core-adapter",
  "vp-product-domain",
+ "vp-product-server-materials",
  "vp-product-storage",
  "zeroize",
 ]
@@ -3126,6 +3143,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "vp-product-server-materials"
+version = "0.1.0-dev.1"
+dependencies = [
+ "rcgen",
+ "rustix",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "time",
+ "vp-product-compiler",
+ "vp-product-control",
+ "vp-product-core-adapter",
+ "vp-product-domain",
+ "vp-product-secrets",
+ "vp-product-storage",
+]
+
+[[package]]
+name = "vp-product-server-protocol3"
+version = "0.1.0-dev.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "vp-product-compiler",
+ "vp-product-domain",
+]
+
+[[package]]
 name = "vp-product-storage"
 version = "0.1.0-dev.1"
 dependencies = [
@@ -3138,6 +3186,14 @@ dependencies = [
  "tempfile",
  "vp-product-control",
  "vp-product-domain",
+]
+
+[[package]]
+name = "vp-product-x509-validity"
+version = "0.1.0-dev.1"
+dependencies = [
+ "time",
+ "yasna",
 ]
 
 [[package]]

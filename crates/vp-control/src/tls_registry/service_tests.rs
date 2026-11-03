@@ -61,8 +61,11 @@ impl TlsAssetWriterLease for Lease {
         Ok(())
     }
 }
+type StoredVaultRecord = (u8, u64, Vec<u8>);
+type VaultRecords = BTreeMap<String, StoredVaultRecord>;
+
 struct Vault {
-    data: RefCell<BTreeMap<String, (u8, u64, Vec<u8>)>>,
+    data: RefCell<VaultRecords>,
     put_count: Cell<usize>,
     fail: Cell<usize>,
     wrong_version: Cell<bool>,

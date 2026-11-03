@@ -1,0 +1,70 @@
+{
+  "schemaVersion": 1,
+  "recordedAtUtc": "2026-10-30T08:05:25.784340+00:00",
+  "scope": "authored Linux installer source and temporary-filesystem tests only",
+  "results": [
+    {
+      "command": "python3 -m unittest discover -s tools/install/tests -v",
+      "status": "passed",
+      "tests": 52,
+      "log": "tests/test-results.log"
+    },
+    {
+      "command": "python3 -m py_compile tools/install/*.py tools/install/tests/live_cli.py",
+      "status": "passed"
+    },
+    {
+      "command": "sh -n tools/install/install.sh",
+      "status": "passed"
+    },
+    {
+      "command": "systemd-analyze verify --man=no TEMP_ROOT/systemd/vp-managementd.service",
+      "status": "blocked",
+      "reason": "Attempted /run/systemd/ creation rejected by read-only filesystem; exit 1; not retried",
+      "log": "tests/unit-verify.log"
+    },
+    {
+      "command": "python3 tools/install/tests/live_cli.py --daemon EXACT_E965_DAEMON --daemon-sha256 e302257e8e276561ca3271bcf339392395cafd1ba69b446bc3212706f738b4e2 --worker EXACT_E965_WORKER --worker-sha256 5dae2017718147c6b2a5f939a398021367457790b391eec058807f4bcc163c91 --web-root BUILT_WEB --evidence tools/install/tests/live-cli-results.json",
+      "status": "passed",
+      "startedAtUtc": "2026-10-30T08:03:41Z",
+      "endedAtUtc": "2026-10-30T08:03:49Z",
+      "exitCode": 0,
+      "scope": "file-only temporary installation + explicit real loopback development profile + retaining uninstall",
+      "log": "tests/live-cli.log",
+      "evidence": "tests/live-cli-results.json",
+      "priorFailuresRetained": "tests/live-cli-attempts.json",
+      "ownedProcesses": "all terminal; exact worker birth/boot/PID identity absent; no host service changes"
+    }
+  ],
+  "fix": "Archive is copied into installer-owned anonymous private snapshot while hashing; parse and extraction only consume this snapshot. Source inode overwrite and pathname replacement regressions pass.",
+  "independentAudit": "incomplete; terminated after one confirmed finding; no full audit certification",
+  "pending": [
+    "root/systemd distro acceptance",
+    "published release authenticity/signatures",
+    "21-preset end-to-end and mobile subscription journey",
+    "first-time account/bootstrap/encrypted-vault service provision transaction",
+    "bundle v2 SQL-layout/control-payload metadata and coordinated explicit migration contract"
+  ],
+  "files": {
+    ".gitignore": "6feaded4e28ea86e001a6751b4e3d960e8b7c31b9616ff9936b79297086e809b",
+    "BUNDLE_V2_CONTRACT.md": "e80b9aea6b57aba95448a9de783e897fd96b5af76a6b9643859fa0a3841b9616",
+    "README.md": "630c61325404798660dafed6dea1d47d0d541afe78a687446530125fbf38687a",
+    "build_bundle.py": "2f98aeeea409713801f8474388831a48056930e67252dff343283378b21297ab",
+    "install.sh": "05fcd5b46c5c542844d9eb5a4cc5682ba6716e5ff7b31c3b3edfe5115a140864",
+    "tests/live-cli-attempt-1.log": "f7bb1f231d19f1abaa6511c434cba408e9703d7519e4a7a1bc211c3b835e49b6",
+    "tests/live-cli-attempt-2.log": "3568d4a59fbe64bc9c72d7230203542eed0aa40075e45f8f710228e0aeac5f30",
+    "tests/live-cli-attempt-3.log": "69bf431835aadc46cd3e3bc2c86ede56ab529d73d269b357a8fddf884f9f734d",
+    "tests/live-cli-attempts.json": "a058473756b41ecd57e18547348a5d905e96a50391a1c9cf98b8eec5c6c28fb5",
+    "tests/live-cli-results.json": "f4387f1246c67c7444e79c21c146957a9f9d36dfe351d23f3e694ef637476a51",
+    "tests/live-cli.log": "f4387f1246c67c7444e79c21c146957a9f9d36dfe351d23f3e694ef637476a51",
+    "tests/live_cli.py": "94e7bd83e24682aacc983a300102a11ef682aabeb1f71214ccc3a91a281ffa8b",
+    "tests/test-results.log": "44e9afbf0a66c70431482255ef62013b1e6aeb55a8b9933bf5333fbf41f70a91",
+    "tests/test_installer.py": "a2b77bc10d9906bbaf8f3ac46ab18fc76513a981a934e50b2d410e0a8e4ada08",
+    "tests/unit-verify.log": "da5b9ffa4561f385cf89e9ee0332086f17f8e7c89f3de62d7d2f9756ccb0d7e5",
+    "vp_api.py": "2c90adb863dd842a94b92e3c4c14dd2228590f8a88c9e0bf1d91a194fde11e58",
+    "vp_form.py": "9bc125ee473ef537e9a3fc0a3b5d55dd351154a4a6545e878a0c405c94bc52a3",
+    "vp_install.py": "c956d230f554486021cf2f63df57c8b0b645176a5a441374cf333952f01eaee2",
+    "vpctl.py": "f69839699c9e8d10ed6d5d400842ff4152cf904ae605df1c4c2579043d613971"
+  },
+  "liveHistory": "tests/live-cli-attempts.json"
+}

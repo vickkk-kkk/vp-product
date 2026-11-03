@@ -5,8 +5,19 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+# Debug-only isolated worker fixture; prohibited by the adapter in release builds.
+local-probe-test = ["experimental-public", "vp-product-core-adapter/local-probe-test"]
+server-v2-journal = []
+server-v2-journal-storage = ["server-v2-journal", "vp-product-control/private-tls"]
+experimental-public = ["server-v2-journal-storage", "vp-product-storage/private-tls", "vp-product-control/experimental-public", "vp-product-core-adapter/experimental-public", "dep:vp-product-server-materials", "vp-product-server-materials/experimental-public", "dep:getrandom", "dep:tokio"]
+
 [dependencies]
 vp-product-domain.workspace = true
+vp-product-server-materials = { path = "../vp-server-materials", optional = true }
+getrandom = { version = "=0.3.4", optional = true }
+tokio = { version = "=1.54.1", features = ["rt", "net", "io-util", "time"], optional = true }
 vp-product-control.workspace = true
 vp-product-compiler.workspace = true
 vp-product-storage.workspace = true
@@ -17,6 +28,9 @@ zeroize.workspace = true
 fs2 = "=0.4.3"
 
 [dev-dependencies]
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
+rcgen = { version = "=0.13.2", default-features = false, features = ["crypto", "ring"] }
 vp-product-api.workspace = true
 axum = { version = "=0.8.4", features = ["json", "tokio", "http1"] }
 tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "time"] }
