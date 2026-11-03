@@ -48,5 +48,7 @@ constructor requires the caller to keep the Activity/AndroidApp alive for the
 entire bridge lifetime. A locked offline host compile and two input/pointer
 tests pass; no JVM round-trip or Android target build has been performed.
 The Gradle module and APK manifest merge have not yet been built.
-The egui runtime entry and rendering UI have only passed source parsing and
-dependency-lock resolution, not Android compilation or device execution.
+The egui runtime entry's AndroidHost implementation also passed a host-side
+typecheck and two tests with a stub AndroidApp; that does not test Android JNI.
+The rendering UI passed source parsing and an isolated connection-method
+typecheck with egui stubs. Neither is an Android compilation or device test.
