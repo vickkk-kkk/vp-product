@@ -21,7 +21,8 @@ discards an instance-close error, so `Bind` requires a separate `confirmClosed`
 callback. An unconfirmed stop blocks another start. The Android UI does not bind
 this experiment and still reports sing-box unavailable.
 The confirmation callback must be side-effect-free and must return true only
-with fresh, exact evidence that the owned engine and TUN are absent.
+with fresh, exact evidence that the owned engine and TUN are absent. It must be
+thread-safe because interruption and final cleanup run on different goroutines.
 
 Binding requires an initially confirmed stopped engine/TUN, a config validator,
 and exclusive ownership of the started-service instance. The package refuses a
@@ -37,6 +38,9 @@ Because upstream discards its instance reference and ignores close errors, a
 later stop might not recover leaked resources; an unconfirmed state requires
 host-level recovery and must never be reported as stopped. The host also remains
 responsible for eventual full CommandServer/recorder destruction.
+Start and stop may block and must run on a dedicated control executor, not the
+Android UI thread. A hung upstream operation can still require process-level
+recovery; no such recovery mechanism is implemented here.
 
 The validator must be pure, must reject unsupported routes, listeners, DNS,
 storage and insecure TLS, and must not retain or log the supplied configuration.
