@@ -86,3 +86,10 @@ identity must be verified. The fixed VP-Core source declares MIT, but the exact
 source snapshot did not contain a complete LICENSE file; do not invent a
 copyright line. No version or download address is assigned until an actual
 reviewed GitHub Release exists.
+
+The current target-specific dependency-tree candidate has 287 package
+identities, including 262 registry identities and 25 local identities. This is
+not an artifact-exact SBOM. Registry notice candidates have been collected, but
+`ring` 0.16.20 uses a composite license file rather than a Cargo SPDX license
+expression; nested and native code still require review. VP-Core's missing
+complete upstream license and copyright notice remain an open distribution gate.
