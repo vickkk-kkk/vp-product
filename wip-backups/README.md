@@ -1,3 +1,7 @@
 # Private work-in-progress backup
 
-This branch stores a recoverable server-source delta, not a release or an installable test package. It is based on commit f61425e48590983378d950818ab49a63c279a33b. The compressed patch has SHA-256 10749509758d907105620d676ab9b1da8c101143feb20e2c01c2a92781c754df. It covers server crates, installer tools, contracts, Cargo files, core lock and patch series, and the single-IP probe note. It does not include the separately managed client submodule, generated core evidence, or historical test evidence. Restore only onto that exact base, inspect the patch, and run its checks before use. No production readiness, public deployment, or GitHub Release is asserted.
+This compressed patch applies to project main commit f61425e48590983378d950818ab49a63c279a33b. It contains experimental server, single-IP probe, foreground lab entry, local-only package builder, and recovered dependency license evidence. It is not a release and has not been validated on a VPS. Client submodule and local test results are not included. No production credentials are included.
+
+SHA-256 of vp-server-delta-f614.patch.zst: 715acaea65f26243f63b7f839ef5ecc466da7fc2bb35841c13ba864cb5772a46
+
+Review source, license provenance, compatibility, and all security properties before any distribution or deployment.
