@@ -5,6 +5,8 @@ transport for an egui host, without importing Flutter. `HostState.kt` replaces
 the Flutter event-channel state projection; `EguiVpnBridge.kt` exposes explicit
 permission preparation, an explicit consent-only Activity, preflight, one-shot
 in-process start, stop, and snapshot entry points. Start acceptance means only that a service request was queued.
+Consent requests and start both require the native adapter's validation of the
+exact supplied payload; the JNI boundary rechecks it before TUN acquisition.
 No credentials are put into Intents, and a TUN or service does not establish a
 healthy connection. Payloads are JVM strings and are not securely erased.
 
@@ -35,4 +37,6 @@ the JNI host separately compiled to AArch64 with seven expected JNI entry
 symbols. Isolated HostState checks cover unavailable/starting state, identity,
 stale observations and invalid schema. The Android process, permission flow,
 network forwarding, DNS, IPv6 and lifecycle remain untested for this bridge.
+JVM checks also confirm empty, oversized, and missing-adapter inputs fail closed;
+they do not exercise a real Android permission dialog or a loaded native core.
 The Gradle module and APK manifest merge have not yet been built.

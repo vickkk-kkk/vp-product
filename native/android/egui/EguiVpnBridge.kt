@@ -16,9 +16,16 @@ object EguiVpnBridge {
     @JvmStatic fun prepareIntent(context: Context): Intent? = VpnService.prepare(context)
     @JvmStatic fun available(): Boolean = NativeRuntime.available()
 
+    /** The core validates the exact request before the system prompt or TUN. */
+    @JvmStatic fun preflight(payload: String): Boolean = try {
+        payload.isNotEmpty() && payload.length <= 1048576 &&
+            payload.toByteArray(Charsets.UTF_8).size <= 1048576 &&
+            NativeRuntime.available() && NativeRuntime.validatePayload(payload)
+    } catch (_: Exception) { false }
+
     /** User-initiated only. Consent never starts a tunnel automatically. */
-    @JvmStatic fun requestConsent(context: Context): Boolean {
-        if (!NativeRuntime.available() || !consentInFlight.compareAndSet(false, true)) return false
+    @JvmStatic fun requestConsent(context: Context, payload: String): Boolean {
+        if (!preflight(payload) || !consentInFlight.compareAndSet(false, true)) return false
         consentResult = "pending"
         return try {
             val intent = Intent(context, EguiVpnConsentActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -37,9 +44,7 @@ object EguiVpnBridge {
 
     @Synchronized @JvmStatic fun startWithPayload(context: Context, payload: String): Boolean {
         if (VpVpnService.current != null || VpVpnService.pendingStart != null) return false
-        if (payload.isEmpty() || payload.length > 1048576 ||
-            payload.toByteArray(Charsets.UTF_8).size > 1048576 || !NativeRuntime.available()) return false
-        if (!NativeRuntime.validatePayload(payload) || VpnService.prepare(context) != null) return false
+        if (!preflight(payload) || VpnService.prepare(context) != null) return false
         val request = NativeRuntime.startRequest(payload, UUID.randomUUID().toString(), UUID.randomUUID().toString())
         VpVpnService.pendingStart = request
         return try {
