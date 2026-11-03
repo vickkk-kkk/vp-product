@@ -2,7 +2,7 @@
 
 This is an **unintegrated experiment**, not a working Android engine. It pins
 sing-box v1.14.4 and exposes a small serialized lifecycle. With build tag
-`singbox`, `Bind` calls the exported `CommandServer.StartedService` method
+`singbox`, the private `bindUnverified` calls the exported `CommandServer.StartedService` method
 directly, rather than `CommandServer.StartOrReloadService`, which writes a
 configuration snapshot. The wrapper never starts the command server listener.
 
@@ -17,7 +17,7 @@ complete dependency lock has not yet been established.
 The caller must supply an actual platform implementation that establishes a TUN,
 protects every relevant TCP/UDP/DNS socket, handles Android network changes and
 revocation, and independently confirms teardown. Upstream `CloseService`
-discards an instance-close error, so `Bind` requires a separate `confirmClosed`
+discards an instance-close error, so binding requires a separate `confirmClosed`
 callback. An unconfirmed stop blocks another start. The Android UI does not bind
 this experiment and still reports sing-box unavailable.
 The confirmation callback must be side-effect-free and must return true only
@@ -38,6 +38,8 @@ Because upstream discards its instance reference and ignores close errors, a
 later stop might not recover leaked resources; an unconfirmed state requires
 host-level recovery and must never be reported as stopped. The host also remains
 responsible for eventual full CommandServer/recorder destruction.
+The binding is deliberately private because nothing yet proves that the exact
+platform guard was installed when that server was constructed.
 Start and stop may block and must run on a dedicated control executor, not the
 Android UI thread. A hung upstream operation can still require process-level
 recovery; no such recovery mechanism is implemented here.
@@ -58,6 +60,13 @@ control executor, not the Android UI thread. These files do not create routes or
 implement libbox's full PlatformInterface and are not wired into an APK. Kotlin
 2.0.21 compilation against Android API 35 and JVM checks with fake descriptors,
 including a protect/close overlap, passed. They do not test real OS descriptors.
+The tagged Go `AndroidPlatform` also forwards protection, TUN and interface
+monitor requests to a required host, fails closed on errors and exposes a sticky
+health failure. The Android host implementation, continuous health supervision,
+and proof that every outbound uses the hook are not implemented or tested.
+The host must validate the requested TUN addresses, routes and DNS and keep the
+borrowed descriptor alive; it must also stop the engine on any sticky platform
+failure. DNS-cache invalidation is not implemented and marks the guard failed.
 
 `go test` without tags tests only the local lifecycle with synthetic callbacks;
 it does not compile sing-box or prove upstream behavior. Both the lifecycle and

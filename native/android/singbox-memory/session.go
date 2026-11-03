@@ -57,7 +57,7 @@ func newSession(start func(context.Context, string) error, stop func() error, va
 // NewVerified refuses to treat a successful stop call as proof of cleanup.
 // The host must independently verify that its exact engine and TUN are absent.
 func NewVerified(start func(context.Context, string) error, stop func() error, confirmClosed func() bool, validate func(string) error) (*Session, error) {
-	if stop == nil || confirmClosed == nil || validate == nil {
+	if start == nil || stop == nil || confirmClosed == nil || validate == nil {
 		return nil, ErrInvalid
 	}
 	if !invokeConfirm(confirmClosed) {

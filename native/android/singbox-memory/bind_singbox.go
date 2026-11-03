@@ -13,7 +13,7 @@ import (
 // complete server-destruction protocol exists, reuse is intentionally denied.
 var claimedServers sync.Map
 
-// Bind selects the exported StartedService method directly. Unlike libbox's
+// bindUnverified selects the exported StartedService method directly. Unlike libbox's
 // CommandServer.StartOrReloadService wrapper, that method does not itself call
 // saveConfigSnapshot. Other upstream logging/reporting and platform paths still
 // require independent audit; this function does not claim memory-only behavior
@@ -21,8 +21,10 @@ var claimedServers sync.Map
 // close errors, so the host must independently prove engine and TUN teardown.
 // The caller transfers exclusive control and must not invoke server methods
 // elsewhere; a caller retaining and using the pointer cannot be prevented here.
-func Bind(server *libbox.CommandServer, confirmClosed func() bool, validate func(string) error) (*Session, error) {
-	if server == nil || server.StartedService == nil || confirmClosed == nil || validate == nil {
+// This is private until construction proves this exact platform was installed
+// in the server and full server teardown is implemented.
+func bindUnverified(server *libbox.CommandServer, platform *AndroidPlatform, confirmClosed func() bool, validate func(string) error) (*Session, error) {
+	if server == nil || server.StartedService == nil || platform == nil || !platform.Healthy() || confirmClosed == nil || validate == nil {
 		return nil, ErrInvalid
 	}
 	key := server.StartedService
@@ -30,7 +32,16 @@ func Bind(server *libbox.CommandServer, confirmClosed func() bool, validate func
 		return nil, ErrBusy
 	}
 	session, err := NewVerified(func(ctx context.Context, config string) error {
-		return key.StartOrReloadService(ctx, config, nil)
+		if !platform.Healthy() {
+			return ErrPlatform
+		}
+		if err := key.StartOrReloadService(ctx, config, nil); err != nil {
+			return err
+		}
+		if !platform.Healthy() {
+			return ErrPlatform
+		}
+		return nil
 	}, key.CloseService, confirmClosed, validate)
 	if err != nil {
 		claimedServers.Delete(key)
