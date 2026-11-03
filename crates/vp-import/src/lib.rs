@@ -6,6 +6,7 @@
 mod encoding;
 mod export;
 mod json;
+pub mod mobile;
 mod uri;
 
 pub use export::export_uri;

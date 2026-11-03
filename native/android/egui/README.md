@@ -20,6 +20,16 @@ vp_core adapter library. This module does **not** connect the consent Activity t
 profiles into the typed payload, or implement six engines. None of those missing
 steps should be inferred from a successful Kotlin compilation.
 
+`vp-product-import::mobile::encode_ephemeral` now produces an ABI-v2 request
+from a selected strict import, explicit numeric bootstrap and proxied-user DNS,
+and a caller-provided node identity. It carries credentials separately, uses a
+non-vault sentinel only within the request, redacts Debug and zeroizes the Rust
+JSON buffer on drop. It rejects obfuscation it cannot preserve; the adapter
+must still validate all protocol and full-TUN capabilities. Never persist this
+request or treat its sentinel as a real vault entry. Kotlin/JNI string copies
+are not securely erasable. The import crate's 31 integration tests and one
+compile-fail doc test pass; this is not JNI or VPN interoperability evidence.
+
 Source compilation against Android API 35 passed using Kotlin 2.0.21 and 2.2.20/JVM 17;
 the JNI host separately compiled to AArch64 with seven expected JNI entry
 symbols. Isolated HostState checks cover unavailable/starting state, identity,
