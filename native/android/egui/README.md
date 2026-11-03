@@ -17,7 +17,9 @@ Compile the three production files here alongside these existing sources, not th
 The optional Gradle library module stages these sources and merges
 `AndroidManifest.xml`, declaring a non-exported consent Activity and the
 permission-protected service. It is enabled only by the client build's explicit
-`vpEguiRuntimeRoot` property. The host also needs the JNI host library and matching
+`vpEguiRuntimeRoot` property. The UI checks availability separately for each of
+six engines, but only vp_core has a backend here; other selections fail closed.
+The host also needs the JNI host library and matching
 vp_core adapter library. The experimental `egui-app` Rust entry now connects
 the UI to this bridge and maps a selected strict URI into a typed payload. It
 only attempts vp_core and does not implement six engines. None of this should be

@@ -3,6 +3,7 @@
 
 use std::net::SocketAddr;
 use vp_client_mobile_ui::runtime::{RuntimeError, RuntimeHost, RuntimeObservation};
+use vp_client_mobile_ui::connection::Engine;
 use vp_product_domain::{NodeId, Revision};
 use vp_product_import::{mobile::{encode_ephemeral, observe_snapshot, MobileObservation, MobilePayload}, parse, ImportFormat};
 use winit::platform::android::activity::AndroidApp;
@@ -22,7 +23,9 @@ impl AndroidHost {
     }
 }
 impl RuntimeHost for AndroidHost {
-    fn available(&mut self) -> bool { self.bridge(|b| b.available().unwrap_or(false)).unwrap_or(false) }
+    fn supports(&mut self, engine: Engine) -> bool {
+        engine == Engine::VpCore && self.bridge(|b| b.available().unwrap_or(false)).unwrap_or(false)
+    }
     fn observe(&mut self) -> RuntimeObservation {
         let Ok(Ok(snapshot)) = self.bridge(|b| b.snapshot_json()) else { return RuntimeObservation::Unavailable };
         let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else { return RuntimeObservation::Unavailable };
@@ -38,8 +41,9 @@ impl RuntimeHost for AndroidHost {
             MobileObservation::Stale => RuntimeObservation::Stale,
         }
     }
-    fn prepare(&mut self, raw_uri: &str, node_id: &str, bootstrap: &[SocketAddr], user_dns: &[SocketAddr]) -> Result<(), RuntimeError> {
+    fn prepare(&mut self, engine: Engine, raw_uri: &str, node_id: &str, bootstrap: &[SocketAddr], user_dns: &[SocketAddr]) -> Result<(), RuntimeError> {
         self.prepared = None;
+        if engine != Engine::VpCore { return Err(RuntimeError::Unsupported); }
         let mut batch = parse(raw_uri.as_bytes(), ImportFormat::NodeUri).map_err(|_| RuntimeError::InvalidInput)?;
         if batch.entries.len() != 1 || batch.has_unimported_fields || !batch.diagnostics.is_empty() { return Err(RuntimeError::Unsupported); }
         let item = batch.entries.remove(0);
