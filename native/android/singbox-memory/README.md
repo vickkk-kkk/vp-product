@@ -50,6 +50,15 @@ Neither a production validator nor Android platform implementation exists yet.
 Cancellation while validation is running prevents the backend from starting,
 but cannot interrupt a stuck validator; the host must supply a bounded one.
 
+The `android/` directory adds a TUN-descriptor lease and a `VpnService.protect`
+adapter. It keeps the original descriptor owned until an independent check says
+the exact engine and any in-flight start are gone; a close exception is marked
+uncertain and never blindly retried. Its callbacks must be bounded and run on a
+control executor, not the Android UI thread. These files do not create routes or
+implement libbox's full PlatformInterface and are not wired into an APK. Kotlin
+2.0.21 compilation against Android API 35 and JVM checks with fake descriptors,
+including a protect/close overlap, passed. They do not test real OS descriptors.
+
 `go test` without tags tests only the local lifecycle with synthetic callbacks;
 it does not compile sing-box or prove upstream behavior. Both the lifecycle and
 tagged binding sources were typechecked with small local API stubs, not actual
