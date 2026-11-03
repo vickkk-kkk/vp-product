@@ -62,7 +62,7 @@ borrowed FD alone cannot prevent a concurrent start/close race. Its callbacks
 must be bounded and must not block the Android UI thread. These files do not create routes or
 implement libbox's full PlatformInterface and are not wired into an APK. Kotlin
 2.0.21 compilation against Android API 35 and JVM checks with fake descriptors,
-including a protect/close overlap, passed. They do not test real OS descriptors.
+including protect/close overlap and callback reentry, passed. They do not test real OS descriptors.
 The tagged Go `AndroidPlatform` also forwards protection, TUN and interface
 monitor requests to a required host, fails closed on errors and exposes a sticky
 health failure. The Android host implementation, continuous health supervision,
@@ -80,7 +80,7 @@ Fatal errors call a nonblocking host callback, which must schedule engine shutdo
 the callback and successful unregister do not prove shutdown. A host must require
 both a healthy monitor and a non-null current network before starting; the monitor
 itself does not start an engine. Socket binding to the selected Network is not
-implemented, and INTERNET capability does not prove validated connectivity. On API 28–30 its network request needs CHANGE_NETWORK_STATE;
+implemented, and INTERNET capability does not prove validated connectivity. It refuses API levels below 26; on API 28–30 its network request needs CHANGE_NETWORK_STATE;
 the included permission overlay is not merged into the app. Kotlin compilation
 against Android 35 and pure observation-policy checks passed, but registration,
 permission behavior, network switching and VPN interaction are not device-tested.

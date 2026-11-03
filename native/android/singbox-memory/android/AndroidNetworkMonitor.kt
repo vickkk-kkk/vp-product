@@ -21,7 +21,7 @@ class AndroidNetworkMonitor(context: Context, private val observer: (SelectedNet
     private val manager = context.applicationContext.getSystemService(ConnectivityManager::class.java)
     private val handler = Handler(Looper.getMainLooper())
     private val lock = Any()
-    private enum class Phase { NEW, ACTIVE, CLOSED, UNCERTAIN }
+    private enum class Phase { NEW, ACTIVE, CLOSING, CLOSED, UNCERTAIN }
     private var phase = Phase.NEW
     private var selected: Network? = null
     private var generation = 0L
@@ -74,6 +74,7 @@ class AndroidNetworkMonitor(context: Context, private val observer: (SelectedNet
     /** API 28–30 requires CHANGE_NETWORK_STATE. Registration failure is final. */
     fun start(): Boolean = synchronized(lock) {
         if (phase != Phase.NEW) return false
+        if (Build.VERSION.SDK_INT < 26) { phase = Phase.UNCERTAIN; failLocked(); return false }
         phase = Phase.ACTIVE
         try {
             when {
@@ -81,7 +82,7 @@ class AndroidNetworkMonitor(context: Context, private val observer: (SelectedNet
                 Build.VERSION.SDK_INT >= 28 -> manager.requestNetwork(request, callback, handler)
                 else -> manager.registerDefaultNetworkCallback(callback, handler)
             }
-            healthy
+            phase == Phase.ACTIVE && healthy
         } catch (_: Exception) {
             selected = null; emitLocked(null)
             try { manager.unregisterNetworkCallback(callback) } catch (_: Exception) { }
@@ -96,8 +97,9 @@ class AndroidNetworkMonitor(context: Context, private val observer: (SelectedNet
         when (phase) {
             Phase.NEW -> { phase = Phase.CLOSED; true }
             Phase.CLOSED -> true
-            Phase.UNCERTAIN -> false
+            Phase.UNCERTAIN, Phase.CLOSING -> false
             Phase.ACTIVE -> {
+                phase = Phase.CLOSING
                 selected = null
                 emitLocked(null)
                 val notified = healthy

@@ -44,5 +44,14 @@ fun main() {
     check(closeReturned.await(5, TimeUnit.SECONDS))
     protectThread.join(5000); closeThread.join(5000)
     check(!protectThread.isAlive && !closeThread.isAlive && concurrentFd.closes == 1)
+    lateinit var reentrant: TunLease
+    reentrant = TunLease(FakeTun(), SocketProtector {
+        check(reentrant.closeAfterConfirmedStop { true }); true
+    }, {})
+    check(!reentrant.protect(3) && reentrant.state() == TunLease.State.CLOSED)
+    val confirmLease = TunLease(FakeTun(), SocketProtector { true }, {})
+    check(confirmLease.closeAfterConfirmedStop {
+        check(!confirmLease.closeAfterConfirmedStop { true }); true
+    })
     println("SINGBOX_TUN_LEASE_CHECKS_PASS")
 }
