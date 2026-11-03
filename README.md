@@ -4,11 +4,15 @@
 
 **当前阶段：工程整合中，尚无可直接安装的正式发行版。** 本源码版本包含真实客户端 submodule、服务端 Rust 基线、管理 Web 与安装工具。这是按精确提交组织的源码检查点，不是可直接安装的二进制发行版；源码已归集，不等于整套产品已完成构建或运行验收。既有原型与测试结果不会自动视为新产品验收结果。
 
-主仓：[vickkk-kkk/vp-product](https://github.com/vickkk-kkk/vp-product)（私有） · 客户端 fork：[vickkk-kkk/vpn-parser](https://github.com/vickkk-kkk/vpn-parser)（公开）。源码、发布与验证是不同状态，详见 [当前快照](docs/source-snapshot.md)。
+主仓：[vickkk-kkk/vp-product](https://github.com/vickkk-kkk/vp-product)（公开） · 客户端 fork：[vickkk-kkk/vpn-parser](https://github.com/vickkk-kkk/vpn-parser)（公开）。源码、发布与验证是不同状态，详见 [当前快照](docs/source-snapshot.md)。
 
 [项目结构](docs/architecture.md) · [开发指南](docs/development.md) · [支持状态](docs/support.md) · [版本与发布](docs/releases.md) · [安全约定](SECURITY.md)
 
-## 本分支：服务端实验候选
+## 本分支：客户端与服务端集成开发检查点
+
+客户端 submodule 指向开发中的精确提交；它和服务端候选均不是正式发布或验收通过的成品。
+
+## 服务端实验候选
 
 本分支包含一个前台运行的 VP-Core 服务端实验入口，目标是让测试者下载预编译包后直接验收。实验预发布版仅供测试，**尚未在 VPS 完成验证**。
 
@@ -42,7 +46,7 @@ flowchart TB
 
 | 入口 | 负责什么 | 本轮落地状态 |
 | --- | --- | --- |
-| `client/` | 客户端 fork；桌面界面、共享业务层及未来移动端适配 | 已绑定定制源码检查点 `09f1bbbe…`；共享层、parser、六套编译器与移动端配置预览已纳入；非原生运行验收 |
+| `client/` | 客户端 fork；桌面界面、共享业务层及未来移动端适配 | 已绑定开发检查点 `05a044c…`；含 Android 构建锁及 macOS 诊断、打包修订；Android VPN 和完整多内核运行尚未完成验证 |
 | `crates/`、`contracts/` | 服务端 Rust workspace 与共享管理契约 | 已纳入源码；新目录完整构建与运行验收待完成 |
 | `flutter/apps/vp_admin/` | Web 管理端，保留所需 `flutter/packages/` | 已纳入源码及所需五个共享包；不含旧 Flutter 客户端 |
 | `tools/install/` | 安装、打包、升级与运维工具 | 已纳入源码；无正式线上安装发行版 |
