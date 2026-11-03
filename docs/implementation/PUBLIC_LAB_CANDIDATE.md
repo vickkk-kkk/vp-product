@@ -1,6 +1,6 @@
 # VP public lab candidate
 
-**Status: development candidate, not a GitHub Release and not VPS-validated.**
+**Status: experimental pre-release candidate; not VPS-validated or production-ready.**
 The foreground lab entry point is intended to make a bounded first-install test
 possible without Git or a Rust toolchain. It does not yet provide automatic
 restart, upgrades, a system service, or a general-purpose VPN. Do not describe a
@@ -84,8 +84,8 @@ The actual archive, executable hashes, compatibility floor, third-party notices,
 VP-Core license/copyright provenance, GitHub Release permissions, and source
 identity must be verified. The fixed VP-Core source declares MIT, but the exact
 source snapshot did not contain a complete LICENSE file; do not invent a
-copyright line. No version or download address is assigned until an actual
-reviewed GitHub Release exists.
+copyright line. Version and download address must be taken from the actual GitHub Release;
+never invent one before publication.
 
 The current target-specific dependency-tree candidate has 287 package
 identities, including 262 registry identities and 25 local identities. This is

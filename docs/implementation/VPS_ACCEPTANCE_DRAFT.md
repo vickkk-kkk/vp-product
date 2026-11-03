@@ -1,9 +1,8 @@
 # VPS acceptance instructions: draft only
 
-This document is not an acceptance-ready prompt. There is no published release
-version, download URL, or validated artifact checksum yet. Fill these only from
-a real, reviewed GitHub Release. Do not turn the local development archive into
-a release by assigning it a version string.
+This document is a drafting aid, not a completed acceptance prompt. Obtain the
+actual release version, URL and checksum from the published GitHub Release. Do
+not invent them or treat a local development archive as a published release.
 
 ## Acceptance scope
 

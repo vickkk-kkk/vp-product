@@ -7,7 +7,7 @@ class PublicLabArchiveTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix='vp-archive-test-')
         self.root = pathlib.Path(self.temp.name)
         with tarfile.open(os.environ['VP_PUBLIC_LAB_CANDIDATE'], 'r:gz') as archive:
-            expected={'README.zh-CN.md','LICENSE_STATUS.zh-CN.md','license-candidate-evidence.tar.gz','vp-lab','vp-public-lab','vp-core-server-worker-v2','vp-public-lab-client','manifest.json','NOT_FOR_DISTRIBUTION.txt'}
+            expected={'README.zh-CN.md','LICENSE_STATUS.zh-CN.md','license-candidate-evidence.tar.gz','vp-lab','vp-public-lab','vp-core-server-worker-v2','vp-public-lab-client','manifest.json',('EXPERIMENTAL_NOTICE.txt' if os.environ.get('VP_PUBLIC_LAB_PRERELEASE')=='1' else 'NOT_FOR_DISTRIBUTION.txt')}
             self.assertEqual(set(archive.getnames()), expected)
             self.assertTrue(all(m.isfile() for m in archive.getmembers()))
             archive.extractall(self.root, filter='data')
@@ -17,6 +17,8 @@ class PublicLabArchiveTest(unittest.TestCase):
         return subprocess.run([str(self.launcher), *args], capture_output=True, text=True, timeout=30)
     def test_license_evidence_hash_matches_manifest(self):
         manifest=json.loads((self.root/'manifest.json').read_text())
+        expected_kind='PUBLIC_EXPERIMENTAL_PRERELEASE' if os.environ.get('VP_PUBLIC_LAB_PRERELEASE')=='1' else 'LOCAL_ONLY_NOT_A_RELEASE'
+        self.assertEqual(manifest['kind'],expected_kind)
         evidence=(self.root/'license-candidate-evidence.tar.gz').read_bytes()
         self.assertEqual(hashlib.sha256(evidence).hexdigest(),manifest['license_evidence_sha256'])
         self.assertTrue((self.root/'LICENSE_STATUS.zh-CN.md').is_file())
