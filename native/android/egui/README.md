@@ -48,6 +48,12 @@ constructor requires the caller to keep the Activity/AndroidApp alive for the
 entire bridge lifetime. A locked offline host compile and two input/pointer
 tests pass; no JVM round-trip or Android target build has been performed.
 The Gradle module and APK manifest merge have not yet been built.
+On a prepared macOS or x86_64 Linux host, `build-core-adapter.sh OUTPUT_DIRECTORY`
+requires `ANDROID_NDK_HOME` and `VP_CORE_UPSTREAM`, verifies the pinned core
+checkout and patch identity, then builds the arm64 mobile-ffi library in a
+temporary target directory and checks its ABI symbols. It preserves the output
+library, removes its temporary build directory, installs nothing, and supports
+`VP_CARGO_OFFLINE=1`. This build script has not run end-to-end.
 The egui runtime entry's AndroidHost implementation also passed a host-side
 typecheck and two tests with a stub AndroidApp; that does not test Android JNI.
 The rendering UI passed source parsing and an isolated connection-method
