@@ -450,6 +450,7 @@ impl ServerCompilerV2 {
                 (ServerProtocolV2::Shadowsocks { method: ShadowsocksCipher::Aes128Gcm }, ServerTransportV2::Tcp {}, ServerSecurityV2::None {})
                 | (ServerProtocolV2::Trojan {}, ServerTransportV2::Tcp {}, ServerSecurityV2::Tls { .. })
                 | (ServerProtocolV2::Vless {}, ServerTransportV2::WebSocket { .. }, ServerSecurityV2::Tls { .. })
+                | (ServerProtocolV2::Vmess {}, ServerTransportV2::WebSocket { .. }, ServerSecurityV2::Tls { .. })
             ) { return Err(error(CompileFailure::UnsupportedProtocol, field("protocol"))); }
             let capability = capability(protocol, &transport, &security);
             if listener

@@ -43,6 +43,7 @@ fn validate_request(listener: &ServerListenerV2, source: &ServerListener, target
     let protocol_matches = matches!((&listener.protocol, &source.protocol),
         (ServerProtocolV2::Trojan {}, ServerProtocol::Proxy { protocol: Protocol::Trojan {}, .. })
         | (ServerProtocolV2::Vless {}, ServerProtocol::Proxy { protocol: Protocol::Vless { flow: None }, .. })
+        | (ServerProtocolV2::Vmess {}, ServerProtocol::Proxy { protocol: Protocol::Vmess { cipher: vp_product_domain::VmessCipher::Auto, alter_id: 0 }, .. })
         | (ServerProtocolV2::Shadowsocks { method: ShadowsocksCipher::Aes128Gcm }, ServerProtocol::Proxy { protocol: Protocol::Shadowsocks { method: ShadowsocksCipher::Aes128Gcm }, .. }));
     let security_matches = match (&listener.security, &source.security) {
         (ServerSecurityV2::None {}, ServerSecurity::None {}) => true,
@@ -114,6 +115,15 @@ async fn open_proxy(listener: &ServerListenerV2, source: &ServerListener, target
             for b in uuid.bytes().filter(|b| *b != b'-') { let n = (b as char).to_digit(16).ok_or(Failure::InvalidConfig)? as u8; if let Some(h) = high.take() { id[j] = h << 4 | n; j += 1; } else { high = Some(n); } }
             let mut head = Zeroizing::new(vec![0]); head.extend_from_slice(&id); id.zeroize(); head.extend_from_slice(&[0,1]); head.extend_from_slice(&target.port().to_be_bytes()); head.push(1); head.extend_from_slice(&ip.octets());
             io.write_all(&head).await.map_err(|_| Failure::Io)?;
+        }
+        ServerProtocolV2::Vmess {} => {
+            let uuid = std::str::from_utf8(credential.expose()).map_err(|_| Failure::InvalidConfig)?.to_owned();
+            let mut cfg = vp_config::VmessCfg { server: listener.bind.address.to_string(), port: listener.bind.port, uuid, alter_id: 0, cipher: "auto".into(), tls: false, server_name: None, skip_cert_verify: false, client_fingerprint: None, network: None, alpn: None, ech_opts: None, ws_opts: None, grpc_opts: None, http_opts: None, udp: false };
+            let built = vp_protocol::vmess::VmessOutbound::new(&cfg); cfg.uuid.zeroize();
+            let outbound = built.map_err(|_| Failure::InvalidConfig)?;
+            let destination = vp_common::DstAddr::ip(target.ip(), target.port());
+            let session = Session::new_tcp("probe".into(), None, destination.clone());
+            io = outbound.connect_over(&session, &destination, io).await.map_err(|_| Failure::ProtocolViolation)?;
         }
         ServerProtocolV2::Shadowsocks { method: ShadowsocksCipher::Aes128Gcm } => {
             let mut password = std::str::from_utf8(credential.expose()).map_err(|_| Failure::InvalidConfig)?.to_owned();

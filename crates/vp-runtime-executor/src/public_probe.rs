@@ -55,7 +55,7 @@ impl OracleProbe {
             let mut random = [0u8;16]; getrandom::fill(&mut random).map_err(|_| ControlError::ExecutorUnavailable)?;
             let mut value = Vec::new();
             for (i, b) in random.iter().enumerate() {
-                if matches!(listener.protocol, ServerProtocolV2::Vless {}) && [4,6,8,10].contains(&i) { value.push(b'-'); }
+                if matches!(listener.protocol, ServerProtocolV2::Vless {} | ServerProtocolV2::Vmess {}) && [4,6,8,10].contains(&i) { value.push(b'-'); }
                 value.extend_from_slice(format!("{b:02x}").as_bytes());
             }
             random.zeroize();
@@ -169,7 +169,7 @@ impl VirtualProbe {
             let mut random = [0u8;16]; getrandom::fill(&mut random).map_err(|_| ControlError::ExecutorUnavailable)?;
             let mut value = Vec::new();
             for (i, b) in random.iter().enumerate() {
-                if matches!(listener.protocol, ServerProtocolV2::Vless {}) && [4,6,8,10].contains(&i) { value.push(b'-'); }
+                if matches!(listener.protocol, ServerProtocolV2::Vless {} | ServerProtocolV2::Vmess {}) && [4,6,8,10].contains(&i) { value.push(b'-'); }
                 value.extend_from_slice(format!("{b:02x}").as_bytes());
             }
             random.zeroize();
@@ -306,9 +306,9 @@ mod tests {
     }
     fn materials(mode: u8, cert: &rcgen::CertifiedKey) -> ServerInputsV2 {
         let mut inputs = ServerInputsV2::default();
-        let secret = match mode { 0 => b"synthetic-test-password".to_vec(), 1 => b"12345678-1234-1234-1234-123456789abc".to_vec(), _ => b"synthetic-ss-password".to_vec() };
+        let secret = match mode { 0 => b"synthetic-test-password".to_vec(), 1 | 3 => b"12345678-1234-1234-1234-123456789abc".to_vec(), _ => b"synthetic-ss-password".to_vec() };
         inputs.credentials.insert(SecretRef::new("probe-credential").unwrap(), SecretBytes::new(secret));
-        if mode < 2 {
+        if mode != 2 {
             inputs.certificate_chains.insert(CertificateId::new("probe-certificate").unwrap(), SecretBytes::new(pem("CERTIFICATE", cert.cert.der())));
             inputs.private_keys.insert(SecretRef::new("probe-key").unwrap(), SecretBytes::new(pem("PRIVATE KEY", &cert.key_pair.serialize_der())));
         }
@@ -387,7 +387,7 @@ mod tests {
             runtime.block_on(async move {
                 let listener = tokio::net::TcpListener::from_std(listener).unwrap();
                 let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
-                for _ in 0..12 {
+                for _ in 0..16 {
                     let (tcp, _) = tokio::time::timeout(Duration::from_secs(15), listener.accept()).await.unwrap().unwrap();
                     if let Ok(Ok(mut tls)) = tokio::time::timeout(Duration::from_secs(5), acceptor.accept(tcp)).await {
                         let mut request = Vec::new();
@@ -409,11 +409,11 @@ mod tests {
         let worker = VerifiedWorker::for_server_v2(&path, &hash, Instant::now()+Duration::from_secs(10), &Cancellation::default()).unwrap();
         let release = vp_product_core_adapter::inspect_build().unwrap().build.release;
         let compiler = ServerCompilerV2::for_loopback_server_extensions(release.clone()).unwrap();
-        for mode in 0..3u8 {
+        for mode in 0..4u8 {
             let bind = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); let port = bind.local_addr().unwrap().port(); drop(bind);
-            let protocol = match mode { 0 => serde_json::json!({"kind":"trojan"}), 1 => serde_json::json!({"kind":"vless","flow":null}), _ => serde_json::json!({"kind":"shadowsocks","method":"aes-128-gcm"}) };
-            let transport = if mode == 1 { serde_json::json!({"kind":"ws","path":"/probe","host":null,"earlyData":null}) } else { serde_json::json!({"kind":"tcp"}) };
-            let security = if mode < 2 { serde_json::json!({"kind":"tls","certificateRef":"probe-certificate","privateKeyRef":"secret:probe-key","alpn":[]}) } else { serde_json::json!({"kind":"none"}) };
+            let protocol = match mode { 0 => serde_json::json!({"kind":"trojan"}), 1 => serde_json::json!({"kind":"vless","flow":null}), 3 => serde_json::json!({"kind":"vmess","cipher":"auto","alterId":0}), _ => serde_json::json!({"kind":"shadowsocks","method":"aes-128-gcm"}) };
+            let transport = if mode == 1 || mode == 3 { serde_json::json!({"kind":"ws","path":"/probe","host":null,"earlyData":null}) } else { serde_json::json!({"kind":"tcp"}) };
+            let security = if mode != 2 { serde_json::json!({"kind":"tls","certificateRef":"probe-certificate","privateKeyRef":"secret:probe-key","alpn":[]}) } else { serde_json::json!({"kind":"none"}) };
             let source: ProductConfig = serde_json::from_value(serde_json::json!({"schemaVersion":1,"minimumReaderVersion":1,"nodes":[],"subscriptions":[],"listeners":[{"schemaVersion":1,"id":"probe-listener","name":"probe","enabled":true,"bind":{"address":"127.0.0.1","port":port},"protocol":{"kind":"proxy","protocol":protocol,"users":[{"id":"probe-user","credentialRef":"secret:probe-credential","enabled":true}]},"transport":transport,"security":security,"requirements":[]}]})).unwrap();
             let recipe = compiler.compile(&source, &release).unwrap();
             let inbound_cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -447,11 +447,11 @@ mod tests {
         let worker = VerifiedWorker::for_server_v2(&path, &hash, Instant::now()+Duration::from_secs(10), &Cancellation::default()).unwrap();
         let release = vp_product_core_adapter::inspect_build().unwrap().build.release;
         let compiler = ServerCompilerV2::for_loopback_server_extensions(release.clone()).unwrap();
-        for mode in 0..3u8 {
+        for mode in 0..4u8 {
             let bind = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); let port = bind.local_addr().unwrap().port(); drop(bind);
-            let protocol = match mode { 0 => serde_json::json!({"kind":"trojan"}), 1 => serde_json::json!({"kind":"vless","flow":null}), _ => serde_json::json!({"kind":"shadowsocks","method":"aes-128-gcm"}) };
-            let transport = if mode == 1 { serde_json::json!({"kind":"ws","path":"/probe","host":null,"earlyData":null}) } else { serde_json::json!({"kind":"tcp"}) };
-            let security = if mode < 2 { serde_json::json!({"kind":"tls","certificateRef":"probe-certificate","privateKeyRef":"secret:probe-key","alpn":[]}) } else { serde_json::json!({"kind":"none"}) };
+            let protocol = match mode { 0 => serde_json::json!({"kind":"trojan"}), 1 => serde_json::json!({"kind":"vless","flow":null}), 3 => serde_json::json!({"kind":"vmess","cipher":"auto","alterId":0}), _ => serde_json::json!({"kind":"shadowsocks","method":"aes-128-gcm"}) };
+            let transport = if mode == 1 || mode == 3 { serde_json::json!({"kind":"ws","path":"/probe","host":null,"earlyData":null}) } else { serde_json::json!({"kind":"tcp"}) };
+            let security = if mode != 2 { serde_json::json!({"kind":"tls","certificateRef":"probe-certificate","privateKeyRef":"secret:probe-key","alpn":[]}) } else { serde_json::json!({"kind":"none"}) };
             let source: ProductConfig = serde_json::from_value(serde_json::json!({"schemaVersion":1,"minimumReaderVersion":1,"nodes":[],"subscriptions":[],"listeners":[{"schemaVersion":1,"id":"probe-listener","name":"probe","enabled":true,"bind":{"address":"127.0.0.1","port":port},"protocol":{"kind":"proxy","protocol":protocol,"users":[{"id":"probe-user","credentialRef":"secret:probe-credential","enabled":true}]},"transport":transport,"security":security,"requirements":[]}]})).unwrap();
             let recipe = compiler.compile(&source, &release).unwrap();
             let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -466,7 +466,7 @@ mod tests {
             let auth = vp_product_control::AuthenticationProbe { listener_id: id.clone(), user_id: "probe-user".into(), credential_ref_digest: ContentDigest::of("vp.credential-reference.v1", &SecretRef::new("probe-credential").unwrap()).unwrap() };
             assert_eq!(probe.check_with_runtime(&recipe, &input, &HealthCheck::AuthenticationAccepted(auth), 1, Instant::now()+Duration::from_secs(10), &mut runtime).unwrap(), CheckOutcome::Passed, "mode {mode} valid");
             assert_eq!(probe.check_with_runtime(&recipe, &input, &HealthCheck::InvalidAuthenticationRejected(id.clone()), 1, Instant::now()+Duration::from_secs(10), &mut runtime).unwrap(), CheckOutcome::Passed, "mode {mode} invalid");
-            if mode < 2 { assert_eq!(probe.check_with_runtime(&recipe, &input, &HealthCheck::SecurityIdentity(id), 1, Instant::now()+Duration::from_secs(10), &mut runtime).unwrap(), CheckOutcome::Passed, "mode {mode} TLS"); }
+            if mode != 2 { assert_eq!(probe.check_with_runtime(&recipe, &input, &HealthCheck::SecurityIdentity(id), 1, Instant::now()+Duration::from_secs(10), &mut runtime).unwrap(), CheckOutcome::Passed, "mode {mode} TLS"); }
             let snapshot = runtime.snapshot(1).unwrap(); assert!(!snapshot.probe_ledger.unwrap().saturated);
             runtime.stop_active(prepared.generation, Duration::ZERO).unwrap();
         }

@@ -512,7 +512,7 @@ fn public_experiment_is_explicit_bounded_and_rejects_unsafe_plans() {
     assert!(ServerCompilerV2::for_public_experiment(release(), vec!["127.0.0.1:443".parse().unwrap()]).is_err());
     assert!(ServerCompilerV2::for_public_experiment(release(), vec![target, target]).is_err());
     let compiler = ServerCompilerV2::for_public_experiment(release(), vec![target]).unwrap();
-    for key in [CapabilityKey::TrojanTls, CapabilityKey::VlessWsTls] {
+    for key in [CapabilityKey::TrojanTls, CapabilityKey::VlessWsTls, CapabilityKey::VmessWsTls] {
         let mut c = config(key);
         assert!(compiler.compile(&c, &release()).is_err(), "public profile requires a specific non-loopback bind");
         c.listeners[0].bind.address = "192.168.1.5".parse().unwrap();
