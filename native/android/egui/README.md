@@ -47,7 +47,9 @@ class using the current Activity's class loader, borrows (never owns) the
 Activity's JNI global reference, and bounds request sizes before JNI. Its unsafe
 constructor requires the caller to keep the Activity/AndroidApp alive for the
 entire bridge lifetime. A locked offline host compile and two input/pointer
-tests pass; no JVM round-trip or Android target build has been performed.
+tests pass. A host JVM round-trip with synthetic Java counterparts exercised
+the class loader and all bridge method signatures; Android JNI and target
+builds remain unverified.
 The Gradle module and APK manifest merge have not yet been built.
 On a prepared macOS or x86_64 Linux host, `build-core-adapter.sh OUTPUT_DIRECTORY`
 requires `ANDROID_NDK_HOME` and `VP_CORE_UPSTREAM`, verifies the pinned core
