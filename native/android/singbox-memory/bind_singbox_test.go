@@ -21,7 +21,8 @@ func TestBindRequiresAbsentAndUniqueServer(t *testing.T) {
 	if _, err := Bind(server, func() bool { return true }, validate); err != nil {
 		t.Fatal("first claim rejected")
 	}
-	if _, err := Bind(server, func() bool { return true }, validate); err != ErrBusy {
+	alias := &libbox.CommandServer{StartedService: server.StartedService}
+	if _, err := Bind(alias, func() bool { return true }, validate); err != ErrBusy {
 		t.Fatal("duplicate claim accepted")
 	}
 }

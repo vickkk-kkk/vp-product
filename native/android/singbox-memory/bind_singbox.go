@@ -25,27 +25,16 @@ func Bind(server *libbox.CommandServer, confirmClosed func() bool, validate func
 	if server == nil || server.StartedService == nil || confirmClosed == nil || validate == nil {
 		return nil, ErrInvalid
 	}
-	if !invokeConfirm(confirmClosed) {
-		return nil, ErrStop
-	}
-	if _, loaded := claimedServers.LoadOrStore(server, struct{}{}); loaded {
+	key := server.StartedService
+	if _, loaded := claimedServers.LoadOrStore(key, struct{}{}); loaded {
 		return nil, ErrBusy
 	}
 	session, err := NewVerified(func(ctx context.Context, config string) error {
-		return server.StartedService.StartOrReloadService(ctx, config, nil)
-	}, server.CloseService, confirmClosed, validate)
+		return key.StartOrReloadService(ctx, config, nil)
+	}, key.CloseService, confirmClosed, validate)
 	if err != nil {
-		claimedServers.Delete(server)
+		claimedServers.Delete(key)
 		return nil, err
 	}
 	return session, nil
-}
-
-func invokeConfirm(f func() bool) (confirmed bool) {
-	defer func() {
-		if recover() != nil {
-			confirmed = false
-		}
-	}()
-	return f()
 }

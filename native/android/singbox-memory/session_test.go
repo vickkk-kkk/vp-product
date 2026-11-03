@@ -4,11 +4,32 @@ package memory
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func newTestSession(start func(context.Context, string) error, stop func() error) (*Session, error) {
 	return NewVerified(start, stop, func() bool { return true }, func(string) error { return nil })
+}
+
+func waitSignal(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for signal")
+	}
+}
+func waitResult(t *testing.T, ch <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-ch:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for result")
+		return nil
+	}
 }
 
 func TestStartStopAndRejectSecondStart(t *testing.T) {
@@ -81,22 +102,23 @@ func TestConcurrentStopDoesNotBlockDuringStart(t *testing.T) {
 	s, _ := newTestSession(func(context.Context, string) error { close(entered); <-release; return nil }, func() error { return nil })
 	done := make(chan error, 1)
 	go func() { done <- s.Start(context.Background(), []byte(`{}`)) }()
-	<-entered
+	waitSignal(t, entered)
 	if s.State() != Starting || s.Stop() != ErrStopPending {
 		t.Fatal("start concurrency")
 	}
 	close(release)
-	if <-done != ErrCancelled || s.State() != Idle || s.Stop() != nil {
+	if waitResult(t, done) != ErrCancelled || s.State() != Idle || s.Stop() != nil {
 		t.Fatal("completion")
 	}
 }
 
 func TestStopCallAloneIsNotTeardownEvidence(t *testing.T) {
-	closed := false
+	closed := true
 	s, err := NewVerified(func(context.Context, string) error { return nil }, func() error { return nil }, func() bool { return closed }, func(string) error { return nil })
 	if err != nil || s.Start(context.Background(), []byte(`{}`)) != nil {
 		t.Fatal("start")
 	}
+	closed = false
 	if s.Stop() != ErrStop || s.State() != StopUncertain {
 		t.Fatal("unconfirmed stop accepted")
 	}
@@ -133,10 +155,10 @@ func TestValidatedCopyIsExactlyWhatBackendReceives(t *testing.T) {
 	config := []byte(`{"value":"a"}`)
 	done := make(chan error, 1)
 	go func() { done <- s.Start(context.Background(), config) }()
-	<-entered // the private copy has already been made
+	waitSignal(t, entered) // the private copy has already been made
 	config[len(config)-3] = 'b'
 	close(release)
-	if <-done != nil || got != `{"value":"a"}` {
+	if waitResult(t, done) != nil || got != `{"value":"a"}` {
 		t.Fatal("validated and executed configs differ")
 	}
 }
@@ -148,11 +170,30 @@ func TestStopPanicAndConfirmationPanicFailClosed(t *testing.T) {
 		func() error { panic("synthetic-secret") },
 		func() error { return nil },
 	} {
-		confirm := func() bool { panic("synthetic-secret") }
+		first := true
+		confirm := func() bool {
+			if first {
+				first = false
+				return true
+			}
+			panic("synthetic-secret")
+		}
 		s, _ := NewVerified(start, stop, confirm, validate)
 		if s.Start(context.Background(), []byte(`{}`)) != nil || s.Stop() != ErrStop || s.State() != StopUncertain {
 			t.Fatal("panic did not fail closed")
 		}
+	}
+}
+
+func TestInitialAbsenceMustBeConfirmed(t *testing.T) {
+	start := func(context.Context, string) error { return nil }
+	stop := func() error { return nil }
+	validate := func(string) error { return nil }
+	if _, err := NewVerified(start, stop, func() bool { return false }, validate); err != ErrStop {
+		t.Fatal("unconfirmed initial state accepted")
+	}
+	if _, err := NewVerified(start, stop, func() bool { panic("synthetic-secret") }, validate); err != ErrStop {
+		t.Fatal("initial verifier panic accepted")
 	}
 }
 
@@ -164,12 +205,108 @@ func TestConcurrentStopsDoNotRunTwice(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() { done <- s.Stop() }()
-	<-entered
+	waitSignal(t, entered)
 	if s.Stop() != ErrBusy || s.Start(context.Background(), []byte(`{}`)) != ErrBusy {
 		t.Fatal("overlap allowed")
 	}
 	close(release)
-	if <-done != nil || s.State() != Idle {
+	if waitResult(t, done) != nil || s.State() != Idle {
 		t.Fatal("stop")
+	}
+}
+
+func TestStopDuringValidationPreventsStart(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	starts := 0
+	s, _ := NewVerified(func(context.Context, string) error { starts++; return nil }, func() error { return nil }, func() bool { return true }, func(string) error { close(entered); <-release; return nil })
+	done := make(chan error, 1)
+	go func() { done <- s.Start(context.Background(), []byte(`{}`)) }()
+	waitSignal(t, entered)
+	if s.State() != Preparing || s.Stop() != ErrStopPending {
+		t.Fatal("validation cancellation")
+	}
+	close(release)
+	if waitResult(t, done) != ErrCancelled || starts != 0 || s.State() != Idle {
+		t.Fatal("cancelled validation started backend")
+	}
+}
+
+func TestEarlyInterruptCannotReportIdleBeforeStartReturns(t *testing.T) {
+	entered, release, interrupted := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	s, _ := newTestSession(func(context.Context, string) error { close(entered); <-release; return nil }, func() error {
+		if calls.Add(1) == 1 {
+			close(interrupted)
+		}
+		return nil
+	})
+	done := make(chan error, 1)
+	go func() { done <- s.Start(context.Background(), []byte(`{}`)) }()
+	waitSignal(t, entered)
+	if s.Stop() != ErrStopPending {
+		t.Fatal("stop was not requested")
+	}
+	waitSignal(t, interrupted)
+	if s.State() != Starting {
+		t.Fatal("reported stopped while start still running")
+	}
+	close(release)
+	if waitResult(t, done) != ErrCancelled || calls.Load() < 2 || s.State() != Idle {
+		t.Fatal("final stop not verified")
+	}
+}
+
+func TestInterruptRetriesWhenFirstRunsBeforeBackendStart(t *testing.T) {
+	entered, allowRealStart, firstInterrupt, secondInterrupt := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	s, _ := newTestSession(func(context.Context, string) error {
+		close(entered)
+		<-allowRealStart
+		<-secondInterrupt
+		return nil
+	}, func() error {
+		switch calls.Add(1) {
+		case 1:
+			close(firstInterrupt)
+		case 2:
+			close(secondInterrupt)
+		}
+		return nil
+	})
+	done := make(chan error, 1)
+	go func() { done <- s.Start(context.Background(), []byte(`{}`)) }()
+	waitSignal(t, entered)
+	if s.Stop() != ErrStopPending {
+		t.Fatal("stop request")
+	}
+	waitSignal(t, firstInterrupt)
+	close(allowRealStart)
+	select {
+	case <-secondInterrupt:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no retry")
+	}
+	select {
+	case result := <-done:
+		if result != ErrCancelled || s.State() != Idle {
+			t.Fatal("cleanup")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("start stuck")
+	}
+}
+
+func TestFailedCleanupAfterInterruptedStartBlocksRestart(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	s, _ := newTestSession(func(context.Context, string) error { close(entered); <-release; return nil }, func() error { return errors.New("synthetic-secret") })
+	done := make(chan error, 1)
+	go func() { done <- s.Start(context.Background(), []byte(`{}`)) }()
+	waitSignal(t, entered)
+	if s.Stop() != ErrStopPending {
+		t.Fatal("stop request")
+	}
+	close(release)
+	if waitResult(t, done) != ErrStop || s.State() != StopUncertain || s.Start(context.Background(), []byte(`{}`)) != ErrBusy {
+		t.Fatal("unsafe restart allowed")
 	}
 }

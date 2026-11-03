@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sync"
+	"time"
 	"unicode/utf8"
 )
 
@@ -24,6 +25,7 @@ type State uint8
 
 const (
 	Idle State = iota
+	Preparing
 	Starting
 	StartedUnverified
 	Stopping
@@ -41,6 +43,7 @@ type Session struct {
 	validate        func(string) error
 	cancelRequested bool
 	interruptDone   chan struct{}
+	startDone       chan struct{}
 	cancelStart     context.CancelFunc
 }
 
@@ -57,6 +60,9 @@ func NewVerified(start func(context.Context, string) error, stop func() error, c
 	if stop == nil || confirmClosed == nil || validate == nil {
 		return nil, ErrInvalid
 	}
+	if !invokeConfirm(confirmClosed) {
+		return nil, ErrStop
+	}
 	return newSession(start, func() error {
 		if err := stop(); err != nil {
 			return err
@@ -66,6 +72,15 @@ func NewVerified(start func(context.Context, string) error, stop func() error, c
 		}
 		return nil
 	}, validate)
+}
+
+func invokeConfirm(f func() bool) (confirmed bool) {
+	defer func() {
+		if recover() != nil {
+			confirmed = false
+		}
+	}()
+	return f()
 }
 func (s *Session) State() State { s.mu.Lock(); defer s.mu.Unlock(); return s.state }
 
@@ -77,17 +92,6 @@ func (s *Session) Start(ctx context.Context, config []byte) (err error) {
 	if ctx == nil || len(config) == 0 || len(config) > 1_048_576 {
 		return ErrInvalid
 	}
-	// Validate and start from the same private copy, never from a mutable caller
-	// buffer after validation. Best-effort clear; upstream Go strings can remain.
-	snapshot := append([]byte(nil), config...)
-	defer clear(snapshot)
-	if !utf8.Valid(snapshot) || !json.Valid(snapshot) {
-		return ErrInvalid
-	}
-	content := string(snapshot)
-	if invokeValidate(s.validate, content) {
-		return ErrInvalid
-	}
 	if ctx.Err() != nil {
 		return ErrCancelled
 	}
@@ -96,17 +100,35 @@ func (s *Session) Start(ctx context.Context, config []byte) (err error) {
 		s.mu.Unlock()
 		return ErrBusy
 	}
-	if ctx.Err() != nil {
+	s.state = Preparing
+	s.cancelRequested = false
+	s.mu.Unlock()
+	// Validate and start from the same private copy, never from a mutable caller
+	// buffer after validation. Best-effort clear; upstream Go strings can remain.
+	snapshot := append([]byte(nil), config...)
+	defer clear(snapshot)
+	content := string(snapshot)
+	invalid := !utf8.Valid(snapshot) || !json.Valid(snapshot) || invokeValidate(s.validate, content)
+	s.mu.Lock()
+	if s.cancelRequested || ctx.Err() != nil {
+		s.state = Idle
 		s.mu.Unlock()
 		return ErrCancelled
 	}
+	if invalid {
+		s.state = Idle
+		s.mu.Unlock()
+		return ErrInvalid
+	}
 	s.state = Starting
-	s.cancelRequested = false
 	s.interruptDone = nil
+	startDone := make(chan struct{})
+	s.startDone = startDone
 	runCtx, cancel := context.WithCancel(ctx)
 	s.cancelStart = cancel
 	s.mu.Unlock()
 	failed := invokeStart(s.start, runCtx, content)
+	close(startDone)
 	s.mu.Lock()
 	if s.cancelRequested {
 		s.cancelStart = nil
@@ -155,6 +177,11 @@ func (s *Session) Stop() (err error) {
 		s.mu.Unlock()
 		return nil
 	}
+	if s.state == Preparing {
+		s.cancelRequested = true
+		s.mu.Unlock()
+		return ErrStopPending
+	}
 	if s.state == Starting {
 		if !s.cancelRequested {
 			s.cancelRequested = true
@@ -163,9 +190,22 @@ func (s *Session) Stop() (err error) {
 			}
 			done := make(chan struct{})
 			s.interruptDone = done
+			startDone := s.startDone
 			// Upstream CloseService first requests start interruption. Its
 			// result is not treated as teardown proof; final cleanup follows.
-			go func() { invokeStop(s.stop); close(done) }()
+			// Retry if the first interrupt ran before the backend actually
+			// entered start. No new session may start while this worker runs.
+			go func() {
+				defer close(done)
+				for {
+					invokeStop(s.stop)
+					select {
+					case <-startDone:
+						return
+					case <-time.After(time.Second):
+					}
+				}
+			}()
 		}
 		s.mu.Unlock()
 		return ErrStopPending

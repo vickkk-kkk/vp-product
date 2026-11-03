@@ -20,13 +20,18 @@ revocation, and independently confirms teardown. Upstream `CloseService`
 discards an instance-close error, so `Bind` requires a separate `confirmClosed`
 callback. An unconfirmed stop blocks another start. The Android UI does not bind
 this experiment and still reports sing-box unavailable.
+The confirmation callback must be side-effect-free and must return true only
+with fresh, exact evidence that the owned engine and TUN are absent.
 
 Binding requires an initially confirmed stopped engine/TUN, a config validator,
-and exclusive ownership of the server. The package refuses a second binding of
-the same server for the process lifetime; it cannot stop code outside this
+and exclusive ownership of the started-service instance. The package refuses a
+second binding of that instance for the process lifetime; it cannot stop code outside this
 package from using a retained server pointer. Stopping during startup requests
 context cancellation and upstream interruption, then waits for startup and the
-interrupt attempt before another stop and independent confirmation. Neither Go
+interrupt worker before another stop and independent confirmation. If the first
+interrupt returns before the backend actually starts, the worker retries while
+startup remains pending. An individual upstream stop can itself block on its
+lifecycle lock, preventing further retries. Neither Go
 context cancellation nor upstream interruption guarantees a hung start returns.
 Because upstream discards its instance reference and ignores close errors, a
 later stop might not recover leaked resources; an unconfirmed state requires
@@ -38,10 +43,13 @@ storage and insecure TLS, and must not retain or log the supplied configuration.
 The same immutable string that passed validation is sent to the starter. The
 caller must not mutate its byte buffer while `Start` is making its private copy.
 Neither a production validator nor Android platform implementation exists yet.
+Cancellation while validation is running prevents the backend from starting,
+but cannot interrupt a stuck validator; the host must supply a bounded one.
 
 `go test` without tags tests only the local lifecycle with synthetic callbacks;
-it does not compile sing-box or prove upstream behavior. Source was formatted
-and parsed with Go 1.26.10. Tests were attempted but stopped at the temporary
+it does not compile sing-box or prove upstream behavior. Both the lifecycle and
+tagged binding sources were typechecked with small local API stubs, not actual
+dependencies, and formatted with Go 1.26.10. Tests were attempted but stopped at the temporary
 disk-space safety floor; they have not passed here. Tagged compilation, actual
 JNI/Android integration, traffic, DNS and leak tests remain outstanding.
 
