@@ -19,7 +19,7 @@ prov=json.loads((a.recovered/'provenance.json').read_text())
 a.output.mkdir(mode=0o700,parents=False,exist_ok=False); inventory=[]
 for pkg in sorted(packages,key=lambda x:(x['name'],x['version'])):
     name,version=pkg['name'],pkg['version']; source=pkg.get('source')
-    record={'name':name,'version':version,'source':source,'license_expression':pkg.get('license'),'files':[]}
+    record={'name':name,'version':version,'source':source,'license_expression':pkg.get('license'),'declared_license_file':pkg.get('license_file'),'files':[]}
     if source and source.startswith('registry+'):
         record['registry_checksum']=lookup.get((name,version))
         if not record['registry_checksum']: raise ValueError('missing Cargo.lock checksum')
