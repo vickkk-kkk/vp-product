@@ -55,8 +55,11 @@ but cannot interrupt a stuck validator; the host must supply a bounded one.
 The `android/` directory adds a TUN-descriptor lease and a `VpnService.protect`
 adapter. It keeps the original descriptor owned until an independent check says
 the exact engine and any in-flight start are gone; a close exception is marked
-uncertain and never blindly retried. Its callbacks must be bounded and run on a
-control executor, not the Android UI thread. These files do not create routes or
+uncertain and never blindly retried. Protection or descriptor failure is sticky
+and invokes a nonblocking fatal callback so the host can schedule shutdown. The
+host must serialize start, absence verification, and closure: returning a raw
+borrowed FD alone cannot prevent a concurrent start/close race. Its callbacks
+must be bounded and must not block the Android UI thread. These files do not create routes or
 implement libbox's full PlatformInterface and are not wired into an APK. Kotlin
 2.0.21 compilation against Android API 35 and JVM checks with fake descriptors,
 including a protect/close overlap, passed. They do not test real OS descriptors.
@@ -67,6 +70,20 @@ and proof that every outbound uses the hook are not implemented or tested.
 The host must validate the requested TUN addresses, routes and DNS and keep the
 borrowed descriptor alive; it must also stop the engine on any sticky platform
 failure. DNS-cache invalidation is not implemented and marks the guard failed.
+
+`AndroidNetworkMonitor` is an unintegrated Android source component that reports
+only a system-selected non-VPN interface. It refuses to guess another interface
+when the system reports none, discards stale callbacks after closure, and marks
+registration/observer errors unhealthy. It carries the Android Network object and
+a generation with each observation, and revokes the observation before unregister.
+Fatal errors call a nonblocking host callback, which must schedule engine shutdown;
+the callback and successful unregister do not prove shutdown. A host must require
+both a healthy monitor and a non-null current network before starting; the monitor
+itself does not start an engine. Socket binding to the selected Network is not
+implemented, and INTERNET capability does not prove validated connectivity. On API 28–30 its network request needs CHANGE_NETWORK_STATE;
+the included permission overlay is not merged into the app. Kotlin compilation
+against Android 35 and pure observation-policy checks passed, but registration,
+permission behavior, network switching and VPN interaction are not device-tested.
 
 `go test` without tags tests only the local lifecycle with synthetic callbacks;
 it does not compile sing-box or prove upstream behavior. Both the lifecycle and

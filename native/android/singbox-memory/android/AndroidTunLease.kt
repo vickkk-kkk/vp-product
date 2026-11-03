@@ -11,5 +11,5 @@ class AndroidTunDescriptor(private val tun: ParcelFileDescriptor) : TunDescripto
 }
 
 /** The Android system must have already granted consent and established TUN. */
-fun androidTunLease(service: VpnService, tun: ParcelFileDescriptor): TunLease =
-    TunLease(AndroidTunDescriptor(tun), SocketProtector { fd -> service.protect(fd) })
+fun androidTunLease(service: VpnService, tun: ParcelFileDescriptor, onFatal: () -> Unit): TunLease =
+    TunLease(AndroidTunDescriptor(tun), SocketProtector { fd -> service.protect(fd) }, onFatal)

@@ -13,19 +13,21 @@ private class FakeTun(var shouldFail: Boolean = false) : TunDescriptor {
 
 fun main() {
     val fd = FakeTun()
-    val lease = TunLease(fd, SocketProtector { it == 9 })
-    check(lease.borrowedFd() == 42 && lease.protect(9) && !lease.protect(8) && !lease.protect(-1))
+    var fatalities = 0
+    val lease = TunLease(fd, SocketProtector { it == 9 }, { fatalities++ })
+    check(lease.borrowedFd() == 42 && lease.protect(9) && !lease.protect(8) && !lease.protect(9))
+    check(!lease.isHealthy() && fatalities == 1)
     check(!lease.closeAfterConfirmedStop { false } && fd.closes == 0)
     check(lease.closeAfterConfirmedStop { true } && fd.closes == 1)
     check(lease.state() == TunLease.State.CLOSED && lease.borrowedFd() == null && !lease.protect(9))
     val failing = FakeTun(true)
-    val uncertain = TunLease(failing, SocketProtector { true })
+    val uncertain = TunLease(failing, SocketProtector { true }, {})
     check(!uncertain.closeAfterConfirmedStop { true } && failing.closes == 1)
     check(uncertain.state() == TunLease.State.CLOSE_UNCERTAIN)
     check(!uncertain.closeAfterConfirmedStop { true } && failing.closes == 1)
     check(!uncertain.reconcileClosed { false } && uncertain.reconcileClosed { true })
     check(uncertain.state() == TunLease.State.CLOSED && failing.closes == 1)
-    val throwing = TunLease(FakeTun(), SocketProtector { throw IllegalStateException() })
+    val throwing = TunLease(FakeTun(), SocketProtector { throw IllegalStateException() }, {})
     check(!throwing.protect(5) && !throwing.closeAfterConfirmedStop { throw IllegalStateException() })
     val entered = CountDownLatch(1)
     val release = CountDownLatch(1)
@@ -33,7 +35,7 @@ fun main() {
     val concurrentFd = FakeTun()
     val concurrent = TunLease(concurrentFd, SocketProtector {
         entered.countDown(); check(release.await(5, TimeUnit.SECONDS)); true
-    })
+    }, {})
     val protectThread = thread { check(concurrent.protect(7)) }
     check(entered.await(5, TimeUnit.SECONDS))
     val closeThread = thread { check(concurrent.closeAfterConfirmedStop { true }); closeReturned.countDown() }
