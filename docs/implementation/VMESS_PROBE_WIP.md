@@ -27,3 +27,16 @@ is available in the published `v0.1.0-lab.1` asset; that release remains limited
 to its original three protocol combinations. Before release, test the built
 package and actual VPS, review the failure and stop/recovery paths, verify
 external clients and publish only with clear limitations.
+
+## Committed journal finalization candidate
+
+The foreground lab now asks the attached runtime to finalize a strictly paired
+committed operation before exporting client material. This moves the journal
+from `candidate_started` to `idle` while retaining the historical owned-process
+record. The record is not a live-status claim; process absence must be observed
+separately. Uncommitted, mismatched, already-finalized or poisoned states are
+rejected. A failed or uncertain publication remains for inspection; no automatic
+retry or restart is performed. The guard has synthetic-state tests, but this
+change has **not** yet been validated in a successful VPS deployment. In
+particular, it does not claim to implement automatic restart or a durable
+shutdown receipt.

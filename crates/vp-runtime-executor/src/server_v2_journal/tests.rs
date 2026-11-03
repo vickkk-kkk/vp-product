@@ -1024,6 +1024,20 @@ fn committed_control_finalizes_lazily_without_rewriting_control_or_claiming_heal
         "runtime receipt cannot commit control"
     );
 }
+#[cfg(feature = "experimental-public")]
+#[test]
+fn foreground_finalization_guard_requires_exact_committed_pair() {
+    use vp_product_control::OperationState as C;
+    let (j, s) = paired_fixture(Phase::CandidateStarted, C::Committed);
+    assert!(crate::public_stage::require_committed_finalization(&j, &s).is_ok());
+    let idle = j.finalize(&s).unwrap();
+    assert!(crate::public_stage::require_committed_finalization(&idle, &s).is_err());
+    let (unfinished, state) = paired_fixture(Phase::CandidateStarted, C::Verifying);
+    assert!(crate::public_stage::require_committed_finalization(&unfinished, &state).is_err());
+    let mut wrong = s.clone();
+    wrong.operations.get_mut(&operation("new-operation")).unwrap().activation.as_mut().unwrap().generation += 1;
+    assert!(crate::public_stage::require_committed_finalization(&j, &wrong).is_err());
+}
 #[test]
 fn pairing_rejects_wrong_plan_actor_owner_revision_health_and_unrelated_inflight() {
     use vp_product_control::OperationState as C;

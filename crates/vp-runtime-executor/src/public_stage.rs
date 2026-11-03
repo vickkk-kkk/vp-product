@@ -25,6 +25,16 @@ pub(crate) fn finalize_before_next(
     journal.persist_finalization(binding, context.runtime_journal_writer())
 }
 
+/// Only a fully paired, terminal committed operation may be finalized here.
+/// An Idle journal, incomplete control state, or missing owner is not authority.
+pub(crate) fn require_committed_finalization(journal: &crate::server_v2_journal::Journal, state: &vp_product_control::StoredState) -> Result<(), ControlError> {
+    if journal.phase != Phase::CandidateStarted || journal.active.is_none()
+        || crate::server_v2_journal::pair_control(journal, state)? != crate::server_v2_journal::Pairing::Finalize {
+        return Err(ControlError::RecoveryRequired);
+    }
+    Ok(())
+}
+
 /// Reserve durably before spawning; record the observed process before material
 /// transfer; acknowledge preparation only after the worker confirms it. A failed
 /// or ambiguous checkpoint is never replayed blindly or treated as absence.
@@ -372,6 +382,14 @@ impl ExperimentalPublicExecutor {
     }
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, PublicInner>, ControlError> {
         self.inner.try_lock().map_err(|_| ControlError::RecoveryRequired)
+    }
+    /// Finalize a successfully committed journal while retaining its historical
+    /// active-process record. This is metadata reconciliation, not live health
+    /// or permission to signal/adopt any process after a restart.
+    pub(crate) fn finalize_committed(&self, lease: &dyn vp_product_control::WriterLease) -> Result<(), ControlError> {
+        let mut inner = self.lock()?;
+        require_committed_finalization(inner.journal.last_acknowledged(), lease.state())?;
+        inner.journal.persist_finalization(&self.binding, lease)
     }
 }
 impl vp_product_control::RuntimeExecutor for ExperimentalPublicExecutor {

@@ -212,6 +212,9 @@ fn start(options: Options) -> Result<(), &'static str> {
         else { eprintln!("VP_LAB_DIAGNOSTIC: operation {:?}", result.state); }
         return Err("APPLY_NOT_COMMITTED_INSPECT_STATE");
     }
+    // Persist the committed journal transition before exporting credentials.
+    // Failure is uncertain and leaves state for inspection, not silent retry.
+    attached.finalize_committed(store.as_ref()).map_err(|_| "JOURNAL_FINALIZATION_UNCERTAIN")?;
     let mut secrets = Vec::new();
     for (reference, kind) in refs.iter().zip(kinds.iter()) { secrets.push(manager.load_credential(reference, kind, Some(1), deadline()).map_err(|_| "CREDENTIAL_UNAVAILABLE")?.ok_or("CREDENTIAL_UNAVAILABLE")?); }
     let text = |i: usize| std::str::from_utf8(secrets[i].expose()).map_err(|_| "CREDENTIAL_UNAVAILABLE");
@@ -229,7 +232,7 @@ fn start(options: Options) -> Result<(), &'static str> {
         tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
         Ok::<(), &'static str>(())
     })?;
-    drop(control); drop(attached); eprintln!("VP_LAB: stopped. This experimental instance cannot yet be reopened automatically."); Ok(())
+    drop(control); drop(attached); eprintln!("VP_LAB: foreground session ended. Verify worker exit and listener closure independently. The finalized journal retains historical process identity, not a live-status claim. Automatic reopening is unsupported."); Ok(())
 }
 fn preflight(mut args: impl Iterator<Item=String>) -> Result<(), &'static str> {
     let mut worker = None; let mut sha = None;

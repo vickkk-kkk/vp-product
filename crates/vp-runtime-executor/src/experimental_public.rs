@@ -13,10 +13,16 @@ use crate::{public_oracle::ProbeOracle, public_probe::{OracleProbe, VirtualProbe
 /// An attached executor plus its reserved challenge endpoint. The endpoint is
 /// not a proxy listener or health proof. Retain the executor for its full worker
 /// lifetime; dropping it closes the worker before closing the oracle socket.
-pub struct AttachedPublicRuntime { executor: Arc<dyn RuntimeExecutor>, probe_target: SocketAddr }
+pub struct AttachedPublicRuntime { executor: Arc<ExperimentalPublicExecutor>, probe_target: SocketAddr }
 impl AttachedPublicRuntime {
     pub fn executor(&self) -> Arc<dyn RuntimeExecutor> { self.executor.clone() }
     pub fn probe_target(&self) -> SocketAddr { self.probe_target }
+    /// Persist final metadata for a committed operation. The retained process
+    /// record is historical and must not be interpreted as live status.
+    pub fn finalize_committed(&self, store: &dyn ControlStore) -> Result<(), ControlError> {
+        let lease = store.writer()?;
+        self.executor.finalize_committed(&*lease)
+    }
 }
 
 /// Attach only an already initialized, exactly paired and idle runtime. This
