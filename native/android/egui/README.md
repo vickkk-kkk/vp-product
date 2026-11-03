@@ -30,8 +30,9 @@ non-vault sentinel only within the request, redacts Debug and zeroizes the Rust
 JSON buffer on drop. It rejects obfuscation it cannot preserve; the adapter
 must still validate all protocol and full-TUN capabilities. Never persist this
 request or treat its sentinel as a real vault entry. Kotlin/JNI string copies
-are not securely erasable. The import crate's 31 integration tests and one
-compile-fail doc test pass; this is not JNI or VPN interoperability evidence.
+are not securely erasable. The prior 28 import tests and one compile-fail doc
+test passed; the four current mobile-payload tests also pass. This is not JNI
+or VPN interoperability evidence.
 
 Source compilation against Android API 35 passed using Kotlin 2.0.21 and 2.2.20/JVM 17;
 the JNI host separately compiled to AArch64 with seven expected JNI entry
@@ -58,3 +59,6 @@ The egui runtime entry's AndroidHost implementation also passed a host-side
 typecheck and two tests with a stub AndroidApp; that does not test Android JNI.
 The rendering UI passed source parsing and an isolated connection-method
 typecheck with egui stubs. Neither is an Android compilation or device test.
+The current UI also polls an asynchronous native snapshot. Missing or stale
+observations are not treated as connected; even a native "connected" phase is
+shown only as reported activity, without asserting forwarding or DNS safety.

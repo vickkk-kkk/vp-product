@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use vp_product_domain::{NodeId, Revision};
-use vp_product_import::{mobile::encode_ephemeral, parse, ImportFormat};
+use vp_product_import::{mobile::{encode_ephemeral, observe_snapshot, MobileObservation}, parse, ImportFormat};
 
 fn candidate(uri: &str) -> vp_product_import::ImportCandidate {
     let mut batch = parse(uri.as_bytes(), ImportFormat::NodeUri).unwrap();
@@ -39,4 +39,18 @@ fn uuid_is_preserved_and_obfuscation_is_not_silently_discarded() {
     assert_eq!(value["credential"]["value"], "00000000-0000-4000-8000-000000000001");
     let item = candidate("hy2://synthetic@proxy.example?obfs=salamander&obfs-password=synthetic-obfs");
     assert!(encode_ephemeral(item, NodeId::new("node-3").unwrap(), Revision::ZERO, &dns(), &dns()).is_err());
+}
+
+#[test]
+fn snapshots_are_bounded_fresh_and_never_prove_connectivity() {
+    let snapshot = r#"{"schemaVersion":1,"nativeSnapshot":{"schemaVersion":1,"phase":"connected","observedAt":100,"validUntil":200}}"#;
+    assert_eq!(observe_snapshot(snapshot, 150), MobileObservation::ReportedActive);
+    assert_eq!(observe_snapshot(snapshot, 200), MobileObservation::Stale);
+    assert_eq!(observe_snapshot(snapshot, 99), MobileObservation::Stale);
+    let excessive = r#"{"schemaVersion":1,"phase":"idle","observedAt":100,"validUntil":1000000}"#;
+    assert_eq!(observe_snapshot(excessive, 150), MobileObservation::Stale);
+    assert_eq!(observe_snapshot("{}", 150), MobileObservation::Unavailable);
+    assert_eq!(observe_snapshot(&"x".repeat(1_048_577), 150), MobileObservation::Unavailable);
+    let failed = r#"{"schemaVersion":1,"phase":"failed","observedAt":100,"validUntil":200}"#;
+    assert_eq!(observe_snapshot(failed, 150), MobileObservation::Failed);
 }

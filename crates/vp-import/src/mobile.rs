@@ -16,6 +16,32 @@ impl fmt::Debug for MobilePayload {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("MobilePayload([REDACTED])") }
 }
 
+/// An observation of reported state, not a claim of connectivity or leak safety.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MobileObservation { Unavailable, Idle, Starting, Verifying, ReportedActive, Stopping, Failed, Stale }
+
+/// Interpret only a bounded, fresh native observation. An engine's reported
+/// connected state remains unverified until independent data-plane evidence.
+pub fn observe_snapshot(json: &str, now_ms: u64) -> MobileObservation {
+    if json.len() > 1_048_576 { return MobileObservation::Unavailable; }
+    let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(json) else { return MobileObservation::Unavailable };
+    if wrapper.get("schemaVersion").and_then(|v| v.as_u64()) != Some(1) { return MobileObservation::Unavailable; }
+    let v = wrapper.get("nativeSnapshot").filter(|v| !v.is_null()).unwrap_or(&wrapper);
+    if v.get("schemaVersion").and_then(|v| v.as_u64()) != Some(1) { return MobileObservation::Unavailable; }
+    let (Some(observed), Some(until)) = (v.get("observedAt").and_then(|v| v.as_u64()), v.get("validUntil").and_then(|v| v.as_u64()))
+        else { return MobileObservation::Unavailable };
+    if observed > now_ms || now_ms >= until || until <= observed || until - observed > 60_000 { return MobileObservation::Stale; }
+    match v.get("phase").and_then(|v| v.as_str()) {
+        Some("idle" | "disconnected") => MobileObservation::Idle,
+        Some("preparing" | "awaiting_permission" | "starting") => MobileObservation::Starting,
+        Some("verifying" | "reconnecting" | "degraded") => MobileObservation::Verifying,
+        Some("connected") => MobileObservation::ReportedActive,
+        Some("stopping") => MobileObservation::Stopping,
+        Some("failed" | "recoveryRequired" | "recovering") => MobileObservation::Failed,
+        _ => MobileObservation::Unavailable,
+    }
+}
+
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Credential<'a> {

@@ -2,9 +2,9 @@
 #![cfg(target_os = "android")]
 
 use std::net::SocketAddr;
-use vp_client_mobile_ui::runtime::{RuntimeError, RuntimeHost};
+use vp_client_mobile_ui::runtime::{RuntimeError, RuntimeHost, RuntimeObservation};
 use vp_product_domain::{NodeId, Revision};
-use vp_product_import::{mobile::{encode_ephemeral, MobilePayload}, parse, ImportFormat};
+use vp_product_import::{mobile::{encode_ephemeral, observe_snapshot, MobileObservation, MobilePayload}, parse, ImportFormat};
 use winit::platform::android::activity::AndroidApp;
 
 struct AndroidHost { app: AndroidApp, prepared: Option<MobilePayload> }
@@ -23,6 +23,21 @@ impl AndroidHost {
 }
 impl RuntimeHost for AndroidHost {
     fn available(&mut self) -> bool { self.bridge(|b| b.available().unwrap_or(false)).unwrap_or(false) }
+    fn observe(&mut self) -> RuntimeObservation {
+        let Ok(Ok(snapshot)) = self.bridge(|b| b.snapshot_json()) else { return RuntimeObservation::Unavailable };
+        let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else { return RuntimeObservation::Unavailable };
+        let Ok(now_ms) = u64::try_from(now.as_millis()) else { return RuntimeObservation::Unavailable };
+        match observe_snapshot(&snapshot, now_ms) {
+            MobileObservation::Unavailable => RuntimeObservation::Unavailable,
+            MobileObservation::Idle => RuntimeObservation::Idle,
+            MobileObservation::Starting => RuntimeObservation::Starting,
+            MobileObservation::Verifying => RuntimeObservation::Verifying,
+            MobileObservation::ReportedActive => RuntimeObservation::ReportedActive,
+            MobileObservation::Stopping => RuntimeObservation::Stopping,
+            MobileObservation::Failed => RuntimeObservation::Failed,
+            MobileObservation::Stale => RuntimeObservation::Stale,
+        }
+    }
     fn prepare(&mut self, raw_uri: &str, node_id: &str, bootstrap: &[SocketAddr], user_dns: &[SocketAddr]) -> Result<(), RuntimeError> {
         self.prepared = None;
         let mut batch = parse(raw_uri.as_bytes(), ImportFormat::NodeUri).map_err(|_| RuntimeError::InvalidInput)?;

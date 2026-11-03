@@ -83,4 +83,7 @@ object EguiVpnBridge {
 
     /** This JSON is an observation, not independent proof of data-plane health. */
     @JvmStatic fun snapshotJson(): String = JSONObject(HostState.snapshot()).toString()
+
+    /** Refresh asynchronously; never manufacture a fresh native observation. */
+    @JvmStatic fun refreshSnapshot() { VpVpnService.current?.querySnapshot { } }
 }

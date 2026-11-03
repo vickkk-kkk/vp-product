@@ -1,6 +1,6 @@
 //! Narrow JNI caller for the optional Android egui host.
 //! No logging, permission request, or network occurs during construction.
-use jni::{jni_sig, jni_str, objects::{Global, JClass, JObject}, sys, JavaVM};
+use jni::{jni_sig, jni_str, objects::{Global, JClass, JObject, JString}, sys, JavaVM};
 use std::marker::PhantomData;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,6 +29,26 @@ impl<'a> AndroidBridge<'a> {
     pub fn consent_granted(&self) -> Result<bool, BridgeError> { self.call(Call::ConsentGranted, None) }
     pub fn start(&self, payload: &str) -> Result<bool, BridgeError> { self.call(Call::Start, Some(payload)) }
     pub fn stop(&self) -> Result<bool, BridgeError> { self.call(Call::Stop, None) }
+    /// A platform observation, never proof that traffic is actually forwarded.
+    pub fn snapshot_json(&self) -> Result<String, BridgeError> {
+        let text = self.vm.attach_current_thread_for_scope(|env| -> jni::errors::Result<String> {
+            // SAFETY: constructor contract; this borrows the Activity global ref.
+            let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&self.activity)? };
+            let loader = env.call_method(&activity, jni_str!("getClassLoader"),
+                jni_sig!("()Ljava/lang/ClassLoader;"), &[])?.l()?;
+            let name = env.new_string("org.vp.product.runtime.EguiVpnBridge")?;
+            let class = env.call_method(&loader, jni_str!("loadClass"),
+                jni_sig!("(Ljava/lang/String;)Ljava/lang/Class;"), &[(&name).into()])?.l()?;
+            let class = env.cast_local::<JClass>(class)?;
+            env.call_static_method(&class, jni_str!("refreshSnapshot"), jni_sig!("()V"), &[])?;
+            let result = env.call_static_method(&class, jni_str!("snapshotJson"),
+                jni_sig!("()Ljava/lang/String;"), &[])?.l()?;
+            let result = env.cast_local::<JString>(result)?;
+            result.try_to_string(env)
+        }).map_err(|_| BridgeError::Unavailable)?;
+        if text.len() > 1_048_576 { return Err(BridgeError::InvalidInput); }
+        Ok(text)
+    }
 
     fn call(&self, call: Call, payload: Option<&str>) -> Result<bool, BridgeError> {
         validate_payload(payload)?;
