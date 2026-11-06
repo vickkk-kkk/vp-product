@@ -8,10 +8,15 @@ providers.gradleProperty("vpBuildDir").orNull?.let {
 
 val productRoot = projectDir.resolve("../../..").canonicalFile
 val sharedHost = productRoot.resolve("flutter/packages/vp_runtime_android/android/src/main/kotlin/org/vp/product/runtime")
+val requiredSharedHostFiles = listOf("VpVpnService.kt", "NativeRuntime.kt", "NotificationPublication.kt", "RuntimeIdentity.kt")
 val staged = layout.buildDirectory.dir("generated/eguiHost")
 val stageHost by tasks.registering(Sync::class) {
+    doFirst {
+        val missing = requiredSharedHostFiles.filterNot { sharedHost.resolve(it).isFile }
+        check(missing.isEmpty()) { "Missing Android runtime host sources: ${missing.joinToString()}; use a complete product checkout." }
+    }
     from(projectDir) { include("HostState.kt", "EguiVpnBridge.kt", "EguiVpnConsentActivity.kt") }
-    from(sharedHost) { include("VpVpnService.kt", "NativeRuntime.kt", "NotificationPublication.kt", "RuntimeIdentity.kt") }
+    from(sharedHost) { include(*requiredSharedHostFiles.toTypedArray()) }
     into(staged)
 }
 
